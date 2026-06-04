@@ -1,37 +1,27 @@
-<p align="center">
-  <strong>🦀 Krab</strong><br>
-  <em>A full-stack Rust framework for SSR + Island Hydration, service composition, and operational hardening.</em>
-</p>
+# Krab
 
-<p align="center">
-  <a href="#quick-start">Quick Start</a> ·
-  <a href="#architecture">Architecture</a> ·
-  <a href="#features">Features</a> ·
-  <a href="docs/API.md">API Reference</a> ·
-  <a href="CONTRIBUTING.md">Contributing</a> ·
-  <a href="RELEASE_POLICY.md">Release Policy</a>
-</p>
+Krab is a full-stack Rust framework for server-side rendering, island hydration, service composition, and production-oriented operational controls.
 
 ---
 
-## What is Krab?
+## Overview
 
-Krab is a **Rust-native full-stack framework** designed to give you the developer experience of modern JavaScript frameworks (Next.js, Astro, SvelteKit) with the performance, memory safety, and type guarantees of Rust.
+Krab is a Rust-native full-stack framework designed to combine the ergonomics of modern web frameworks with Rust’s performance, memory safety, and type guarantees.
 
-It uses a **Server-Side Rendering (SSR) with Island Hydration** architecture: pages are rendered as fast HTML on the server, while only interactive components are selectively hydrated with WebAssembly on the client. This results in minimal bundle sizes and blazing-fast page loads.
+It uses a server-side rendering architecture with island hydration: pages are rendered as HTML on the server, while interactive components are selectively hydrated with WebAssembly on the client. This reduces client-side payload size while preserving interactivity where it is needed.
 
-Unlike single-purpose libraries, Krab ships with **built-in service composition** — a multi-service architecture with auth, users, and frontend services — and **enterprise operational hardening** including migration governance, dependency security enforcement, structured telemetry, and production secret management.
+Krab also includes built-in service composition for frontend, authentication, and user-domain services, together with production-focused operational controls such as migration governance, dependency policy enforcement, structured telemetry, and secret-management support.
 
 ### Why Krab over alternatives?
 
-| Concern                     | Axum / Actix | Leptos / Dioxus | Next.js      | **Krab**                                                    |
-| --------------------------- | ------------ | --------------- | ------------ | ----------------------------------------------------------- |
-| SSR + Islands               | Manual       | Full WASM SPA   | JS-based ISR | ✅ Native Rust SSR + selective WASM hydratio n              |
-| Multi-service orchestration | DIY          | Not included    | Not included | ✅ Built-in orchestrator + service mesh                     |
-| Migration governance        | DIY          | DIY             | DIY          | ✅ Checksum validation, drift detection, rollback rehearsal |
-| Dependency security         | DIY          | DIY             | npm audit    | ✅ `cargo-deny` CI gates (advisories + licenses + bans)     |
-| Secret management           | DIY          | DIY             | DIY          | ✅ `*_FILE` / vault-ref sourcing enforced in production     |
-| Telemetry & SLOs            | DIY          | DIY             | DIY          | ✅ Prometheus metrics, RED/USE taxonomy, burn-rate alerts   |
+| Concern                     | Axum / Actix | Leptos / Dioxus | Next.js      | **Krab**                                                     |
+| --------------------------- | ------------ | --------------- | ------------ | ------------------------------------------------------------ |
+| SSR + Islands               | Manual       | Full WASM SPA   | JS-based ISR | Native Rust SSR with selective WASM hydration                |
+| Multi-service orchestration | DIY          | Not included    | Not included | Built-in orchestrator and service composition                |
+| Migration governance        | DIY          | DIY             | DIY          | Checksum validation, drift detection, and rollback rehearsal |
+| Dependency security         | DIY          | DIY             | npm audit    | `cargo-deny` CI gates for advisories, licenses, and bans     |
+| Secret management           | DIY          | DIY             | DIY          | `*_FILE` and vault-reference sourcing in production          |
+| Telemetry and SLOs          | DIY          | DIY             | DIY          | Prometheus metrics, RED/USE taxonomy, and burn-rate alerts   |
 
 ---
 
@@ -80,7 +70,7 @@ cargo doc --workspace --no-deps                            # Generate rustdoc
 
 ## Architecture
 
-Krab follows a **"Server-First, Client-Opt-In"** architecture organized as a Cargo workspace.
+Krab follows a server-first, client-opt-in architecture organized as a Cargo workspace.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -119,7 +109,7 @@ Krab follows a **"Server-First, Client-Opt-In"** architecture organized as a Car
 
 ## Features
 
-### Islands Architecture
+### Islands architecture
 
 Pages are server-rendered as static HTML by default. Interactive components are marked with `#[island]` and selectively hydrated via WebAssembly:
 
@@ -135,21 +125,21 @@ pub fn Counter(initial: i32) -> impl View {
 }
 ```
 
-- **Server**: Renders to HTML string
-- **Client**: Downloads targeted WASM, attaches event listeners to existing DOM
+- Server: renders HTML
+- Client: downloads targeted WASM and attaches event listeners to the existing DOM
 
-### Multi-Database Support
+### Multi-database support
 
 Krab supports pluggable database backends via the `KRAB_DB_DRIVER` environment variable:
 
 | Driver         | Value                | Use Case                                        | Vulnerability Status |
 | -------------- | -------------------- | ----------------------------------------------- | -------------------- |
-| **PostgreSQL** | `postgres` (default) | Production-grade with full migration governance | ✅ Clean             |
-| **SQLite**     | `sqlite`             | Lightweight dev/testing, portable deployments   | ✅ Clean             |
+| **PostgreSQL** | `postgres` (default) | Production-grade with full migration governance | Clean                |
+| **SQLite**     | `sqlite`             | Lightweight dev/testing, portable deployments   | Clean                |
 
 PostgreSQL includes enterprise features: versioned migrations with checksums, drift detection, promotion policy enforcement, and rollback rehearsal requirements.
 
-### Authentication & Security
+### Authentication and security
 
 - **JWT/OIDC** token issuance with key rotation (`KeyRing` with multiple `kid` support)
 - **Rate limiting** with configurable capacity/refill and explicit store-failure policy (`KRAB_RATE_LIMIT_FAIL_OPEN`)
@@ -160,7 +150,7 @@ PostgreSQL includes enterprise features: versioned migrations with checksums, dr
 - **RBAC**: Admin scope/role gating on protected endpoints
 - **Token lifecycle**: Issue, refresh (with replay detection), revoke
 
-### Dependency Security
+### Dependency security
 
 Zero-tolerance dependency governance enforced via `cargo-deny`:
 
@@ -239,14 +229,14 @@ KRAB_DB_DRIVER=sqlite DATABASE_URL="sqlite://krab_users.sqlite?mode=rwc" cargo r
 
 All gates must pass before merge. Automated workflows enforce quality at every PR:
 
-| Workflow            | File                                                                                       | Purpose                                       |
-| ------------------- | ------------------------------------------------------------------------------------------ | --------------------------------------------- |
-| Ops Hardening       | [`.github/workflows/ops-hardening.yaml`](.github/workflows/ops-hardening.yaml)             | `fmt` + `clippy` + `rustdoc` + `cargo-deny`   |
-| Dependency Security | [`.github/workflows/dependency-security.yaml`](.github/workflows/dependency-security.yaml) | `cargo-audit` + SBOM generation               |
-| API Contract        | [`.github/workflows/api-contract.yaml`](.github/workflows/api-contract.yaml)               | API contract validation                       |
-| DB Lifecycle        | [`.github/workflows/db-lifecycle.yaml`](.github/workflows/db-lifecycle.yaml)               | Migrations, rollback simulation, drift checks |
-| E2E Depth           | [`.github/workflows/e2e-depth.yaml`](.github/workflows/e2e-depth.yaml)                     | Multi-service end-to-end testing              |
-| NFT Suite           | [`.github/workflows/nft.yaml`](.github/workflows/nft.yaml)                                 | Non-functional / load testing gates           |
+| Workflow            | File                                                                                       | Purpose                                          |
+| ------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------ |
+| Ops Hardening       | [`.github/workflows/ops-hardening.yaml`](.github/workflows/ops-hardening.yaml)             | `fmt`, `clippy`, `rustdoc`, and `cargo-deny`     |
+| Dependency Security | [`.github/workflows/dependency-security.yaml`](.github/workflows/dependency-security.yaml) | `cargo-audit` and SBOM generation                |
+| API Contract        | [`.github/workflows/api-contract.yaml`](.github/workflows/api-contract.yaml)               | API contract validation                          |
+| DB Lifecycle        | [`.github/workflows/db-lifecycle.yaml`](.github/workflows/db-lifecycle.yaml)               | Migration, rollback simulation, and drift checks |
+| E2E Depth           | [`.github/workflows/e2e-depth.yaml`](.github/workflows/e2e-depth.yaml)                     | Multi-service end-to-end testing                 |
+| NFT Suite           | [`.github/workflows/nft.yaml`](.github/workflows/nft.yaml)                                 | Non-functional and load-testing gates            |
 
 ---
 
@@ -263,18 +253,18 @@ All gates must pass before merge. Automated workflows enforce quality at every P
 
 ### Technical references (`docs/`)
 
-| Document                                         | Purpose                                                         |
-| ------------------------------------------------ | --------------------------------------------------------------- |
-| [`docs/API.md`](docs/API.md)                     | Public API contract for all HTTP and GraphQL endpoints          |
-| [`docs/signal_safety.md`](docs/signal_safety.md) | Signal system threading constraints and SSR usage patterns      |
-| [`docs/security.md`](docs/security.md)           | Security architecture, secret management, and threat model      |
-| [`docs/database.md`](docs/database.md)           | Database architecture, migrations, and multi-driver support     |
-| [`docs/deployment.md`](docs/deployment.md)       | Deployment guide for containerized and self-hosted environments |
-| [`docs/reference_apps.md`](docs/reference_apps.md) | Official reference app tracks and starter mapping             |
-| [`docs/migration_guide.md`](docs/migration_guide.md) | Migration notes from Axum, Leptos, and JS full-stack frameworks |
-| [`docs/why_krab.md`](docs/why_krab.md)           | Krab's product position and differentiators                    |
-| [`docs/server_functions.md`](docs/server_functions.md) | Server-function endpoint contract and safety patterns      |
-| [`docs/service_composition.md`](docs/service_composition.md) | Service graph, topology, orchestrator, and boundary rules |
+| Document                                                     | Purpose                                                         |
+| ------------------------------------------------------------ | --------------------------------------------------------------- |
+| [`docs/API.md`](docs/API.md)                                 | Public API contract for all HTTP and GraphQL endpoints          |
+| [`docs/signal_safety.md`](docs/signal_safety.md)             | Signal system threading constraints and SSR usage patterns      |
+| [`docs/security.md`](docs/security.md)                       | Security architecture, secret management, and threat model      |
+| [`docs/database.md`](docs/database.md)                       | Database architecture, migrations, and multi-driver support     |
+| [`docs/deployment.md`](docs/deployment.md)                   | Deployment guide for containerized and self-hosted environments |
+| [`docs/reference_apps.md`](docs/reference_apps.md)           | Official reference app tracks and starter mapping               |
+| [`docs/migration_guide.md`](docs/migration_guide.md)         | Migration notes from Axum, Leptos, and JS full-stack frameworks |
+| [`docs/why_krab.md`](docs/why_krab.md)                       | Krab's product position and differentiators                     |
+| [`docs/server_functions.md`](docs/server_functions.md)       | Server-function endpoint contract and safety patterns           |
+| [`docs/service_composition.md`](docs/service_composition.md) | Service graph, topology, orchestrator, and boundary rules       |
 
 ### Planning documents (`plans/`)
 
@@ -296,16 +286,16 @@ Report vulnerabilities privately via [GitHub Security Advisories](../../security
 
 Current security posture:
 
-- ✅ Zero `cargo-deny` advisory ignores
-- ✅ Production secret sourcing enforced (`*_FILE` / `*_VAULT_REF`)
-- ✅ Inline secrets rejected in non-dev environments
-- ✅ No panic-driven startup paths
-- ✅ Rate limiting on authentication endpoints
-- ✅ Rate-limit store failure policy configurable (`KRAB_RATE_LIMIT_FAIL_OPEN`)
-- ✅ JWT algorithm allowlist enforced (`KRAB_JWT_ALLOWED_ALGS`)
-- ✅ Proxy headers untrusted by default (`KRAB_TRUST_PROXY_HEADERS=false`)
-- ✅ CORS, compression, and request-id middleware on all services
-- ✅ Non-dev startup rejects empty CORS allowlist (`KRAB_CORS_ORIGINS` required in staging/prod)
+- Zero `cargo-deny` advisory ignores
+- Production secret sourcing enforced via `*_FILE` and `*_VAULT_REF`
+- Inline secrets rejected in non-development environments
+- No panic-driven startup paths
+- Rate limiting on authentication endpoints
+- Configurable rate-limit store failure policy via `KRAB_RATE_LIMIT_FAIL_OPEN`
+- JWT algorithm allowlist enforcement via `KRAB_JWT_ALLOWED_ALGS`
+- Proxy headers untrusted by default via `KRAB_TRUST_PROXY_HEADERS=false`
+- CORS, compression, and request-id middleware on all services
+- Non-development startup rejects empty CORS allowlists, requiring `KRAB_CORS_ORIGINS` in staging and production
 
 For the full security architecture, see [`docs/security.md`](docs/security.md).
 
