@@ -1,6 +1,41 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Versioned RPC envelope for additive schema evolution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcEnvelope<T> {
+    pub data: T,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feature_flags: Vec<String>,
+    #[serde(default)]
+    pub compatibility_mode: bool,
+}
+
+impl<T> RpcEnvelope<T> {
+    pub fn new(data: T, version: u32) -> Self {
+        Self {
+            data,
+            request_id: None,
+            schema_version: version,
+            feature_flags: vec![],
+            compatibility_mode: false,
+        }
+    }
+
+    pub fn with_request_id(mut self, id: String) -> Self {
+        self.request_id = Some(id);
+        self
+    }
+
+    pub fn with_compatibility_mode(mut self) -> Self {
+        self.compatibility_mode = true;
+        self
+    }
+}
+
 /// Supported API transport protocols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

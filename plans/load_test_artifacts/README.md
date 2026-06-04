@@ -16,6 +16,8 @@ This directory is the canonical repository for non-functional multi-service load
 - `latest_summary.md` — most recent run summary with service-by-service p95/p99 outcomes and gate decision.
 - `latest_summary_single.md` — single-replica (`N=1`) service results.
 - `latest_summary_scaled.md` — scaled (`N=3`) service results.
+- `shared_state_validation.json` — distributed/shared-state abuse-control validation output (expects block behavior under scaled topology).
+- `release_evidence_bundle.json` / `release_evidence_bundle.md` — consolidated release-evidence presence report aligned to release policy artifacts.
 
 ## CI/Workflow Contract
 
@@ -28,6 +30,11 @@ This directory is the canonical repository for non-functional multi-service load
    - regression percentage exceeds allowed drift relative to the selected baseline window, or
    - horizontal-scaling regression exceeds allowed drift, or
    - shared-state-required validation runs without shared state enabled.
+
+Additional governance automation:
+
+- `scripts/shared_state_validation.py` verifies scaled-stack shared-state blocking behavior and publishes `shared_state_validation.json`.
+- `scripts/release_evidence_bundle.py` generates a release evidence manifest for CI artifact upload and audit traceability.
 
 ## Artifact Retention
 

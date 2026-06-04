@@ -17,12 +17,32 @@
 //!
 //! On the server, this keeps the function as-is and generates an Axum handler.
 //! On the client (WASM), the body is replaced with a `fetch` call to `/api/rpc/get_user`.
+//!
+//! Once a generated handler is mounted, the server function is a public HTTP POST endpoint.
+//! Validate all inputs and enforce auth inside the function or in the mounted router stack.
 
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 
 // ── Error Type ──────────────────────────────────────────────────────────────
+
+/// Stable error category carried over the server-function wire contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerFnErrorCode {
+    BadRequest,
+    Validation,
+    Unauthorized,
+    Forbidden,
+    NotFound,
+    Conflict,
+    Internal,
+}
+
+fn default_error_code() -> ServerFnErrorCode {
+    ServerFnErrorCode::Internal
+}
 
 /// Error type returned by server functions.
 ///
@@ -35,6 +55,46 @@ pub struct ServerFnError {
     /// HTTP status code for the error response.
     #[serde(default = "default_status")]
     pub status_code: u16,
+    /// Stable machine-readable error category.
+    #[serde(default = "default_error_code")]
+    pub code: ServerFnErrorCode,
+}
+
+/// Wire response envelope emitted by server-function HTTP handlers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerFnErrorEnvelope {
+    /// Legacy-compatible error string.
+    pub error: String,
+    /// Canonical error message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// HTTP status code for the error response.
+    #[serde(default = "default_status")]
+    pub status_code: u16,
+    /// Stable machine-readable error category.
+    #[serde(default = "default_error_code")]
+    pub code: ServerFnErrorCode,
+}
+
+impl From<ServerFnError> for ServerFnErrorEnvelope {
+    fn from(err: ServerFnError) -> Self {
+        Self {
+            error: err.message.clone(),
+            message: Some(err.message),
+            status_code: err.status_code,
+            code: err.code,
+        }
+    }
+}
+
+impl From<ServerFnErrorEnvelope> for ServerFnError {
+    fn from(envelope: ServerFnErrorEnvelope) -> Self {
+        Self {
+            message: envelope.message.unwrap_or(envelope.error),
+            status_code: envelope.status_code,
+            code: envelope.code,
+        }
+    }
 }
 
 fn default_status() -> u16 {
@@ -50,53 +110,111 @@ impl std::fmt::Display for ServerFnError {
 impl std::error::Error for ServerFnError {}
 
 impl ServerFnError {
-    /// Create a new server error with HTTP 500.
-    pub fn new(message: impl Into<String>) -> Self {
+    fn with_code(message: impl Into<String>, status_code: u16, code: ServerFnErrorCode) -> Self {
         Self {
             message: message.into(),
-            status_code: 500,
+            status_code,
+            code,
         }
+    }
+
+    /// Create a new server error with HTTP 500.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self::with_code(message, 500, ServerFnErrorCode::Internal)
     }
 
     /// Create a bad request error (HTTP 400).
     pub fn bad_request(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            status_code: 400,
-        }
+        Self::with_code(message, 400, ServerFnErrorCode::BadRequest)
+    }
+
+    /// Create a validation error (HTTP 400).
+    pub fn validation(message: impl Into<String>) -> Self {
+        Self::with_code(message, 400, ServerFnErrorCode::Validation)
     }
 
     /// Create an unauthorized error (HTTP 401).
     pub fn unauthorized(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            status_code: 401,
-        }
+        Self::with_code(message, 401, ServerFnErrorCode::Unauthorized)
     }
 
     /// Create a forbidden error (HTTP 403).
     pub fn forbidden(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            status_code: 403,
-        }
+        Self::with_code(message, 403, ServerFnErrorCode::Forbidden)
     }
 
     /// Create a not found error (HTTP 404).
     pub fn not_found(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            status_code: 404,
-        }
+        Self::with_code(message, 404, ServerFnErrorCode::NotFound)
     }
 
     /// Create a conflict error (HTTP 409).
     pub fn conflict(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            status_code: 409,
-        }
+        Self::with_code(message, 409, ServerFnErrorCode::Conflict)
     }
+
+    /// Create an error from an HTTP status code, preserving the closest known category.
+    pub fn from_status(status_code: u16, message: impl Into<String>) -> Self {
+        let code = match status_code {
+            400 => ServerFnErrorCode::BadRequest,
+            401 => ServerFnErrorCode::Unauthorized,
+            403 => ServerFnErrorCode::Forbidden,
+            404 => ServerFnErrorCode::NotFound,
+            409 => ServerFnErrorCode::Conflict,
+            _ => ServerFnErrorCode::Internal,
+        };
+        Self::with_code(message, status_code, code)
+    }
+}
+
+/// Return a validation error when a server-function precondition is false.
+pub fn validate_server_fn(
+    condition: bool,
+    message: impl Into<String>,
+) -> Result<(), ServerFnError> {
+    if condition {
+        Ok(())
+    } else {
+        Err(ServerFnError::validation(message))
+    }
+}
+
+/// Require an authenticated caller before running a server-function mutation.
+pub fn require_server_fn_auth(
+    authenticated: bool,
+    message: impl Into<String>,
+) -> Result<(), ServerFnError> {
+    if authenticated {
+        Ok(())
+    } else {
+        Err(ServerFnError::unauthorized(message))
+    }
+}
+
+/// Require a caller scope before running a protected server function.
+pub fn require_server_fn_scope<I, S>(scopes: I, required: &str) -> Result<(), ServerFnError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    if scopes.into_iter().any(|scope| scope.as_ref() == required) {
+        Ok(())
+    } else {
+        Err(ServerFnError::forbidden(format!(
+            "missing required scope '{required}'"
+        )))
+    }
+}
+
+/// Decode a server-function error response body into the canonical error type.
+pub fn decode_server_fn_error_body(body: &str, fallback_status_code: u16) -> ServerFnError {
+    if let Ok(envelope) = serde_json::from_str::<ServerFnErrorEnvelope>(body) {
+        return envelope.into();
+    }
+    if let Ok(err) = serde_json::from_str::<ServerFnError>(body) {
+        return err;
+    }
+    ServerFnError::from_status(fallback_status_code, body)
 }
 
 impl From<serde_json::Error> for ServerFnError {
@@ -118,10 +236,7 @@ impl axum::response::IntoResponse for ServerFnError {
     fn into_response(self) -> axum::response::Response {
         let status = axum::http::StatusCode::from_u16(self.status_code)
             .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-        let body = serde_json::json!({
-            "error": self.message,
-            "status_code": self.status_code,
-        });
+        let body = ServerFnErrorEnvelope::from(self);
         (status, axum::Json(body)).into_response()
     }
 }
@@ -163,8 +278,11 @@ const _: fn() = || {
 /// use krab_core::server_fn::server_fn_router;
 ///
 /// let rpc_routes = server_fn_router(&[
-///     get_user_registration(),
-///     list_items_registration(),
+///     ServerFnRegistration {
+///         name: "get_user",
+///         url: "/api/rpc/get_user",
+///         handler: __get_user_handler,
+///     },
 /// ]);
 ///
 /// let app = Router::new()
@@ -286,26 +404,36 @@ pub async fn call_server_fn<A: Serialize, T: serde::de::DeserializeOwned>(
         serde_json::from_str(&text_str).map_err(|e| ServerFnError::new(e.to_string()))
     } else {
         // Try to parse server error
-        if let Ok(err) = serde_json::from_str::<ServerFnError>(&text_str) {
-            Err(err)
-        } else {
-            Err(ServerFnError {
-                message: text_str,
-                status_code: resp.status(),
-            })
-        }
+        Err(decode_server_fn_error_body(&text_str, resp.status()))
     }
 }
 
-/// Placeholder for non-WASM, non-server contexts (e.g., tests).
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "rest")))]
+/// Native client-side call path for non-WASM targets.
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn call_server_fn<A: Serialize, T: serde::de::DeserializeOwned>(
-    _url: &str,
-    _args: &A,
+    url: &str,
+    args: &A,
 ) -> Result<T, ServerFnError> {
-    Err(ServerFnError::new(
-        "call_server_fn is only available in WASM or with the 'rest' feature",
-    ))
+    let client = reqwest::Client::new();
+    let response = client
+        .post(url)
+        .json(args)
+        .send()
+        .await
+        .map_err(|err| ServerFnError::new(format!("request failed: {err}")))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|err| ServerFnError::new(format!("failed to read response body: {err}")))?;
+
+    if status.is_success() {
+        serde_json::from_str(&body)
+            .map_err(|err| ServerFnError::new(format!("invalid success payload: {err}")))
+    } else {
+        Err(decode_server_fn_error_body(&body, status.as_u16()))
+    }
 }
 
 // ── Convenience Macro ───────────────────────────────────────────────────────
@@ -317,7 +445,6 @@ pub async fn call_server_fn<A: Serialize, T: serde::de::DeserializeOwned>(
 /// ```rust,ignore
 /// use krab_core::collect_server_fns;
 ///
-/// // Each server function generates a `{name}_registration` function
 /// static SERVER_FNS: &[krab_core::server_fn::ServerFnRegistration] =
 ///     &collect_server_fns![get_user, list_items, create_item];
 /// ```
@@ -350,6 +477,10 @@ mod tests {
     #[test]
     fn server_fn_error_constructors() {
         assert_eq!(ServerFnError::bad_request("bad").status_code, 400);
+        assert_eq!(
+            ServerFnError::validation("bad input").code,
+            ServerFnErrorCode::Validation
+        );
         assert_eq!(ServerFnError::unauthorized("no").status_code, 401);
         assert_eq!(ServerFnError::forbidden("denied").status_code, 403);
         assert_eq!(ServerFnError::not_found("gone").status_code, 404);
@@ -363,6 +494,43 @@ mod tests {
         let parsed: ServerFnError = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.message, "invalid input");
         assert_eq!(parsed.status_code, 400);
+        assert_eq!(parsed.code, ServerFnErrorCode::BadRequest);
+    }
+
+    #[test]
+    fn server_fn_error_deserializes_legacy_error_envelope() {
+        let parsed =
+            decode_server_fn_error_body(r#"{"error":"invalid payload","status_code":400}"#, 500);
+        assert_eq!(parsed.message, "invalid payload");
+        assert_eq!(parsed.status_code, 400);
+        assert_eq!(parsed.code, ServerFnErrorCode::Internal);
+    }
+
+    #[test]
+    fn server_fn_error_envelope_is_client_deserializable() {
+        let envelope = ServerFnErrorEnvelope::from(ServerFnError::validation("missing field"));
+        let json = serde_json::to_string(&envelope).unwrap();
+        let parsed = decode_server_fn_error_body(&json, 500);
+
+        assert_eq!(parsed.message, "missing field");
+        assert_eq!(parsed.status_code, 400);
+        assert_eq!(parsed.code, ServerFnErrorCode::Validation);
+    }
+
+    #[test]
+    fn validation_and_auth_helpers_return_typed_errors() {
+        assert!(validate_server_fn(true, "ok").is_ok());
+        let validation = validate_server_fn(false, "name is required").unwrap_err();
+        assert_eq!(validation.status_code, 400);
+        assert_eq!(validation.code, ServerFnErrorCode::Validation);
+
+        let unauthorized = require_server_fn_auth(false, "login required").unwrap_err();
+        assert_eq!(unauthorized.status_code, 401);
+        assert_eq!(unauthorized.code, ServerFnErrorCode::Unauthorized);
+
+        let forbidden = require_server_fn_scope(["users:read"], "users:write").unwrap_err();
+        assert_eq!(forbidden.status_code, 403);
+        assert_eq!(forbidden.code, ServerFnErrorCode::Forbidden);
     }
 
     #[test]

@@ -128,6 +128,7 @@ pub struct MigrationGovernanceConfig {
     pub allow_apply: bool,
     pub release_environments: Vec<String>,
     pub require_rollback_rehearsal_in_release: bool,
+    pub drift_tolerance_threshold: usize,
 }
 
 impl MigrationGovernanceConfig {
@@ -142,6 +143,10 @@ impl MigrationGovernanceConfig {
                 "DB_MIGRATION_REQUIRE_REHEARSAL_IN_RELEASE",
                 true,
             ),
+            drift_tolerance_threshold: std::env::var("DB_MIGRATION_DRIFT_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
         }
     }
 }
@@ -282,6 +287,29 @@ pub async fn enforce_migration_governance(
     .execute(pool)
     .await?;
 
+    Ok(())
+}
+
+pub fn enforce_drift_policy(report: &MigrationDriftReport, max_unexpected: usize) -> Result<()> {
+    if !report.missing_versions.is_empty() {
+        anyhow::bail!(
+            "drift policy violation: database is missing expected migrations: {:?}",
+            report.missing_versions
+        );
+    }
+    if !report.checksum_mismatches.is_empty() {
+        anyhow::bail!(
+            "drift policy violation: checksum mismatches detected (potential manual DB edits): {:?}",
+            report.checksum_mismatches
+        );
+    }
+    if report.unexpected_versions.len() > max_unexpected {
+        anyhow::bail!(
+            "drift policy violation: {} unexpected versions exist, exceeding threshold {}",
+            report.unexpected_versions.len(),
+            max_unexpected
+        );
+    }
     Ok(())
 }
 

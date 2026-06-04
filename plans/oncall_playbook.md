@@ -25,6 +25,7 @@
 5. Verify Prometheus inputs are healthy for canonical series:
    - `krab_http_responses_total{class="5xx"}`
    - `krab_http_requests_by_protocol_total`
+   - Compatibility aliases may exist for legacy dashboards: `krab_response_5xx_total`
 
 ### Immediate Actions
 - If deploy related: rollback first, investigate second.
@@ -97,6 +98,7 @@
 4. Validate histogram contract and scrape freshness for:
    - `krab_http_request_duration_seconds_bucket`
    - `krab_http_request_duration_seconds_count`
+   - Compatibility aliases may exist for legacy dashboards: `krab_request_duration_ms_*`
 
 ### Actions
 - Reduce expensive query paths (indexes, batching, cache).

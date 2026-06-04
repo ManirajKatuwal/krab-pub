@@ -1,8 +1,11 @@
 [package]
 name = "krab_macros"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [lib]
 proc-macro = true
@@ -13,5 +16,7 @@ syn = { version = "2.0", features = ["full"] }
 proc-macro2 = "1.0"
 
 [dev-dependencies]
-krab_core = { path = "../krab_core" }
+krab_core = { path = "../krab_core", features = ["rest"] }
 trybuild = { version = "1.0", features = ["diff"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }

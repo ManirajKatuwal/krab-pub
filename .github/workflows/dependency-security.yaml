@@ -28,6 +28,15 @@ jobs:
       - name: Advisory gate (cargo-audit)
         run: cargo audit --deny warnings
 
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v1
+        with:
+          command: check advisories bans licenses sources
+
   sbom:
     runs-on: ubuntu-latest
     steps:

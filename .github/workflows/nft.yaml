@@ -120,6 +120,24 @@ jobs:
             --json-out plans/load_test_artifacts/scaled_replica_results.json \
             --markdown-out plans/load_test_artifacts/latest_summary_scaled.md
 
+      - name: Validate shared-state rate-limit behavior (scaled)
+        env:
+          KRAB_AUTH_BASE_URL: http://service_auth:3001
+          KRAB_BEARER_TOKEN: ${KRAB_BEARER_TOKEN}
+          KRAB_SHARED_STATE_SAMPLES: "240"
+          KRAB_SHARED_STATE_EXPECT_STATUS: "429"
+        run: |
+          docker compose \
+            -f docker-compose.yml \
+            -f docker-compose.nft.yaml \
+            run --rm --entrypoint python3 nft_runner \
+            scripts/shared_state_validation.py
+
+      - name: Generate release evidence bundle
+        if: always()
+        run: |
+          python3 scripts/release_evidence_bundle.py
+
       - name: Evaluate horizontal scaling regression gate
         run: |
           python3 scripts/nft_scaling_compare.py \
@@ -155,4 +173,7 @@ jobs:
             plans/load_test_artifacts/latest_summary_scaled.md
             plans/load_test_artifacts/single_replica_results.json
             plans/load_test_artifacts/scaled_replica_results.json
+            plans/load_test_artifacts/shared_state_validation.json
+            plans/load_test_artifacts/release_evidence_bundle.json
+            plans/load_test_artifacts/release_evidence_bundle.md
             plans/load_test_artifacts/trend_history.csv

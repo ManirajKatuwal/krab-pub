@@ -80,6 +80,8 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let parsed: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["error"], "invalid payload");
+        assert_eq!(parsed["message"], "invalid payload");
+        assert_eq!(parsed["code"], "bad_request");
         assert_eq!(parsed["status_code"], 400);
     }
 

@@ -2,13 +2,19 @@ version: "3.9"
 
 services:
   service_frontend:
-    ports: []
+    ports: !reset []
+    environment:
+      KRAB_TRUST_PROXY_HEADERS: "true"
 
   service_auth:
-    ports: []
+    ports: !reset []
+    environment:
+      KRAB_TRUST_PROXY_HEADERS: "true"
 
   service_users:
-    ports: []
+    ports: !reset []
+    environment:
+      KRAB_TRUST_PROXY_HEADERS: "true"
 
   nft_runner:
     image: python:3.12-slim

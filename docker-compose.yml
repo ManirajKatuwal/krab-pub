@@ -87,6 +87,7 @@ services:
     environment:
       KRAB_ENVIRONMENT: dev
       KRAB_AUTH_MODE: static
+      KRAB_DB_DRIVER: postgres
       KRAB_BEARER_TOKEN: ${KRAB_BEARER_TOKEN:?set KRAB_BEARER_TOKEN in .env}
       KRAB_REDIS_URL: ${KRAB_REDIS_URL:-redis://redis:6379}
       KRAB_HOST: 0.0.0.0
@@ -129,6 +130,8 @@ services:
     environment:
       KRAB_ENVIRONMENT: dev
       RUST_LOG: info
+      KRAB_HOST: 0.0.0.0
+      KRAB_PORT: "3000"
       KRAB_REDIS_URL: ${KRAB_REDIS_URL:-redis://redis:6379}
       KRAB_AUTH_PUBLIC_PATHS: "/about,/greet,/blog/*,/rpc/*,/data/*,/asset-manifest.json,/pkg/*"
     ports:

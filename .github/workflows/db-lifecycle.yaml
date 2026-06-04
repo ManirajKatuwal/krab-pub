@@ -58,6 +58,12 @@ jobs:
       - name: 3. Drift Detection
         run: cargo run --package krab_cli -- db drift --diagnostics
 
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features rustls,postgres
+      
+      - name: 3.1 Type Metadata Consistency (Schema Evolution Check)
+        run: cargo sqlx prepare --workspace --check
+
       - name: 4. Rollback rehearsal — run and capture evidence
         run: |
           cargo run --package krab_cli -- db rehearsal --out rollback-rehearsal-evidence.txt --diagnostics

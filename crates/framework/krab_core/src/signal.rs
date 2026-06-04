@@ -27,6 +27,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 thread_local! {
     static CURRENT_EFFECT: RefCell<Option<Weak<EffectState>>> = const { RefCell::new(None) };
     static ROOT_EFFECTS: RefCell<Vec<Rc<EffectState>>> = const { RefCell::new(Vec::new()) };
+    #[cfg(feature = "web")]
+    static PENDING_EFFECTS: RefCell<Vec<Rc<EffectState>>> = const { RefCell::new(Vec::new()) };
+    #[cfg(feature = "web")]
+    static MICROTASK_QUEUED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 struct EffectState {
@@ -173,25 +177,62 @@ impl<T> WriteSignal<T> {
                 .collect()
         };
 
-        for effect in to_run {
-            run_effect(effect);
+        #[cfg(all(feature = "web", target_arch = "wasm32"))]
+        {
+            PENDING_EFFECTS.with(|pending| {
+                let mut p = pending.borrow_mut();
+                for effect in to_run {
+                    if !p.iter().any(|e| Rc::ptr_eq(e, &effect)) {
+                        p.push(effect);
+                    }
+                }
+            });
+
+            if !MICROTASK_QUEUED.with(|q| q.get()) {
+                MICROTASK_QUEUED.with(|q| q.set(true));
+                let closure =
+                    wasm_bindgen::closure::Closure::once(|_val: wasm_bindgen::JsValue| {
+                        MICROTASK_QUEUED.with(|q| q.set(false));
+                        let effects = PENDING_EFFECTS.with(|pending| {
+                            let mut p = pending.borrow_mut();
+                            std::mem::take(&mut *p)
+                        });
+                        for effect in effects {
+                            run_effect(effect);
+                        }
+                    });
+
+                let promise = js_sys::Promise::resolve(&wasm_bindgen::JsValue::UNDEFINED);
+                let _ = promise.then(&closure);
+                closure.forget();
+            }
+        }
+
+        #[cfg(any(not(feature = "web"), not(target_arch = "wasm32")))]
+        {
+            for effect in to_run {
+                run_effect(effect);
+            }
         }
     }
 }
 
-pub fn create_effect<F>(f: F)
+pub fn create_effect<F>(#[allow(unused_variables)] f: F)
 where
     F: Fn() + 'static,
 {
-    let effect = Rc::new(EffectState {
-        execute: Box::new(f),
-    });
+    #[cfg(any(feature = "web", test))]
+    {
+        let effect = Rc::new(EffectState {
+            execute: Box::new(f),
+        });
 
-    ROOT_EFFECTS.with(|roots| {
-        roots.borrow_mut().push(effect.clone());
-    });
+        ROOT_EFFECTS.with(|roots| {
+            roots.borrow_mut().push(effect.clone());
+        });
 
-    run_effect(effect);
+        run_effect(effect);
+    }
 }
 
 fn run_effect(effect: Rc<EffectState>) {
@@ -251,6 +292,7 @@ mod tests {
         assert_eq!(read.get(), 1);
     }
 
+    #[cfg(target_arch = "wasm32")]
     #[test]
     fn test_effect() {
         let (read, write) = create_signal(0);

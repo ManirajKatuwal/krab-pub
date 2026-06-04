@@ -1,62 +1,34 @@
 use anyhow::{Context as _, Result};
-use async_graphql::{EmptyMutation, EmptySubscription, Schema};
-use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use async_trait::async_trait;
-use axum::extract::{Request, State};
-use axum::http::StatusCode;
-use axum::middleware::{self, Next};
-use axum::response::Response;
-use axum::routing::{get, post};
-use axum::{Extension, Json, Router};
 use krab_core::config::KrabConfig;
-use krab_core::db::{
-    detect_migration_drift, enforce_migration_governance, enforce_promotion_policy,
-    migration_failure_policy_from_env, run_versioned_migrations, DbConfig, DbPool, Migration,
-    MigrationGovernanceConfig, PromotionConfig,
-};
-use krab_core::http::AuthContext;
-use krab_core::http::{
-    apply_common_http_layers, health, metrics, metrics_prometheus, readiness_with_dependencies,
-    DependencyStatus, HasReadinessDependencies, HasRuntimeState, RuntimeState,
-};
-use krab_core::protocol::{
-    DeploymentTopology, ExposureMode, ProtocolConfig, ProtocolKind, ServiceCapabilities,
-};
-use krab_core::repository::UserRepository;
-use krab_core::service::{ApiService, ServiceConfig};
+use krab_core::db::DbConfig;
+use krab_core::http::RuntimeState;
+use krab_core::protocol::{DeploymentTopology, ExposureMode, ProtocolConfig, ProtocolKind};
+use krab_core::service::{serve_with_graceful_shutdown, ApiService, ServiceConfig};
 use krab_core::telemetry::init_tracing;
-use serde::Serialize;
 use sqlx::sqlite::SqlitePoolOptions;
-use sqlx::SqlitePool;
-use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
+
+#[cfg(test)]
+use krab_core::db::DbPool;
+#[cfg(test)]
+use krab_core::repository::UserRepository;
+#[cfg(test)]
+use sqlx::SqlitePool;
 
 mod adapters;
 mod capabilities;
 mod db;
 mod domain;
+mod runtime;
 
+use crate::db::bootstrap::{
+    build_user_repository, default_db_url_for_driver, resolve_db_driver, DbDriver, UsersDbPool,
+};
+use crate::db::migrations::{bootstrap_sqlite_users_schema, run_postgres_migration_lifecycle};
 use crate::domain::service::{UserDomainService, UserDomainServiceImpl};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DbDriver {
-    Postgres,
-    Sqlite,
-}
-
-impl DbDriver {
-    fn parse(input: &str) -> Result<Self> {
-        match input.trim().to_ascii_lowercase().as_str() {
-            "postgres" => Ok(Self::Postgres),
-            "sqlite" => Ok(Self::Sqlite),
-            other => anyhow::bail!(
-                "unsupported KRAB_DB_DRIVER='{}'; supported values are postgres|sqlite",
-                other
-            ),
-        }
-    }
-}
+use crate::runtime::{build_app, AppState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SqlDialect {
@@ -97,244 +69,10 @@ fn redact_db_url_credentials(url: &str) -> String {
     url.to_string()
 }
 
-fn resolve_db_driver() -> Result<DbDriver> {
-    let raw = std::env::var("KRAB_DB_DRIVER").unwrap_or_else(|_| "sqlite".to_string());
-    DbDriver::parse(&raw)
-}
-
-#[derive(Clone)]
-enum UsersDbPool {
-    Postgres(DbPool),
-    Sqlite(SqlitePool),
-}
-
-impl UsersDbPool {
-    fn dependency_name(&self) -> &'static str {
-        match self {
-            Self::Postgres(_) => "postgres",
-            Self::Sqlite(_) => "sqlite",
-        }
-    }
-
-    fn try_acquire_available(&self) -> bool {
-        match self {
-            Self::Postgres(pool) => pool.try_acquire().is_some(),
-            Self::Sqlite(pool) => pool.try_acquire().is_some(),
-        }
-    }
-}
-
-fn build_user_repository(driver: DbDriver, pool: &UsersDbPool) -> Result<Arc<dyn UserRepository>> {
-    match (driver, pool) {
-        (DbDriver::Postgres, UsersDbPool::Postgres(pool)) => Ok(Arc::new(
-            db::postgres::PostgresUserRepository::new(pool.clone()),
-        )),
-        (DbDriver::Sqlite, UsersDbPool::Sqlite(pool)) => Ok(Arc::new(
-            db::sqlite::SqliteUserRepository::new(pool.clone()),
-        )),
-        (DbDriver::Postgres, UsersDbPool::Sqlite(_)) => {
-            anyhow::bail!("database driver/pool mismatch: postgres driver requires postgres pool")
-        }
-        (DbDriver::Sqlite, UsersDbPool::Postgres(_)) => {
-            anyhow::bail!("database driver/pool mismatch: sqlite driver requires sqlite pool")
-        }
-    }
-}
-
 struct UsersService {
     config: ServiceConfig,
     pool: UsersDbPool,
     domain: Arc<dyn UserDomainService>,
-}
-
-fn users_service_migrations() -> Vec<Migration> {
-    vec![
-        Migration {
-            version: 1,
-            name: "create_users",
-            sql: "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, email TEXT NOT NULL UNIQUE, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now())",
-            rollback_sql: Some("DROP TABLE IF EXISTS users"),
-            critical: true,
-            destructive: false,
-        },
-        Migration {
-            version: 2,
-            name: "create_users_created_at_index",
-            sql: "CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at)",
-            rollback_sql: Some("DROP INDEX IF EXISTS idx_users_created_at"),
-            critical: false,
-            destructive: false,
-        },
-        Migration {
-            version: 3,
-            name: "create_user_profiles",
-            sql: "CREATE TABLE IF NOT EXISTS user_profiles (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, display_name TEXT, bio TEXT, avatar_url TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())",
-            rollback_sql: Some("DROP TABLE IF EXISTS user_profiles"),
-            critical: false,
-            destructive: false,
-        },
-        Migration {
-            version: 4,
-            name: "create_user_audit_log",
-            sql: "CREATE TABLE IF NOT EXISTS user_audit_log (id BIGSERIAL PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, action TEXT NOT NULL, actor_sub TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
-            rollback_sql: Some("DROP TABLE IF EXISTS user_audit_log"),
-            critical: false,
-            destructive: false,
-        },
-        Migration {
-            version: 5,
-            name: "create_user_audit_log_created_at_index",
-            sql: "CREATE INDEX IF NOT EXISTS idx_user_audit_log_created_at ON user_audit_log(created_at)",
-            rollback_sql: Some("DROP INDEX IF EXISTS idx_user_audit_log_created_at"),
-            critical: false,
-            destructive: false,
-        },
-        Migration {
-            version: 6,
-            name: "add_tenant_id_to_users",
-            sql: "ALTER TABLE users ADD COLUMN IF NOT EXISTS tenant_id TEXT",
-            rollback_sql: Some("ALTER TABLE users DROP COLUMN IF EXISTS tenant_id"),
-            critical: true,
-            destructive: false,
-        },
-        Migration {
-            version: 7,
-            name: "create_users_tenant_id_index",
-            sql: "CREATE INDEX IF NOT EXISTS idx_users_tenant_id ON users(tenant_id)",
-            rollback_sql: Some("DROP INDEX IF EXISTS idx_users_tenant_id"),
-            critical: false,
-            destructive: false,
-        },
-    ]
-}
-
-type UsersSchema = Schema<adapters::graphql::UserQuery, EmptyMutation, EmptySubscription>;
-
-#[derive(Clone)]
-struct AppState {
-    schema: UsersSchema,
-    pool: UsersDbPool,
-    runtime: RuntimeState,
-    domain: Arc<dyn UserDomainService>,
-    protocol_config: ProtocolConfig,
-    capabilities: ServiceCapabilities,
-}
-
-#[derive(Serialize)]
-struct StatusPayload {
-    status: &'static str,
-}
-
-async fn root() -> &'static str {
-    "Users Service Online"
-}
-
-impl HasReadinessDependencies for AppState {
-    fn readiness_dependencies(&self) -> Vec<DependencyStatus> {
-        let db_ready = self.pool.try_acquire_available();
-        vec![DependencyStatus {
-            name: self.pool.dependency_name(),
-            ready: db_ready,
-            critical: true,
-            latency_ms: None,
-            detail: Some(if db_ready {
-                "connection-pool-available".to_string()
-            } else {
-                "connection-pool-unavailable".to_string()
-            }),
-        }]
-    }
-}
-
-async fn graphql_handler(
-    State(state): State<AppState>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    req: GraphQLRequest,
-) -> GraphQLResponse {
-    let request = req.into_inner().data(auth_ctx);
-    let response = state.schema.execute(request).await;
-    GraphQLResponse::from(response)
-}
-
-async fn capabilities_handler(State(state): State<AppState>) -> Json<ServiceCapabilities> {
-    Json(state.capabilities.clone())
-}
-
-fn has_admin_entitlement(auth: &AuthContext) -> bool {
-    let admin_scope =
-        std::env::var("KRAB_AUTH_ADMIN_SCOPE").unwrap_or_else(|_| "admin".to_string());
-    let admin_role = std::env::var("KRAB_AUTH_ADMIN_ROLE").unwrap_or_else(|_| "admin".to_string());
-    auth.scopes.iter().any(|s| s == &admin_scope) || auth.roles.iter().any(|r| r == &admin_role)
-}
-
-async fn admin_audit_handler(
-    Extension(auth_ctx): Extension<AuthContext>,
-) -> (StatusCode, Json<StatusPayload>) {
-    if !has_admin_entitlement(&auth_ctx) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(StatusPayload {
-                status: "forbidden",
-            }),
-        );
-    }
-
-    (StatusCode::OK, Json(StatusPayload { status: "admin_ok" }))
-}
-
-async fn admin_rbac_middleware(req: Request, next: Next) -> Result<Response, StatusCode> {
-    let authorized = req
-        .extensions()
-        .get::<AuthContext>()
-        .map(has_admin_entitlement)
-        .unwrap_or(false);
-
-    if !authorized {
-        return Err(StatusCode::FORBIDDEN);
-    }
-
-    Ok(next.run(req).await)
-}
-
-impl HasRuntimeState for AppState {
-    fn runtime_state(&self) -> &RuntimeState {
-        &self.runtime
-    }
-}
-
-fn build_app(state: AppState) -> Router {
-    let domain = state.domain.clone();
-    let proto_cfg = state.protocol_config.clone();
-
-    let admin_api = Router::new()
-        .route("/audit", get(admin_audit_handler))
-        .route_layer(middleware::from_fn(admin_rbac_middleware));
-
-    let mut api = Router::new();
-
-    if proto_cfg.enabled_protocols.contains(&ProtocolKind::Graphql) {
-        api = api.route("/graphql", post(graphql_handler));
-    }
-    if proto_cfg.enabled_protocols.contains(&ProtocolKind::Rest) {
-        api = api.merge(adapters::rest::rest_router(domain.clone()).with_state(()));
-    }
-    if proto_cfg.enabled_protocols.contains(&ProtocolKind::Rpc) {
-        api = api.merge(adapters::rpc::rpc_router(domain.clone()).with_state(()));
-    }
-
-    api = api
-        .nest("/admin", admin_api)
-        .route("/capabilities", get(capabilities_handler));
-
-    let app = Router::new()
-        .route("/", get(root))
-        .route("/health", get(health))
-        .route("/ready", get(readiness_with_dependencies::<AppState>))
-        .route("/metrics", get(metrics::<AppState>))
-        .route("/metrics/prometheus", get(metrics_prometheus::<AppState>))
-        .nest("/api/v1", api);
-
-    apply_common_http_layers(app, state.clone()).with_state(state)
 }
 
 #[async_trait]
@@ -347,11 +85,12 @@ impl ApiService for UsersService {
             .clone()
             .unwrap_or_else(ProtocolConfig::from_env);
         let capabilities = capabilities::build_capabilities(&protocol_config);
+        let runtime = RuntimeState::new().with_protocol_config(protocol_config.clone());
 
         let state = AppState {
             schema,
             pool: self.pool.clone(),
-            runtime: RuntimeState::new(),
+            runtime,
             domain: self.domain.clone(),
             protocol_config,
             capabilities,
@@ -359,37 +98,22 @@ impl ApiService for UsersService {
 
         let app = build_app(state);
 
-        let addr = format!("{}:{}", self.config.host, self.config.port)
-            .parse::<SocketAddr>()
-            .context("invalid users service bind address")?;
-
-        info!(
-            service = %self.config.name,
-            host = %self.config.host,
-            port = self.config.port,
-            %addr,
-            "service_listening"
-        );
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .context("failed to bind users service listener")?;
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .context("users service server exited with error")?;
-        info!(service = %self.config.name, "service_shutdown_complete");
-        Ok(())
+        serve_with_graceful_shutdown(app, &self.config).await
     }
 }
 
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    info!(service = "users", "service_shutdown_signal_received");
-}
-
 async fn bootstrap_users_service() -> Result<UsersService> {
-    let cfg = KrabConfig::from_env("users", 3002);
-    cfg.validate().context("startup config validation failed")?;
+    let cfg = KrabConfig::from_env_checked("users", 3002)
+        .context("failed to load users config from environment")?;
+    let secrets_report = cfg
+        .validate_all()
+        .context("startup config validation failed")?;
+    if !secrets_report.is_clean() {
+        warn!(
+            issue_count = secrets_report.issues.len(),
+            "startup_secrets_policy_warnings_detected"
+        );
+    }
     let mut protocol_config = ProtocolConfig::from_env();
 
     // Backward-compatible users default when protocol env vars are unset.
@@ -415,10 +139,7 @@ async fn bootstrap_users_service() -> Result<UsersService> {
     };
 
     let db_driver = resolve_db_driver()?;
-    let default_db_url = match db_driver {
-        DbDriver::Postgres => "postgres://postgres@localhost:5432/krab_users",
-        DbDriver::Sqlite => "sqlite://krab_users.sqlite?mode=rwc",
-    };
+    let default_db_url = default_db_url_for_driver(db_driver);
     let db_cfg = DbConfig::from_env(default_db_url);
     info!(
         db_driver = ?db_driver,
@@ -438,45 +159,7 @@ async fn bootstrap_users_service() -> Result<UsersService> {
             let pool = krab_core::db::connect_with_config(&db_cfg)
                 .await
                 .context("failed to connect to users database")?;
-
-            let promotion = PromotionConfig::from_env();
-            enforce_promotion_policy(&pool, &promotion)
-                .await
-                .context("failed to enforce migration promotion policy")?;
-
-            let governance = MigrationGovernanceConfig::from_env();
-            enforce_migration_governance(&pool, &governance)
-                .await
-                .context("failed to enforce migration governance policy")?;
-
-            anyhow::ensure!(
-                promotion.allow_apply,
-                "DB_MIGRATION_ALLOW_APPLY is false; refusing to run automatic migrations"
-            );
-
-            let report = run_versioned_migrations(
-                &pool,
-                &users_service_migrations(),
-                migration_failure_policy_from_env(),
-            )
-            .await
-            .context("failed to run users migrations")?;
-            info!(
-                applied = ?report.applied_versions,
-                skipped = ?report.skipped_versions,
-                "users_migrations_applied"
-            );
-
-            let drift = detect_migration_drift(&pool, &users_service_migrations())
-                .await
-                .context("failed to detect users migration drift")?;
-            info!(
-                missing = ?drift.missing_versions,
-                unexpected = ?drift.unexpected_versions,
-                checksum_mismatches = ?drift.checksum_mismatches,
-                environment = %promotion.environment,
-                "users_migration_drift_report"
-            );
+            run_postgres_migration_lifecycle(&pool).await?;
 
             let wrapped = UsersDbPool::Postgres(pool);
             let repo = build_user_repository(DbDriver::Postgres, &wrapped)?;
@@ -492,32 +175,7 @@ async fn bootstrap_users_service() -> Result<UsersService> {
                 .connect(&db_cfg.url)
                 .await
                 .context("failed to connect to users sqlite database")?;
-
-            sqlx::query(
-                "CREATE TABLE IF NOT EXISTS users (
-                    id TEXT PRIMARY KEY,
-                    username TEXT NOT NULL UNIQUE,
-                    email TEXT NOT NULL UNIQUE,
-                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-                    tenant_id TEXT NULL
-                )",
-            )
-            .execute(&pool)
-            .await
-            .context("failed to bootstrap sqlite users schema")?;
-
-            sqlx::query("CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at)")
-                .execute(&pool)
-                .await
-                .context("failed to create sqlite users index")?;
-
-            sqlx::query("CREATE INDEX IF NOT EXISTS idx_users_tenant_id ON users(tenant_id)")
-                .execute(&pool)
-                .await
-                .context("failed to create sqlite tenant index")?;
-
-            info!("sqlite_users_schema_bootstrapped");
+            bootstrap_sqlite_users_schema(&pool).await?;
 
             let wrapped = UsersDbPool::Sqlite(pool);
             let repo = build_user_repository(DbDriver::Sqlite, &wrapped)?;
@@ -636,6 +294,7 @@ mod tests {
     use crate::db::postgres::PostgresUserRepository;
     use crate::db::sqlite::SqliteUserRepository;
     use crate::domain::service::UserDomainServiceImpl;
+    use async_graphql::{EmptyMutation, EmptySubscription, Schema};
     use axum::body::to_bytes;
     use axum::body::Body;
     use axum::http::Request;
@@ -661,6 +320,86 @@ mod tests {
 
     fn env_lock() -> &'static tokio::sync::Mutex<()> {
         ENV_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    const BOOTSTRAP_ENV_VARS: &[&str] = &[
+        "KRAB_DB_DRIVER",
+        "KRAB_ENVIRONMENT",
+        "KRAB_SERVICE_NAME",
+        "KRAB_HOST",
+        "KRAB_PORT",
+        "KRAB_PROTOCOL_EXPOSURE_MODE",
+        "KRAB_PROTOCOL_ENABLED",
+        "KRAB_PROTOCOL_ENABLED_USERS",
+        "KRAB_PROTOCOL_DEFAULT",
+        "KRAB_PROTOCOL_TOPOLOGY",
+        "DATABASE_URL",
+        "DATABASE_URL_FILE",
+        "DB_MAX_CONNECTIONS",
+        "DB_MIN_CONNECTIONS",
+        "DB_ACQUIRE_TIMEOUT_SECS",
+        "DB_MAX_LIFETIME_SECS",
+        "DB_IDLE_TIMEOUT_SECS",
+        "DB_CONNECT_RETRIES",
+        "DB_CONNECT_RETRY_DELAY_MS",
+    ];
+
+    struct TestEnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl TestEnvGuard {
+        fn capture(names: &[&'static str]) -> Self {
+            Self {
+                saved: names
+                    .iter()
+                    .map(|name| (*name, std::env::var(name).ok()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    fn clear_bootstrap_env() {
+        for name in BOOTSTRAP_ENV_VARS {
+            std::env::remove_var(name);
+        }
+    }
+
+    fn bootstrap_sqlite_database_url(test_name: &str) -> (String, std::path::PathBuf) {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let file_name = format!(
+            "krab_users_{}_{}_{}.sqlite",
+            test_name,
+            std::process::id(),
+            suffix
+        );
+        let path = std::env::current_dir().unwrap().join(&file_name);
+        (format!("sqlite://{}?mode=rwc", file_name), path)
+    }
+
+    fn cleanup_sqlite_database_artifacts(path: &std::path::Path) {
+        for suffix in ["", "-journal", "-shm", "-wal"] {
+            let candidate = if suffix.is_empty() {
+                path.to_path_buf()
+            } else {
+                std::path::PathBuf::from(format!("{}{}", path.display(), suffix))
+            };
+            let _ = std::fs::remove_file(candidate);
+        }
     }
 
     async fn test_state() -> AppState {
@@ -694,7 +433,7 @@ mod tests {
         AppState {
             schema,
             pool: UsersDbPool::Postgres(pool),
-            runtime: RuntimeState::new(),
+            runtime: RuntimeState::new().with_protocol_config(protocol_config.clone()),
             domain,
             protocol_config,
             capabilities,
@@ -761,7 +500,7 @@ mod tests {
         AppState {
             schema,
             pool: UsersDbPool::Sqlite(pool),
-            runtime: RuntimeState::new(),
+            runtime: RuntimeState::new().with_protocol_config(protocol_config.clone()),
             domain,
             protocol_config,
             capabilities,
@@ -815,6 +554,201 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn contract_resolve_db_driver_defaults_to_sqlite_when_env_is_unset() {
+        let _env_guard = env_lock().lock().await;
+        let _saved_env = TestEnvGuard::capture(BOOTSTRAP_ENV_VARS);
+        clear_bootstrap_env();
+
+        assert!(matches!(resolve_db_driver(), Ok(DbDriver::Sqlite)));
+    }
+
+    #[tokio::test]
+    async fn contract_resolve_db_driver_honors_env_overrides() {
+        let _env_guard = env_lock().lock().await;
+        let _saved_env = TestEnvGuard::capture(BOOTSTRAP_ENV_VARS);
+        clear_bootstrap_env();
+
+        std::env::set_var("KRAB_DB_DRIVER", "postgres");
+        assert!(matches!(resolve_db_driver(), Ok(DbDriver::Postgres)));
+
+        std::env::set_var("KRAB_DB_DRIVER", "sqlite");
+        assert!(matches!(resolve_db_driver(), Ok(DbDriver::Sqlite)));
+    }
+
+    #[tokio::test]
+    async fn startup_bootstrap_users_service_defaults_to_sqlite_driver_and_legacy_protocols() {
+        let _env_guard = env_lock().lock().await;
+        let _saved_env = TestEnvGuard::capture(BOOTSTRAP_ENV_VARS);
+        clear_bootstrap_env();
+
+        std::env::set_var("KRAB_ENVIRONMENT", "dev");
+        std::env::set_var("DB_MAX_CONNECTIONS", "1");
+        std::env::set_var("DB_MIN_CONNECTIONS", "1");
+        let (database_url, sqlite_path) = bootstrap_sqlite_database_url("startup_default");
+        std::env::set_var("DATABASE_URL", &database_url);
+
+        let service = bootstrap_users_service()
+            .await
+            .expect("default startup should succeed with sqlite");
+
+        assert_eq!(service.config.name, "users");
+        assert_eq!(service.config.host, "127.0.0.1");
+        assert_eq!(service.config.port, 3002);
+        assert!(matches!(&service.pool, UsersDbPool::Sqlite(_)));
+
+        let protocol = service
+            .config
+            .protocol
+            .as_ref()
+            .expect("bootstrap should attach protocol config");
+        assert_eq!(protocol.exposure_mode, ExposureMode::Multi);
+        assert_eq!(protocol.default_protocol, ProtocolKind::Graphql);
+        assert_eq!(protocol.topology, DeploymentTopology::SingleService);
+        assert_eq!(
+            protocol.enabled_protocols,
+            vec![ProtocolKind::Graphql, ProtocolKind::Rest]
+        );
+
+        if let UsersDbPool::Sqlite(pool) = &service.pool {
+            pool.close().await;
+        }
+        drop(service);
+        cleanup_sqlite_database_artifacts(&sqlite_path);
+    }
+
+    #[tokio::test]
+    async fn startup_bootstrap_users_service_honors_sqlite_driver_service_overrides() {
+        let _env_guard = env_lock().lock().await;
+        let _saved_env = TestEnvGuard::capture(BOOTSTRAP_ENV_VARS);
+        clear_bootstrap_env();
+
+        std::env::set_var("KRAB_ENVIRONMENT", "dev");
+        std::env::set_var("KRAB_DB_DRIVER", "sqlite");
+        std::env::set_var("KRAB_SERVICE_NAME", "users-startup-matrix");
+        std::env::set_var("KRAB_HOST", "0.0.0.0");
+        std::env::set_var("KRAB_PORT", "4317");
+        std::env::set_var("DB_MAX_CONNECTIONS", "1");
+        std::env::set_var("DB_MIN_CONNECTIONS", "1");
+        let (database_url, sqlite_path) = bootstrap_sqlite_database_url("startup_override");
+        std::env::set_var("DATABASE_URL", &database_url);
+
+        let service = bootstrap_users_service()
+            .await
+            .expect("sqlite startup override path should succeed");
+
+        assert_eq!(service.config.name, "users-startup-matrix");
+        assert_eq!(service.config.host, "0.0.0.0");
+        assert_eq!(service.config.port, 4317);
+        assert!(matches!(&service.pool, UsersDbPool::Sqlite(_)));
+
+        if let UsersDbPool::Sqlite(pool) = &service.pool {
+            pool.close().await;
+        }
+        drop(service);
+        cleanup_sqlite_database_artifacts(&sqlite_path);
+    }
+
+    #[tokio::test]
+    async fn startup_bootstrap_users_service_rejects_unsupported_driver() {
+        let _env_guard = env_lock().lock().await;
+        let _saved_env = TestEnvGuard::capture(BOOTSTRAP_ENV_VARS);
+        clear_bootstrap_env();
+
+        std::env::set_var("KRAB_ENVIRONMENT", "dev");
+        std::env::set_var("KRAB_DB_DRIVER", "oracle");
+
+        let err = match bootstrap_users_service().await {
+            Ok(_) => panic!("unsupported driver should fail before boot"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("unsupported KRAB_DB_DRIVER='oracle'"));
+    }
+
+    #[tokio::test]
+    async fn startup_bootstrap_users_service_rejects_sqlite_url_when_postgres_driver_selected() {
+        let _env_guard = env_lock().lock().await;
+        let _saved_env = TestEnvGuard::capture(BOOTSTRAP_ENV_VARS);
+        clear_bootstrap_env();
+
+        std::env::set_var("KRAB_ENVIRONMENT", "dev");
+        std::env::set_var("KRAB_DB_DRIVER", "postgres");
+        std::env::set_var("DATABASE_URL", "sqlite://mismatch.sqlite?mode=rwc");
+
+        let err = match bootstrap_users_service().await {
+            Ok(_) => panic!("postgres driver with sqlite url should fail"),
+            Err(err) => err,
+        };
+
+        let message = err.to_string();
+        assert!(
+            message.contains("failed to connect to users database")
+                || message.contains("sqlite")
+                || message.contains("database driver/pool mismatch"),
+            "unexpected postgres/sqlite mismatch error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_bootstrap_users_service_rejects_postgres_url_when_sqlite_driver_selected() {
+        let _env_guard = env_lock().lock().await;
+        let _saved_env = TestEnvGuard::capture(BOOTSTRAP_ENV_VARS);
+        clear_bootstrap_env();
+
+        std::env::set_var("KRAB_ENVIRONMENT", "dev");
+        std::env::set_var("KRAB_DB_DRIVER", "sqlite");
+        std::env::set_var(
+            "DATABASE_URL",
+            "postgres://postgres@localhost:5432/krab_users",
+        );
+
+        let err = match bootstrap_users_service().await {
+            Ok(_) => panic!("sqlite driver with postgres url should fail"),
+            Err(err) => err,
+        };
+
+        let message = err.to_string();
+        assert!(
+            message.contains("failed to connect to users sqlite database")
+                || message.contains("unknown database")
+                || message.contains("unable to open database file"),
+            "unexpected sqlite/postgres mismatch error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_bootstrap_users_service_rejects_invalid_service_port_override() {
+        let _env_guard = env_lock().lock().await;
+        let _saved_env = TestEnvGuard::capture(BOOTSTRAP_ENV_VARS);
+        clear_bootstrap_env();
+
+        std::env::set_var("KRAB_ENVIRONMENT", "dev");
+        std::env::set_var("KRAB_DB_DRIVER", "sqlite");
+        std::env::set_var("KRAB_PORT", "invalid-port");
+        let (database_url, sqlite_path) = bootstrap_sqlite_database_url("invalid_port");
+        std::env::set_var("DATABASE_URL", &database_url);
+
+        let err = match bootstrap_users_service().await {
+            Ok(_) => panic!("invalid KRAB_PORT should fail bootstrap with typed config error"),
+            Err(err) => err,
+        };
+
+        cleanup_sqlite_database_artifacts(&sqlite_path);
+        assert!(
+            err.to_string().contains("invalid KRAB_PORT='invalid-port'")
+                || err
+                    .source()
+                    .map(|source| source
+                        .to_string()
+                        .contains("invalid KRAB_PORT='invalid-port'"))
+                    .unwrap_or(false),
+            "unexpected invalid port error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
     async fn contract_repository_factory_supports_sqlite_and_rejects_mismatch() {
         let sqlite_pool = UsersDbPool::Sqlite(unavailable_sqlite_pool());
         let sqlite_repo = build_user_repository(DbDriver::Sqlite, &sqlite_pool);
@@ -852,7 +786,7 @@ mod tests {
         AppState {
             schema,
             pool: UsersDbPool::Postgres(pool),
-            runtime: RuntimeState::new(),
+            runtime: RuntimeState::new().with_protocol_config(protocol_config.clone()),
             domain,
             protocol_config,
             capabilities,

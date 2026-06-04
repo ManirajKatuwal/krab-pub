@@ -30,3 +30,7 @@ tracing-subscriber.workspace = true
 tokio-stream = { version = "0.1.18", features = ["sync"] }
 futures-util = "0.3.32"
 anyhow.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+serial_test = "3"

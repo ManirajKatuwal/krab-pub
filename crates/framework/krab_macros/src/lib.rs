@@ -2,7 +2,8 @@ use proc_macro::TokenStream;
 use quote::{quote, ToTokens};
 use syn::{
     parse::{Parse, ParseStream},
-    parse_macro_input, token, Expr, Ident, ItemFn, LitStr, Result, Token,
+    parse_macro_input, token, Expr, FnArg, GenericArgument, Ident, ItemFn, LitStr, PathArguments,
+    Result, ReturnType, Token, Type, TypePath,
 };
 
 // ── Server Function Macro ───────────────────────────────────────────────────
@@ -10,7 +11,9 @@ use syn::{
 /// Marks an async function as a server function.
 ///
 /// On the **server**, the function body is preserved and an Axum handler
-/// function (`{fn_name}_handler`) is generated alongside it.
+/// function (`{fn_name}_handler`) is generated alongside it. Once mounted,
+/// a server function is a public HTTP POST endpoint and must perform its own
+/// validation and authorization checks.
 ///
 /// On the **client** (WASM), the function body is replaced with a `fetch`
 /// call to `/api/rpc/{fn_name}`, transparently calling the server.
@@ -42,11 +45,28 @@ pub fn server(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attr_str = attr.to_string();
     let is_stream = attr_str.contains("stream");
 
+    if let Err(err) = validate_server_attr(&attr_str, &input_fn) {
+        return err.to_compile_error().into();
+    }
+
     // Validate: must be async
     if input_fn.sig.asyncness.is_none() {
-        return syn::Error::new_spanned(input_fn.sig.fn_token, "#[server] functions must be async")
-            .to_compile_error()
-            .into();
+        return syn::Error::new_spanned(
+            input_fn.sig.fn_token,
+            "#[server] functions must be async. Add `async` before `fn`:\n  #[server]\n  pub async fn my_function(...) -> Result<T, ServerFnError> { ... }",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    // Validate: must have a return type
+    if matches!(input_fn.sig.output, syn::ReturnType::Default) {
+        return syn::Error::new_spanned(
+            input_fn.sig.fn_token,
+            "#[server] functions must return Result<T, ServerFnError>.\n  Expected: async fn my_func() -> Result<MyType, ServerFnError> { ... }",
+        )
+        .to_compile_error()
+        .into();
     }
 
     let fn_name = &input_fn.sig.ident;
@@ -135,7 +155,7 @@ pub fn server(attr: TokenStream, item: TokenStream) -> TokenStream {
                     Ok(v) => v,
                     Err(e) => {
                         let msg = format!("Validation failed for '{}': {}. Payload: {}", stringify!(#fn_name), e, __raw_args);
-                        return krab_core::server_fn::ServerFnError::bad_request(msg).into_response();
+                        return krab_core::server_fn::ServerFnError::validation(msg).into_response();
                     }
                 };
                 let stream = #call_expr;
@@ -153,7 +173,7 @@ pub fn server(attr: TokenStream, item: TokenStream) -> TokenStream {
                         Ok(v) => v,
                         Err(e) => {
                             let msg = format!("Validation failed for '{}': {}. Payload: {}", stringify!(#fn_name), e, args);
-                            return krab_core::server_fn::ServerFnError::bad_request(msg).into_response();
+                            return krab_core::server_fn::ServerFnError::validation(msg).into_response();
                         }
                     };
                     let stream = #call_expr;
@@ -177,7 +197,7 @@ pub fn server(attr: TokenStream, item: TokenStream) -> TokenStream {
                     Ok(v) => v,
                     Err(e) => {
                         let msg = format!("Validation failed for '{}': {}. Payload: {}", stringify!(#fn_name), e, __raw_args);
-                        return krab_core::server_fn::ServerFnError::bad_request(msg).into_response();
+                        return krab_core::server_fn::ServerFnError::validation(msg).into_response();
                     }
                 };
                 match #call_expr {
@@ -202,7 +222,7 @@ pub fn server(attr: TokenStream, item: TokenStream) -> TokenStream {
                         Ok(v) => v,
                         Err(e) => {
                             let msg = format!("Validation failed for '{}': {}. Payload: {}", stringify!(#fn_name), e, args);
-                            return krab_core::server_fn::ServerFnError::bad_request(msg).into_response();
+                            return krab_core::server_fn::ServerFnError::validation(msg).into_response();
                         }
                     };
                     match #call_expr {
@@ -248,6 +268,71 @@ pub fn server(attr: TokenStream, item: TokenStream) -> TokenStream {
     TokenStream::from(output)
 }
 
+fn validate_server_attr(attr_str: &str, input_fn: &ItemFn) -> syn::Result<()> {
+    let is_stream = attr_str.contains("stream");
+    let trimmed = attr_str.trim();
+    if !trimmed.is_empty() && trimmed != "stream" {
+        return Err(syn::Error::new_spanned(
+            &input_fn.sig.ident,
+            "#[server] only supports no arguments or `stream` as an option",
+        ));
+    }
+
+    for arg in &input_fn.sig.inputs {
+        if matches!(arg, FnArg::Receiver(_)) {
+            return Err(syn::Error::new_spanned(
+                arg,
+                "#[server] methods with `self` are not supported. Use a free async function instead",
+            ));
+        }
+    }
+
+    if is_result_server_fn(&input_fn.sig.output) || is_stream {
+        return Ok(());
+    }
+
+    Err(syn::Error::new_spanned(
+        &input_fn.sig.output,
+        "#[server] functions must return `Result<T, ServerFnError>` unless declared as `#[server(stream)]`",
+    ))
+}
+
+fn is_result_server_fn(output: &ReturnType) -> bool {
+    let ReturnType::Type(_, ty) = output else {
+        return false;
+    };
+
+    let Type::Path(TypePath { path, .. }) = ty.as_ref() else {
+        return false;
+    };
+
+    let Some(last) = path.segments.last() else {
+        return false;
+    };
+
+    if last.ident != "Result" {
+        return false;
+    }
+
+    let PathArguments::AngleBracketed(args) = &last.arguments else {
+        return false;
+    };
+
+    let generic_args: Vec<&GenericArgument> = args.args.iter().collect();
+    if generic_args.len() != 2 {
+        return false;
+    }
+
+    matches!(generic_args[1], GenericArgument::Type(Type::Path(error_path)) if path_ends_with_server_fn_error(&error_path.path))
+}
+
+fn path_ends_with_server_fn_error(path: &syn::Path) -> bool {
+    path.segments
+        .last()
+        .map(|segment| segment.ident == "ServerFnError")
+        .unwrap_or(false)
+}
+
 /// Convert snake_case to PascalCase.
 fn to_pascal_case(s: &str) -> String {
     s.split('_')
@@ -268,25 +353,58 @@ pub fn island(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let vis = &input_fn.vis;
     let inputs = &input_fn.sig.inputs;
 
+    // Check for generics
+    if !input_fn.sig.generics.params.is_empty() {
+        return syn::Error::new_spanned(
+            &input_fn.sig.generics,
+            "Island components cannot be generic because they require concrete function registration for client-side hydration",
+        )
+        .to_compile_error()
+        .into();
+    }
+
     // Check for props argument
     let props_type = if let Some(syn::FnArg::Typed(pat_type)) = inputs.first() {
         &pat_type.ty
     } else {
-        return syn::Error::new_spanned(inputs, "Component must have one argument (props)")
-            .to_compile_error()
-            .into();
+        return syn::Error::new_spanned(
+            inputs,
+            "#[island] component must have exactly one props argument.\n  \
+             Example:\n    #[island]\n    fn MyIsland(props: MyProps) -> krab_core::Node { ... }",
+        )
+        .to_compile_error()
+        .into();
     };
+
+    // Validate: must have exactly one argument
+    if inputs.len() > 1 {
+        return syn::Error::new_spanned(
+            inputs,
+            "#[island] component must have exactly one argument (props struct).\n  \
+             Multiple arguments are not supported. Bundle them into a single props struct:\n    \
+             #[derive(Clone, Serialize, Deserialize)]\n    \
+             struct MyProps { field1: String, field2: i32 }\n    \
+             #[island]\n    \
+             fn MyIsland(props: MyProps) -> krab_core::Node { ... }",
+        )
+        .to_compile_error()
+        .into();
+    }
 
     let props_arg_name = if let Some(syn::FnArg::Typed(pat_type)) = inputs.first() {
         if let syn::Pat::Ident(pat_ident) = &*pat_type.pat {
             &pat_ident.ident
         } else {
-            return syn::Error::new_spanned(inputs, "Component argument must be an identifier")
-                .to_compile_error()
-                .into();
+            return syn::Error::new_spanned(
+                inputs,
+                "#[island] component argument must be a simple identifier, not a pattern.\n  \
+                 Use: fn MyIsland(props: MyProps) instead of destructuring",
+            )
+            .to_compile_error()
+            .into();
         }
     } else {
-        return syn::Error::new_spanned(inputs, "Component must have one argument")
+        return syn::Error::new_spanned(inputs, "#[island] component must have one argument")
             .to_compile_error()
             .into();
     };
@@ -302,7 +420,9 @@ pub fn island(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #vis fn #original_fn_name(#inputs) -> krab_core::Node {
             // Serialize props
             let props_json = serde_json::to_string(&#props_arg_name).unwrap_or_default();
-            let children = #inner_fn_name(#props_arg_name.clone());
+            let boundary_id = krab_core::next_hydration_boundary_id(stringify!(#original_fn_name));
+            let children =
+                krab_core::annotate_hydration_tree(#inner_fn_name(#props_arg_name.clone()), &boundary_id);
 
             // Wrap in div
             krab_core::Node::Element(krab_core::Element {
@@ -310,6 +430,9 @@ pub fn island(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 attributes: vec![
                     krab_core::Attribute { name: "data-island".to_string(), value: stringify!(#original_fn_name).to_string() },
                     krab_core::Attribute { name: "data-props".to_string(), value: props_json },
+                    krab_core::Attribute { name: "data-krab-boundary".to_string(), value: stringify!(#original_fn_name).to_string() },
+                    krab_core::Attribute { name: "data-krab-boundary-id".to_string(), value: boundary_id },
+                    krab_core::Attribute { name: "data-krab-boundary-state".to_string(), value: "ssr".to_string() },
                 ],
                 children: vec![children],
                 events: vec![],
@@ -425,6 +548,15 @@ struct EventListener {
 
 impl Parse for Node {
     fn parse(input: ParseStream) -> Result<Self> {
+        if input.is_empty() {
+            return Err(input.error(
+                "view! macro body is empty. Provide at least one element, text, or expression:\n  \
+                 view! { <div>\"Hello\"</div> }\n  \
+                 view! { \"Static text\" }\n  \
+                 view! { {my_variable} }",
+            ));
+        }
+
         if input.peek(Token![<]) {
             if input.peek2(Token![>]) {
                 // Fragment <>...</>
@@ -501,9 +633,13 @@ impl Parse for Element {
                 syn::braced!(content in input);
                 content.parse()?
             } else {
-                return Err(
-                    input.error("Expected string literal or expression block for attribute value")
-                );
+                return Err(input.error(format!(
+                    "Expected string literal or {{expression}} for attribute '{}' value.\n  \
+                             Examples:\n    \
+                             <div class=\"my-class\">  (string literal)\n    \
+                             <div class={{my_var}}>  (expression block)",
+                    attr_name_str
+                )));
             };
 
             attributes.push(Attribute {

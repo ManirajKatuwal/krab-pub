@@ -1,0 +1,15 @@
+error: #[server] functions must be async. Add `async` before `fn`:
+         #[server]
+         pub async fn my_function(...) -> Result<T, ServerFnError> { ... }
+ --> tests/compile_fail/server_not_async.rs:6:5
+  |
+6 | pub fn sync_function(id: String) -> Result<String, ServerFnError> {
+  |     ^^
+
+warning: unused import: `krab_core::server_fn::ServerFnError`
+ --> tests/compile_fail/server_not_async.rs:3:5
+  |
+3 | use krab_core::server_fn::ServerFnError;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

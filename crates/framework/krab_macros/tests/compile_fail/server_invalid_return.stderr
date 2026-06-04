@@ -1,0 +1,5 @@
+error: #[server] functions must return `Result<T, ServerFnError>` unless declared as `#[server(stream)]`
+ --> tests/compile_fail/server_invalid_return.rs:4:41
+  |
+4 | pub async fn invalid_return(id: String) -> String {
+  |                                         ^^^^^^^^^

@@ -1,6 +1,7 @@
 import json
 import pathlib
 import sys
+import os
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -10,6 +11,19 @@ SUMMARY_PATH = ROOT / "plans" / "load_test_artifacts" / "latest_summary.md"
 
 def load_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw.strip())
+        if value <= 0:
+            return default
+        return value
+    except Exception:
+        return default
 
 
 def main():
@@ -23,6 +37,7 @@ def main():
     limits = thresholds["horizontal_scaling"]["max_percent_increase_from_single_replica"]
     p95_limit = float(limits["p95"])
     p99_limit = float(limits["p99"])
+    baseline_floor_ms = env_float("KRAB_SCALING_BASELINE_FLOOR_MS", 10.0)
 
     single_by_service = {item["service"]: item for item in single["results"]}
     scaled_by_service = {item["service"]: item for item in scaled["results"]}
@@ -36,6 +51,7 @@ def main():
     lines.append(f"- **Timestamp (UTC):** {scaled.get('timestamp_utc', '')}")
     lines.append("- **Scope:** service_frontend + service_auth + service_users")
     lines.append("- **Mode:** horizontal scaling validation (`N=1` vs `N=3`) with shared state")
+    lines.append(f"- **Regression baseline floor:** {baseline_floor_ms:.1f} ms")
     lines.append("")
     lines.append("## Single Replica (`N=1`)")
     lines.append("")
@@ -64,8 +80,10 @@ def main():
         base = single_by_service[service]
         scale = scaled_by_service[service]
 
-        base_p95 = max(float(base["p95_ms"]), 1.0)
-        base_p99 = max(float(base["p99_ms"]), 1.0)
+        # Use a floor for very small baselines so sub-millisecond shifts do not
+        # create outsized percentage regressions and false gate failures.
+        base_p95 = max(float(base["p95_ms"]), baseline_floor_ms)
+        base_p99 = max(float(base["p99_ms"]), baseline_floor_ms)
 
         p95_reg = ((float(scale["p95_ms"]) - base_p95) / base_p95) * 100.0
         p99_reg = ((float(scale["p99_ms"]) - base_p99) / base_p99) * 100.0

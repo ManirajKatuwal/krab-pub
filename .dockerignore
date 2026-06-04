@@ -1,0 +1,30 @@
+# Rust build outputs (largest contributor to Docker context size)
+target/
+**/target/
+
+# VCS / editor / local environment
+.git/
+.github/
+.vscode/
+.idea/
+.env
+
+# Python/JS caches
+__pycache__/
+*.pyc
+node_modules/
+
+# Runtime/log artifacts
+frontend_stdout.txt
+frontend_stderr.txt
+*.log
+
+# Audit and generated evidence artifacts (not needed to compile service bins)
+audit/evidence/
+plans/load_test_artifacts/*.json
+plans/load_test_artifacts/*.md
+plans/load_test_artifacts/*.csv
+
+# OS junk
+.DS_Store
+Thumbs.db

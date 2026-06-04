@@ -7,3 +7,9 @@ timestamp_utc,service,framework,route,profile,replica_mode,shared_state_mode,sam
 2026-03-08T10:53:42Z,benchmark,krab,api_status,load,single,none,1000,2156.87,2348.37,0,0,0,0,0.0,info,local-dev,external-benchmark
 2026-03-08T10:53:42Z,benchmark,krab,api_mutation,load,single,none,1000,16.19,16.19,0,0,0,0,98.4,info,local-dev,external-benchmark
 2026-03-08T10:53:42Z,benchmark,krab,health,load,single,none,1000,9.27,16.75,0,0,0,0,94.3,info,local-dev,external-benchmark
+2026-03-18T20:22:18Z,service_frontend,krab,composite,load,single,redis,1000,7,8,120,250,0,0,0.0,pass,local-dev,ci-nft-auto-append
+2026-03-18T20:22:18Z,service_auth,krab,composite,load,single,redis,1000,8,9,80,160,0,0,0.0,pass,local-dev,ci-nft-auto-append
+2026-03-18T20:22:18Z,service_users,krab,composite,load,single,redis,1000,6,9,150,300,0,0,0.0,pass,local-dev,ci-nft-auto-append
+2026-03-18T20:29:24Z,service_frontend,krab,composite,load,scaled,redis,1000,8,10,120,250,0,0,0.0,pass,local-dev,ci-nft-auto-append
+2026-03-18T20:29:24Z,service_auth,krab,composite,load,scaled,redis,1000,8,11,80,160,0,0,0.0,pass,local-dev,ci-nft-auto-append
+2026-03-18T20:29:24Z,service_users,krab,composite,load,scaled,redis,1000,8,10,150,300,0,0,0.0,pass,local-dev,ci-nft-auto-append

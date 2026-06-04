@@ -49,11 +49,14 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --no-deps
 
-      - name: Cargo deny (security and license policy)
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check advisories licenses bans sources
-          arguments: --all-features
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Dependency policy gate (CI/local parity)
+        run: cargo run --package krab_cli -- security dependency-gate --diagnostics
+
+      - name: Verify alert routing + on-call delivery path
+        run: python3 scripts/verify_oncall_delivery_path.py
 
   migration-contract-e2e-gates:
     runs-on: ubuntu-latest
@@ -86,3 +89,30 @@ jobs:
             Cargo.lock
             .env.example
             krab.toml
+
+  release-certification-evidence:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Generate release certification evidence
+        run: cargo run --package krab_cli -- release certify --out audit/release-certify/run-${{ github.run_id }} --json
+
+      - name: Upload release certification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-certification-${{ github.run_id }}
+          path: |
+            audit/release-certify/run-${{ github.run_id }}
+            audit/release-certify/latest.json
+            audit/release-certify/latest.md

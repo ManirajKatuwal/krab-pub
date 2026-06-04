@@ -20,16 +20,15 @@
 .DS_Store
 Thumbs.db
 
-# Internal working documents (not for public distribution)
-plans/memory_notes.md
-plans/fullstack_remediation.md
-plans/next_steps.md
-plans/09_feature_maturity_task_document.md
-plans/06_completeness_report.md
-plans/phase6_integration_matrix.md
+# Internal documentation (not for public distribution)
+AUDIT.md
+plans/
+docs/wiki/
+docs/PRE_RELEASE_*.md
+docs/FRAMEWORK_*.md
 
 # Audit logs (internal)
 audit/
 
-# CI-generated load test snapshots (updated per run, not static docs)
-plans/load_test_artifacts/latest_summary*.md
+# Local runtime artifacts
+dist/.hmr_signal

@@ -12,14 +12,13 @@ use krab_core::http::{
     HasReadinessDependencies, HasRuntimeState, RuntimeState,
 };
 use krab_core::protocol::{ProtocolConfig, ProtocolKind};
-use krab_core::service::{ApiService, ServiceConfig};
+use krab_core::service::{serve_with_graceful_shutdown, ApiService, ServiceConfig};
 use krab_core::telemetry::init_tracing;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 const INSECURE_DEV_JWT_SECRET: &str = "krab-insecure-dev-secret-change-me";
@@ -571,35 +570,18 @@ fn build_app(state: AppState) -> Router {
 impl ApiService for AuthService {
     async fn start(&self) -> Result<()> {
         let state = AppState {
-            runtime: RuntimeState::new(),
+            runtime: RuntimeState::new().with_protocol_config(
+                self.config
+                    .protocol
+                    .clone()
+                    .unwrap_or_else(ProtocolConfig::from_env),
+            ),
         };
 
         let app = build_app(state);
-        let addr = format!("{}:{}", self.config.host, self.config.port)
-            .parse::<SocketAddr>()
-            .context("invalid auth service bind address")?;
 
-        info!(
-            service = %self.config.name,
-            host = %self.config.host,
-            port = self.config.port,
-            "service_listening"
-        );
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .context("failed to bind auth service listener")?;
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .context("auth service server exited with error")?;
-        info!(service = %self.config.name, "service_shutdown_complete");
-        Ok(())
+        serve_with_graceful_shutdown(app, &self.config).await
     }
-}
-
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    info!(service = "auth", "service_shutdown_signal_received");
 }
 
 fn bootstrap_auth_service() -> Result<AuthService> {
@@ -619,13 +601,22 @@ fn bootstrap_auth_service() -> Result<AuthService> {
             .collect::<Vec<&str>>()
     );
 
-    let cfg = KrabConfig::from_env("auth", 3001);
-    cfg.validate().context("startup config validation failed")?;
+    let cfg = KrabConfig::from_env_checked("auth", 3001)
+        .context("failed to load auth config from environment")?;
+    let secrets_report = cfg
+        .validate_all()
+        .context("startup config validation failed")?;
+    if !secrets_report.is_clean() {
+        warn!(
+            issue_count = secrets_report.issues.len(),
+            "startup_secrets_policy_warnings_detected"
+        );
+    }
     let config = ServiceConfig {
         name: cfg.service_name.clone(),
         host: cfg.host.clone(),
         port: cfg.port,
-        protocol: None,
+        protocol: Some(protocol_cfg.clone()),
     };
 
     // Fail fast if critical security configuration is missing in production mode

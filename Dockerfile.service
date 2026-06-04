@@ -5,7 +5,7 @@ ARG BIN=service_auth
 
 # ── Build stage ───────────────────────────────────────────────────────────────
 # Use stable Rust so Cargo understands modern lockfile formats (v4+).
-FROM rust:stable-slim-bookworm AS builder
+FROM rust:slim-bookworm AS builder
 ARG BIN
 WORKDIR /build
 

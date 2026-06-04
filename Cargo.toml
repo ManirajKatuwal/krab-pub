@@ -9,8 +9,17 @@ members = [
     "crates/framework/krab_client",
     "crates/tooling/krab_cli",
     "crates/framework/krab_server",
+    "services/service_users_split",
 ]
 resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A full-stack rust web framework"
+repository = "https://github.com/krab-framework/krab"
+homepage = "https://github.com/krab-framework/krab"
 
 [workspace.dependencies]
 axum = "=0.8.8"
@@ -25,4 +34,14 @@ anyhow = "1.0"
 async-trait = "0.1"
 tower = "0.5"
 tower-http = "0.6"
+http-body-util = "0.1"
+
+[profile.release]
+lto = true
+opt-level = "z"
+strip = true
+codegen-units = 1
+
+[profile.dev]
+debug = true
 

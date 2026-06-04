@@ -30,7 +30,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 
 # Dependency governance
-cargo deny --all-features check advisories licenses bans
+cargo run --package krab_cli -- security dependency-gate --diagnostics
 
 # Documentation
 cargo doc --workspace --no-deps

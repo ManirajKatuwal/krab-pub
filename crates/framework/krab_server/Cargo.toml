@@ -1,8 +1,11 @@
 [package]
 name = "krab_server"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 hyper = { version = "1.0", features = ["full"] }

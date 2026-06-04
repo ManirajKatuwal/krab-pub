@@ -89,6 +89,9 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Backward compatibility gate (schema test)
+        run: cargo run --package krab_cli -- contract check --diagnostics
+
       - name: Run parity gate suite
         run: |
           cargo test -p service_users parity_

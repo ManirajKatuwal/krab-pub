@@ -196,7 +196,9 @@ mod tests {
         let pool = match get_test_pool().await {
             Some(p) => p,
             None => {
-                println!("Skipping test_governance_release_requires_rehearsal_artifact: database not available");
+                println!(
+                    "Skipping test_governance_release_requires_rehearsal_artifact: database not available"
+                );
                 return;
             }
         };
@@ -208,6 +210,7 @@ mod tests {
             allow_apply: true,
             release_environments: vec!["staging".to_string(), "prod".to_string()],
             require_rollback_rehearsal_in_release: true,
+            drift_tolerance_threshold: 0,
         };
 
         let result = enforce_migration_governance(&pool, &cfg).await;
@@ -219,7 +222,9 @@ mod tests {
         let pool = match get_test_pool().await {
             Some(p) => p,
             None => {
-                println!("Skipping test_governance_release_passes_with_rehearsal_artifact: database not available");
+                println!(
+                    "Skipping test_governance_release_passes_with_rehearsal_artifact: database not available"
+                );
                 return;
             }
         };
@@ -242,10 +247,35 @@ mod tests {
             allow_apply: true,
             release_environments: vec!["staging".to_string(), "prod".to_string()],
             require_rollback_rehearsal_in_release: true,
+            drift_tolerance_threshold: 0,
         };
 
         enforce_migration_governance(&pool, &cfg)
             .await
             .expect("governance should pass with rehearsal artifact");
+    }
+
+    #[test]
+    fn test_enforce_drift_policy() {
+        use crate::db::{enforce_drift_policy, MigrationDriftReport};
+
+        let report_clean = MigrationDriftReport::default();
+        assert!(enforce_drift_policy(&report_clean, 0).is_ok());
+
+        let report_unexpected = MigrationDriftReport {
+            unexpected_versions: vec![999],
+            ..Default::default()
+        };
+        // Allowed threshold is 1
+        assert!(enforce_drift_policy(&report_unexpected, 1).is_ok());
+        // Threshold 0 should fail
+        assert!(enforce_drift_policy(&report_unexpected, 0).is_err());
+
+        // Mismatches or missing versions should always fail
+        let report_missing = MigrationDriftReport {
+            missing_versions: vec![1],
+            ..Default::default()
+        };
+        assert!(enforce_drift_policy(&report_missing, 1).is_err());
     }
 }
