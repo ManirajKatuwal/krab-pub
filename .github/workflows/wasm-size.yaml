@@ -43,7 +43,7 @@ jobs:
 
       - name: Build WASM bundle
         working-directory: crates/framework/krab_client
-        run: wasm-pack build --release --target web --out-dir ../dist/pkg
+        run: wasm-pack build --release --target web --out-dir ../../../dist/pkg
 
       - name: Measure bundle size
         id: size

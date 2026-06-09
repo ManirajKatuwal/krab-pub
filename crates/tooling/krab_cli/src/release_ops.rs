@@ -713,55 +713,6 @@ fn render_release_certification_index_markdown(index: &ReleaseCertificationIndex
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        build_release_certification_index, render_release_certification_index_markdown,
-        CertificationStepReport, ReleaseCertificationReport,
-    };
-    use std::path::Path;
-
-    #[test]
-    fn certification_index_tracks_summary_paths() {
-        let summary = ReleaseCertificationReport {
-            success: true,
-            evidence_root: "audit/release-certify/run-42".to_string(),
-            timestamp: "2026-06-05T00:00:00Z".to_string(),
-            steps: vec![CertificationStepReport {
-                name: "workspace-tests",
-                artifact: "audit/release-certify/run-42/01-test-and-lint/workspace-tests.txt"
-                    .to_string(),
-                status: "passed",
-                error: None,
-            }],
-        };
-
-        let index =
-            build_release_certification_index(Path::new("audit/release-certify/run-42"), &summary);
-        assert_eq!(index.evidence_root, "audit/release-certify/run-42");
-        assert!(index.summary_json.ends_with("08-signoff/summary.json"));
-        assert!(index.summary_markdown.ends_with("08-signoff/summary.md"));
-    }
-
-    #[test]
-    fn certification_index_markdown_links_summary_artifacts() {
-        let markdown =
-            render_release_certification_index_markdown(&build_release_certification_index(
-                Path::new("audit/release-certify/run-77"),
-                &ReleaseCertificationReport {
-                    success: false,
-                    evidence_root: "audit/release-certify/run-77".to_string(),
-                    timestamp: "2026-06-05T01:02:03Z".to_string(),
-                    steps: vec![],
-                },
-            ));
-
-        assert!(markdown.contains("Latest Release Certification Evidence"));
-        assert!(markdown.contains("audit/release-certify/run-77/08-signoff/summary.json"));
-        assert!(markdown.contains("audit/release-certify/run-77/08-signoff/summary.md"));
-    }
-}
-
 pub(super) fn run_command_logged(label: &str, cmd: &mut Command, diagnostics: bool) -> Result<()> {
     if diagnostics {
         println!("   > Running: {label}");
@@ -864,4 +815,53 @@ fn run_protocol_version_compatibility_check() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_release_certification_index, render_release_certification_index_markdown,
+        CertificationStepReport, ReleaseCertificationReport,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn certification_index_tracks_summary_paths() {
+        let summary = ReleaseCertificationReport {
+            success: true,
+            evidence_root: "audit/release-certify/run-42".to_string(),
+            timestamp: "2026-06-05T00:00:00Z".to_string(),
+            steps: vec![CertificationStepReport {
+                name: "workspace-tests",
+                artifact: "audit/release-certify/run-42/01-test-and-lint/workspace-tests.txt"
+                    .to_string(),
+                status: "passed",
+                error: None,
+            }],
+        };
+
+        let index =
+            build_release_certification_index(Path::new("audit/release-certify/run-42"), &summary);
+        assert_eq!(index.evidence_root, "audit/release-certify/run-42");
+        assert!(index.summary_json.ends_with("08-signoff/summary.json"));
+        assert!(index.summary_markdown.ends_with("08-signoff/summary.md"));
+    }
+
+    #[test]
+    fn certification_index_markdown_links_summary_artifacts() {
+        let markdown =
+            render_release_certification_index_markdown(&build_release_certification_index(
+                Path::new("audit/release-certify/run-77"),
+                &ReleaseCertificationReport {
+                    success: false,
+                    evidence_root: "audit/release-certify/run-77".to_string(),
+                    timestamp: "2026-06-05T01:02:03Z".to_string(),
+                    steps: vec![],
+                },
+            ));
+
+        assert!(markdown.contains("Latest Release Certification Evidence"));
+        assert!(markdown.contains("audit/release-certify/run-77/08-signoff/summary.json"));
+        assert!(markdown.contains("audit/release-certify/run-77/08-signoff/summary.md"));
+    }
 }

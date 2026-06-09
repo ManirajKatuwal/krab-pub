@@ -3,15 +3,13 @@ use krab_core::render_policy::{CacheMode, EdgeCapability, RenderMode, RouteRende
 use crate::frontend_env::{distributed_cache_ttl, isr_revalidate_duration};
 
 fn normalized_route_pattern(path: &str) -> &str {
-    let route_pattern = if path == "/" {
+    if path == "/" {
         "/"
     } else if path.starts_with("/blog/") {
         "/blog/:slug"
     } else {
         path
-    };
-
-    route_pattern
+    }
 }
 
 pub(crate) fn route_render_policy(path: &str) -> Option<RouteRenderPolicy> {

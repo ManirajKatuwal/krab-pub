@@ -125,7 +125,7 @@ jobs:
 
       - name: Build and start all services
         run: docker compose up -d --build --wait
-        timeout-minutes: 10
+        timeout-minutes: 20
 
       - name: Wait for services to become healthy
         run: |

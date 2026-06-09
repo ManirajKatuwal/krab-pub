@@ -346,6 +346,24 @@ impl IntoNode for &i32 {
     }
 }
 
+// Generic implementation for Closures?
+// impl<F> IntoNode for F where F: Fn() -> Node + 'static { ... }
+// This might conflict or requires boxing.
+// Since we use Rc<dyn Fn() -> Node>, we can impl it.
+impl<F> IntoNode for F
+where
+    F: Fn() -> Node + 'static,
+{
+    fn into_node(self) -> Node {
+        Node::Dynamic(Rc::new(self))
+    }
+}
+
+// Also support closures returning things that can be nodes?
+// e.g. Fn() -> String.
+// Rust doesn't support specialization well, so F: Fn() -> Node is safer.
+// If the user returns String from closure, they might need to wrap it.
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,21 +476,3 @@ mod tests {
         );
     }
 }
-
-// Generic implementation for Closures?
-// impl<F> IntoNode for F where F: Fn() -> Node + 'static { ... }
-// This might conflict or requires boxing.
-// Since we use Rc<dyn Fn() -> Node>, we can impl it.
-impl<F> IntoNode for F
-where
-    F: Fn() -> Node + 'static,
-{
-    fn into_node(self) -> Node {
-        Node::Dynamic(Rc::new(self))
-    }
-}
-
-// Also support closures returning things that can be nodes?
-// e.g. Fn() -> String.
-// Rust doesn't support specialization well, so F: Fn() -> Node is safer.
-// If the user returns String from closure, they might need to wrap it.
