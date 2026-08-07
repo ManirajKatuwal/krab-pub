@@ -1,5 +1,7 @@
 # Build artifacts
 /target/
+/dist/pkg/
+dist/.hmr_signal
 
 # Local environment (never commit secrets)
 .env
@@ -9,6 +11,10 @@
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# Python tooling
+__pycache__/
+*.py[cod]
 
 # IDE
 .vscode/
@@ -20,15 +26,21 @@
 .DS_Store
 Thumbs.db
 
-# Internal documentation (not for public distribution)
-AUDIT.md
-plans/
-docs/wiki/
-docs/PRE_RELEASE_*.md
-docs/FRAMEWORK_*.md
+# ---------------------------------------------------------------------------
+# Internal documentation and evidence (not for public distribution).
+# Everything internal lives under internal/ so this stays a single rule.
+#   internal/plans/    planning documents and roadmaps
+#   internal/audit/    audit reports, evidence bundles, generated CI evidence
+#   internal/wiki/     engineering wiki
+#   internal/reports/  strategy, framework, and pre-release reports
+# ---------------------------------------------------------------------------
+internal/
 
-# Audit logs (internal)
-audit/
+# Generated benchmark/NFT results (inputs in benchmarks/ stay tracked)
+benchmarks/latest_summary*.md
+benchmarks/release_evidence_bundle.*
+benchmarks/*_replica_results.json
+benchmarks/shared_state_validation.json
 
-# Local runtime artifacts
-dist/.hmr_signal
+# Rendered compose output
+docker/composed.nft.rendered.yaml

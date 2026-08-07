@@ -4,7 +4,7 @@ import time
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-ART = ROOT / "plans" / "load_test_artifacts"
+ART = ROOT / "benchmarks"
 
 
 def exists(path: pathlib.Path) -> bool:
@@ -20,7 +20,7 @@ def main() -> int:
         "scaled_results": ART / "scaled_replica_results.json",
         "shared_state_validation": ART / "shared_state_validation.json",
         "trend_history": ART / "trend_history.csv",
-        "rollback_rehearsal_evidence": ROOT / "rollback-rehearsal-evidence.txt",
+        "rollback_rehearsal_evidence": ROOT / "internal" / "audit" / "evidence" / "rollback-rehearsal-evidence.txt",
     }
 
     status = {name: exists(path) for name, path in files.items()}

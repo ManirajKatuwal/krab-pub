@@ -83,7 +83,7 @@ enum Commands {
     /// Generate developer workflow documentation
     Docs {
         /// Output file path
-        #[arg(long, default_value = "plans/07_dev_workflow.md")]
+        #[arg(long, default_value = "docs/guides/dev_workflow.md")]
         out: PathBuf,
     },
     /// Bootstrap full local stack in one command (build + orchestrator)
@@ -181,7 +181,10 @@ enum DbAction {
     /// Run rollback rehearsal and capture evidence
     Rehearsal {
         /// Path for evidence output
-        #[arg(long, default_value = "rollback-rehearsal-evidence.txt")]
+        #[arg(
+            long,
+            default_value = "internal/audit/evidence/rollback-rehearsal-evidence.txt"
+        )]
         out: PathBuf,
         /// Emit richer command diagnostics
         #[arg(long)]

@@ -12,7 +12,7 @@ import urllib.request
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-OUT = ROOT / "plans" / "load_test_artifacts" / "targeted_hardening_results.json"
+OUT = ROOT / "benchmarks" / "targeted_hardening_results.json"
 
 
 def wait_until_ready(url: str, timeout_s: int = 120) -> bool:

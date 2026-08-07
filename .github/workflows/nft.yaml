@@ -88,8 +88,8 @@ jobs:
             -f docker-compose.nft.yaml \
             run --rm nft_runner \
             --mode single \
-            --json-out plans/load_test_artifacts/single_replica_results.json \
-            --markdown-out plans/load_test_artifacts/latest_summary_single.md
+            --json-out benchmarks/single_replica_results.json \
+            --markdown-out benchmarks/latest_summary_single.md
 
       - name: Stop single-replica stack
         if: always()
@@ -117,8 +117,8 @@ jobs:
             -f docker-compose.nft.yaml \
             run --rm nft_runner \
             --mode scaled \
-            --json-out plans/load_test_artifacts/scaled_replica_results.json \
-            --markdown-out plans/load_test_artifacts/latest_summary_scaled.md
+            --json-out benchmarks/scaled_replica_results.json \
+            --markdown-out benchmarks/latest_summary_scaled.md
 
       - name: Validate shared-state rate-limit behavior (scaled)
         env:
@@ -141,8 +141,8 @@ jobs:
       - name: Evaluate horizontal scaling regression gate
         run: |
           python3 scripts/nft_scaling_compare.py \
-            plans/load_test_artifacts/single_replica_results.json \
-            plans/load_test_artifacts/scaled_replica_results.json
+            benchmarks/single_replica_results.json \
+            benchmarks/scaled_replica_results.json
 
       - name: Append trend history rows
         if: always()
@@ -150,8 +150,8 @@ jobs:
           KRAB_SHARED_STATE_MODE: redis
         run: |
           python3 scripts/nft_append_trends.py \
-            plans/load_test_artifacts/single_replica_results.json \
-            plans/load_test_artifacts/scaled_replica_results.json
+            benchmarks/single_replica_results.json \
+            benchmarks/scaled_replica_results.json
 
       - name: Stop multi-service stack
         if: always()
@@ -168,12 +168,12 @@ jobs:
           name: nft-results-${{ github.run_id }}
           path: |
             target/criterion/
-            plans/load_test_artifacts/latest_summary.md
-            plans/load_test_artifacts/latest_summary_single.md
-            plans/load_test_artifacts/latest_summary_scaled.md
-            plans/load_test_artifacts/single_replica_results.json
-            plans/load_test_artifacts/scaled_replica_results.json
-            plans/load_test_artifacts/shared_state_validation.json
-            plans/load_test_artifacts/release_evidence_bundle.json
-            plans/load_test_artifacts/release_evidence_bundle.md
-            plans/load_test_artifacts/trend_history.csv
+            benchmarks/latest_summary.md
+            benchmarks/latest_summary_single.md
+            benchmarks/latest_summary_scaled.md
+            benchmarks/single_replica_results.json
+            benchmarks/scaled_replica_results.json
+            benchmarks/shared_state_validation.json
+            benchmarks/release_evidence_bundle.json
+            benchmarks/release_evidence_bundle.md
+            benchmarks/trend_history.csv

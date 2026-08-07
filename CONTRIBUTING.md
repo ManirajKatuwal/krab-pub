@@ -51,7 +51,7 @@ wasm-pack build krab_client --release --target web
 - Keep a PR focused on one logical objective.
 - Keep commit history clean; merge strategy is **squash merge**.
 - Every required CI workflow must be green before merge.
-- Breaking changes require migration notes in [`docs/API.md`](docs/API.md) and [`CHANGELOG.md`](CHANGELOG.md).
+- Breaking changes require migration notes in [`docs/reference/api.md`](docs/reference/api.md) and [`CHANGELOG.md`](CHANGELOG.md).
 
 ---
 
@@ -69,7 +69,7 @@ wasm-pack build krab_client --release --target web
   );
   ```
 - **OpenTelemetry keys**: Use OTel-aligned field names where applicable (`http.method`, `http.status_code`, `http.route`, `duration_ms`).
-- **Configuration**: New configuration knobs must be documented in [`.env.example`](.env.example) and [`plans/environment_template.md`](plans/environment_template.md).
+- **Configuration**: New configuration knobs must be documented in [`.env.example`](.env.example) and [`docs/reference/environment.md`](docs/reference/environment.md).
 - **Secrets**: Use `krab_core::config::read_env_or_file()` for any sensitive configuration. Never hardcode secrets.
 
 ### Database Migrations
@@ -78,7 +78,7 @@ wasm-pack build krab_client --release --target web
 - Every migration must provide `rollback_sql` unless explicitly irreversible and documented.
 - Destructive migrations (`destructive: true`) **must** include `rollback_sql`.
 - Promotion to staging/production requires rollback rehearsal evidence.
-- See [`docs/database.md`](docs/database.md) for the full migration governance model.
+- See [`docs/reference/database.md`](docs/reference/database.md) for the full migration governance model.
 
 ### Dependencies
 
@@ -105,7 +105,7 @@ wasm-pack build krab_client --release --target web
 
 Report vulnerabilities privately via [GitHub Security Advisories](../../security/advisories).
 
-- For the full security architecture, see [`docs/security.md`](docs/security.md).
+- For the full security architecture, see [`docs/reference/security.md`](docs/reference/security.md).
 
 ---
 
@@ -123,8 +123,8 @@ When contributing documentation:
 ## Getting Help
 
 - Review the [Architecture section in README.md](README.md#architecture) for an overview.
-- Check [`docs/API.md`](docs/API.md) for endpoint contracts.
-- Check [`plans/`](plans/) for detailed technical plans and roadmaps.
+- Check [`docs/reference/api.md`](docs/reference/api.md) for endpoint contracts.
+- Browse [`docs/`](docs/README.md) for the full documentation index.
 
 ---
 

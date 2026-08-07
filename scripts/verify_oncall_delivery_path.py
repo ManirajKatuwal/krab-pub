@@ -5,7 +5,7 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PROM = ROOT / "monitoring" / "prometheus.yml"
 ALERTS = ROOT / "monitoring" / "alert_rules.yml"
-PLAYBOOK = ROOT / "plans" / "oncall_playbook.md"
+PLAYBOOK = ROOT / "docs" / "operations" / "oncall_playbook.md"
 
 
 def read(path: pathlib.Path) -> str:

@@ -12,7 +12,7 @@ use tracing::{error, info, warn};
 
 use crate::configuration::{KrabConfig, ServiceDefinition, DEFAULT_SHUTDOWN_TIMEOUT_MS};
 
-const ORCHESTRATOR_ARTIFACT_ROOT: &str = "audit/orchestrator";
+const ORCHESTRATOR_ARTIFACT_ROOT: &str = "internal/audit/orchestrator";
 const PROBE_BODY_EXCERPT_LIMIT: usize = 160;
 
 #[derive(Debug, Default)]

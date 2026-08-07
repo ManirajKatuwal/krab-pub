@@ -33,7 +33,7 @@ groups:
         annotations:
           summary: "Availability error budget burn (fast) on {{ $labels.job }}"
           description: "5xx ratio exceeded 1.4% (14x burn for 99.9% SLO) over 5m on {{ $labels.job }}."
-          runbook: "plans/oncall_playbook.md#p1-availability-burn-rate"
+          runbook: "docs/operations/oncall_playbook.md#p1-availability-burn-rate"
 
       - alert: AvailabilityBurnRateSlow
         expr: |
@@ -47,7 +47,7 @@ groups:
         annotations:
           summary: "Availability error budget burn (slow) on {{ $labels.job }}"
           description: "5xx ratio exceeded 0.6% (6x burn for 99.9% SLO) over 30m on {{ $labels.job }}."
-          runbook: "plans/oncall_playbook.md#p2-availability-burn-rate-slow"
+          runbook: "docs/operations/oncall_playbook.md#p2-availability-burn-rate-slow"
 
       - alert: ServiceNotReady
         expr: krab_dependency_up == 0
@@ -96,7 +96,7 @@ groups:
         annotations:
           summary: "Latency error budget burn (fast) on {{ $labels.job }}"
           description: "More than 10% of requests exceeded 500ms over 5m on {{ $labels.job }}."
-          runbook: "plans/oncall_playbook.md#p2-latency-burn-rate"
+          runbook: "docs/operations/oncall_playbook.md#p2-latency-burn-rate"
 
       - alert: LatencyBurnRateSlow
         expr: |
@@ -113,7 +113,7 @@ groups:
         annotations:
           summary: "Latency error budget burn (slow) on {{ $labels.job }}"
           description: "More than 5% of requests exceeded 500ms over 30m on {{ $labels.job }}."
-          runbook: "plans/oncall_playbook.md#p2-latency-burn-rate"
+          runbook: "docs/operations/oncall_playbook.md#p2-latency-burn-rate"
 
   - name: krab_rate_limiting
     rules:
@@ -136,7 +136,7 @@ groups:
         annotations:
           summary: "Auth failure budget burn (fast) on {{ $labels.job }}"
           description: "Auth failure rate remained above 10/s for 5m on {{ $labels.job }}."
-          runbook: "plans/oncall_playbook.md#p2-auth-budget-burn"
+          runbook: "docs/operations/oncall_playbook.md#p2-auth-budget-burn"
 
       - alert: AuthBudgetBurnSlow
         expr: rate(krab_auth_failures_total[30m]) > 5
@@ -148,7 +148,7 @@ groups:
         annotations:
           summary: "Auth failure budget burn (slow) on {{ $labels.job }}"
           description: "Auth failure rate remained above 5/s for 30m on {{ $labels.job }}."
-          runbook: "plans/oncall_playbook.md#p2-auth-budget-burn"
+          runbook: "docs/operations/oncall_playbook.md#p2-auth-budget-burn"
 
   - name: krab_protocol_parity
     rules:

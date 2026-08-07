@@ -37,7 +37,7 @@ All conditions below must be satisfied before a beta release can be promoted to 
 ### Operational Readiness
 
 - SLO/burn-rate alert wiring validated.
-- On-call runbook mapping validated (see [`plans/oncall_playbook.md`](plans/oncall_playbook.md)).
+- On-call runbook mapping validated (see [`docs/operations/oncall_playbook.md`](docs/operations/oncall_playbook.md)).
 - Rollback rehearsal evidence exists for current migration version.
 
 ### Documentation
@@ -57,7 +57,7 @@ All conditions below must be satisfied before a beta release can be promoted to 
 
 Breaking API changes require:
 
-1. Migration guidance in [`docs/API.md`](docs/API.md).
+1. Migration guidance in [`docs/reference/api.md`](docs/reference/api.md).
 2. Deprecation notice in the previous release's [`CHANGELOG.md`](CHANGELOG.md).
 3. Minimum one minor version with deprecation warning before removal.
 

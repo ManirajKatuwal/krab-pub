@@ -66,11 +66,11 @@ jobs:
 
       - name: 4. Rollback rehearsal — run and capture evidence
         run: |
-          cargo run --package krab_cli -- db rehearsal --out rollback-rehearsal-evidence.txt --diagnostics
+          cargo run --package krab_cli -- db rehearsal --out internal/audit/evidence/rollback-rehearsal-evidence.txt --diagnostics
 
       - name: Upload rollback evidence artifact
         uses: actions/upload-artifact@v4
         with:
           name: rollback-rehearsal-evidence-${{ github.run_id }}
-          path: rollback-rehearsal-evidence.txt
+          path: internal/audit/evidence/rollback-rehearsal-evidence.txt
           retention-days: 90

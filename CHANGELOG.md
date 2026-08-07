@@ -2,73 +2,241 @@
 
 All notable changes to this project will be documented in this file.
 
-The format follows [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
+The format follows [Keep a Changelog](https://keepachangelog.com/) and
+[Semantic Versioning](https://semver.org/). Entries are newest-first.
+
+Change categories: **Added**, **Changed**, **Deprecated**, **Removed**,
+**Fixed**, **Security**, **Governance**.
+
+Every user-visible change lands an entry under `[Unreleased]` in the same commit
+as the change itself. Entries describe outcomes, not tasks or plan phases.
+Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
+
+---
+
+## [Unreleased]
+
+Covers work merged after `0.1.1` (2026-03-11) through commit `bac72c5`
+(2026-06-10). Not yet released or version-tagged.
+
+### Added
+
+- **`krab_core` HTTP layer split** into focused modules: `http_auth`,
+  `http_error`, `http_headers`, `http_observability`, `http_protocol`,
+  `http_runtime`, and `http_security`, alongside the existing `http`.
+- **GraphQL and gRPC protocol modules** in `krab_core` (`graphql.rs`, `grpc.rs`).
+- **`service_contract` and `render_policy` modules** in `krab_core`.
+- **`krab_cli` restructured** into dedicated modules — `dev_workflow`, `doctor`,
+  `generator`, `governance`, `project_model`, `project_template`, `release_ops`,
+  `topology` — with new commands:
+  - `krab doctor --diagnostics --strict` — aggregated workspace health checks
+  - `krab release check` / `krab release certify --out <dir> --json` — release
+    pre-flight and evidence bundle generation
+  - `krab topology doctor` / `krab topology split <domain>` — topology hygiene
+    checks and split-service extraction scaffolding
+  - `krab new <name> --template <t>` — project templates
+  - `krab bootstrap` — one-command local stack (build + orchestrator)
+- **`krab_orchestrator` restructured** into `configuration`, `process_runtime`,
+  and `watch_runtime` modules.
+- **`service_users_split`** reference service for split-service topology
+  (port `3207`), registered in the workspace and `krab.toml`.
+- **`krab_macros` compile-fail test suite** (trybuild) covering `empty_view`,
+  `island_generic`, `mismatched_closing_tag`, `server_invalid_attr`,
+  `server_invalid_return`, `server_method_self`, and `server_not_async`, plus an
+  island expansion test.
+- **New CI workflows**: `release-attestation.yaml` (provenance hashes +
+  certification evidence), `streaming-slo-gate.yaml`, `topology-matrix.yaml`.
+- **Architecture Decision Records** in `docs/adr/`:
+  - `0001-hydration-markers.md`
+  - `0002-render-policy.md`
+  - `0003-server-functions-public-endpoints.md`
+- **New documentation**: hydration, render policy, server functions, service
+  composition, migration guide, reference apps, why-krab, IDE setup, and the
+  FaaS platform review. See the reorganisation note under **Changed** for their
+  current locations.
+- **Reference application tracks** under `examples/reference_apps/`:
+  `content_site`, `edge_rendered`, `event_stream`, `saas_dashboard`,
+  `split_service`.
+- **PostgreSQL container bootstrap** — `docker/postgres/init/01-create-users-db.sh`.
+- **`.cargo/audit.toml`** and **`.dockerignore`**.
+- **Agent and governance documentation**: `CLAUDE.md`,
+  `internal/audit/VERIFICATION_EVIDENCE_LOG.md`,
+  `internal/plans/PLAN_CREATION_RULES.md`,
+  `internal/plans/PLAN_CLOSING_RULES.md`, and project skills under
+  `.claude/skills/`.
+- **Documentation indexes**: `docs/README.md` (public documentation map) and
+  `internal/README.md` (internal boundary and generated-artifact map).
+
+### Changed
+
+- `service_frontend` render policy behaviour updated (`src/render_policy.rs`).
+- `krab_core` public module surface (`lib.rs`) re-exported to match the HTTP and
+  protocol module split.
+- `krab_cli` release operations reworked to emit machine-readable JSON summaries.
+- `docker-compose.yml` and `docker-compose.nft.yaml` environment bootstrap
+  reworked; `composed.nft.rendered.yaml` added as the rendered NFT composition.
+- `Dockerfile.service` and `check_health.ps1` updated for the current service set.
+- `monitoring/prometheus.yml` scrape targets updated.
+- `.env.example` expanded for the new configuration surface.
+- `README.md` rewritten with the current architecture, feature, and configuration
+  reference.
+- `CONTRIBUTING.md` updated with the current CI gate table and engineering
+  standards.
+- `deny.toml` policy updated.
+- **Repository reorganised** around a public/internal boundary:
+  - `docs/` is now split by purpose into `guides/`, `reference/`,
+    `architecture/`, `operations/`, and `adr/`, indexed by `docs/README.md`.
+    `docs/API.md` → `docs/reference/api.md`, `docs/security.md` →
+    `docs/reference/security.md`, and so on for every public document.
+  - Genuinely public planning documents were promoted out of `plans/`:
+    `environment_template.md` → `docs/reference/environment.md`,
+    `01_vision_and_philosophy.md` → `docs/architecture/vision.md`,
+    `02_architecture_design.md` → `docs/architecture/design.md`,
+    `03_roadmap.md` → `docs/roadmap.md`, `08_production_readiness.md`,
+    `oncall_playbook.md`, `db_rollback_runbook.md`, `slo_alerts.md`, and
+    `api_governance.md` → `docs/operations/`.
+  - All internal material moved under a single `internal/` tree
+    (`plans/`, `audit/`, `wiki/`, `reports/`), replacing six separate
+    `.gitignore` rules with one.
+  - `plans/load_test_artifacts/` → `benchmarks/`, so NFT thresholds and
+    benchmark config are tracked CI inputs rather than ignored planning files.
+  - Root reduced from 18 files to 14: `check_health.ps1` → `scripts/`,
+    `composed.nft.rendered.yaml` → `docker/`, `AUDIT.md` →
+    `internal/reports/`, `rollback-rehearsal-evidence.txt` →
+    `internal/audit/evidence/`.
+  - 841 markdown cross-links rewritten to match the new depths.
+- `.gitignore` consolidated: one `internal/` rule for all internal
+  documentation, plus `__pycache__/`, generated benchmark results, and the
+  rendered NFT compose file.
+- CI and tooling output paths repointed: `krab release certify` →
+  `internal/audit/release-certify/`, orchestrator logs →
+  `internal/audit/orchestrator/`, `krab db rehearsal` →
+  `internal/audit/evidence/`, `krab docs` → `docs/guides/dev_workflow.md`.
+  The seven NFT scripts now read and write `benchmarks/`.
+
+### Fixed
+
+- `krab db rehearsal` now creates the parent directory of its `--out` path
+  before writing, instead of failing when the directory does not yet exist.
+- `scripts/__pycache__/*.pyc` removed from version control and `__pycache__/`
+  added to `.gitignore`.
+- Missing `sqlx` trait bounds on manual `FromRow` implementations (`3ec3e23`).
+- Compose environment bootstrap and WASM `tokio` target gating in CI (`bec6643`).
+- E2E teardown diagnostics added for compose env interpolation failures
+  (`3c8e3c0`).
+
+### Security
+
+- Runtime configuration hardening across services (`d54db0a`).
+- `docs/security.md` updated for the current threat model and secret-sourcing
+  behaviour.
+
+### Governance
+
+- Release certification evidence is now generated in CI by
+  `krab release certify` and uploaded as a workflow artifact.
+- Provenance hashes (`Cargo.lock`, `.env.example`) recorded by
+  `release-attestation.yaml`.
+
+> **Verification status.** No verification run has been logged at `bac72c5`. The
+> most recent recorded evidence bundle predates these changes — see
+> [`internal/audit/VERIFICATION_EVIDENCE_LOG.md`](internal/audit/VERIFICATION_EVIDENCE_LOG.md) §7.
+> This section is a record of merged changes, not an attestation that gates are
+> green at HEAD.
+
+---
+
+## [0.1.1] - 2026-03-11
+
+### Added
+
+- Protocol flexibility rollout completion across auth/frontend/CLI:
+  - `service_auth` capability endpoint: `GET /api/v1/auth/capabilities`.
+  - REST-only auth guardrails tests for GraphQL/RPC non-exposure paths.
+  - `krab_cli` protocol-aware scaffolding flags:
+    `krab gen service --exposure-mode ... --protocols ... --topology ...`
+  - `krab contract protocol-check` command for parity/resolver validation.
+- New public documentation: `docs/protocol_flexibility.md`.
+
+### Changed
+
+- `krab_core::http` auth open-path allowlist includes `/api/v1/auth/capabilities`.
+- Tracing includes additional protocol attributes: `krab.protocol`,
+  `krab.operation`, `krab.selection_source`.
+- Environment template expanded with `KRAB_PROTOCOL_*` configuration guidance.
+- Deployment and API docs updated with capability endpoint + split-topology notes.
+
+### Governance
+
+- Added protocol parity and exposure-mode policy section to
+  `plans/api_governance.md`.
+
+---
 
 ## [0.1.0] - 2026-03-06
 
 ### Added
+
 - Multi-service NFT gate with single/scale (`N=1` vs `N=3`) validation.
 - SLO burn-rate alert linkage and on-call mapping.
 - Rustdoc CI gate and docs publish workflow.
 - Centralized `read_env_or_file` secret sourcing utility in `krab_core::config`.
 - `env_non_empty` helper for safe non-empty environment variable reads.
-- SQLite database driver support (`KRAB_DB_DRIVER=sqlite`) with full schema bootstrap.
+- SQLite database driver support (`KRAB_DB_DRIVER=sqlite`) with full schema
+  bootstrap.
 - Feature maturity closure items:
   - Route-level middleware chaining for file-based routes.
-  - Incremental Static Regeneration (ISR) stale-while-revalidate integration in frontend cache flow.
-  - i18n locale detection + localized home rendering (Accept-Language + locale-prefixed route).
-  - WebSocket ergonomic layer service integration (`/api/ws/chat`, `/api/ws/publish`).
+  - Incremental Static Regeneration (ISR) stale-while-revalidate integration in
+    the frontend cache flow.
+  - i18n locale detection + localized home rendering (Accept-Language +
+    locale-prefixed route).
+  - WebSocket ergonomic layer service integration (`/api/ws/chat`,
+    `/api/ws/publish`).
 - Comprehensive publish-ready documentation suite:
-  - `docs/security.md` — Security architecture, secret management, threat model.
-  - `docs/database.md` — Database architecture, multi-driver support, migration governance.
-  - `docs/deployment.md` — Deployment guide for Docker, Kubernetes, and self-hosted.
-  - Rewritten `README.md` with full architecture, feature, and configuration reference.
+  - `docs/security.md` — security architecture, secret management, threat model.
+  - `docs/database.md` — database architecture, multi-driver support, migration
+    governance.
+  - `docs/deployment.md` — deployment guide for Docker, Kubernetes, self-hosted.
+  - Rewritten `README.md` with full architecture, feature, and configuration
+    reference.
 
 ### Changed
+
 - Load-test thresholds and trend artifacts expanded to service-level tracking.
-- `config` crate upgraded from `0.13` to `0.14` in `krab_core` and `krab_orchestrator` (eliminates `yaml-rust` unmaintained advisory).
-- `DATABASE_URL` now supports `DATABASE_URL_FILE` secret sourcing via `read_env_or_file` pattern.
-- `service_users` database backend changed from MySQL to SQLite as the alternative to PostgreSQL.
-- `sqlx` configured with `default-features = false` to minimize dependency surface.
+- `config` crate upgraded from `0.13` to `0.14` in `krab_core` and
+  `krab_orchestrator` (eliminates the `yaml-rust` unmaintained advisory).
+- `DATABASE_URL` now supports `DATABASE_URL_FILE` secret sourcing via the
+  `read_env_or_file` pattern.
+- `service_users` database backend changed from MySQL to SQLite as the
+  alternative to PostgreSQL.
+- `sqlx` configured with `default-features = false` to minimize dependency
+  surface.
 
 ### Removed
-- MySQL database driver and all associated scaffolding code (`MySqlUserRepository`, `MySqlPool`, MySQL schema bootstrap).
-- `rsa` crate entirely removed from dependency tree (was pulled in transitively by `sqlx-mysql`).
-- `yaml-rust` crate removed from dependency tree (was pulled in by `config` 0.13).
-- `RUSTSEC-2023-0071` removed from `deny.toml` ignore list (vulnerability no longer present).
-- `RUSTSEC-2024-0320` removed from `deny.toml` ignore list (vulnerability no longer present).
+
+- MySQL database driver and all associated scaffolding code
+  (`MySqlUserRepository`, `MySqlPool`, MySQL schema bootstrap).
+- `rsa` crate entirely removed from the dependency tree (was pulled in
+  transitively by `sqlx-mysql`).
+- `yaml-rust` crate removed from the dependency tree (was pulled in by `config`
+  0.13).
+- `RUSTSEC-2023-0071` removed from the `deny.toml` ignore list (vulnerability no
+  longer present).
+- `RUSTSEC-2024-0320` removed from the `deny.toml` ignore list (vulnerability no
+  longer present).
 - `deny.toml` `ignore` array emptied — zero advisory exceptions.
 
+### Fixed
+
+- `deny.toml` syntax errors corrected for `cargo-deny` compatibility (`unsound`,
+  `yanked`, `unmaintained` values).
+- Deprecated `copyleft` key removed from the `deny.toml` `[licenses]` section.
+
 ### Security
+
 - `sqlx` moved to `0.8.x` in workspace services.
 - Non-local auth startup now rejects insecure/default JWT/bootstrap credentials.
-- Production secret sourcing enforced via `*_FILE` / `*_VAULT_REF` pattern.
-- `cargo deny --all-features check advisories licenses bans` passes with zero ignores.
+- Production secret sourcing enforced via the `*_FILE` / `*_VAULT_REF` pattern.
+- `cargo deny --all-features check advisories licenses bans` passes with zero
+  ignores.
 - All RUSTSEC advisories resolved at the crate level (not suppressed).
-
-### Fixed
-- `deny.toml` syntax errors corrected for `cargo-deny` compatibility (`unsound`, `yanked`, `unmaintained` values).
-- Deprecated `copyleft` key removed from `deny.toml` `[licenses]` section.
-
-## [0.1.1] - 2026-03-11
-
-### Added
-- Protocol flexibility rollout completion across auth/frontend/CLI:
-  - `service_auth` capability endpoint: `GET /api/v1/auth/capabilities`.
-  - REST-only auth guardrails tests for GraphQL/RPC non-exposure paths.
-  - `krab_cli` protocol-aware scaffolding flags:
-    - `krab gen service --exposure-mode ... --protocols ... --topology ...`
-  - `krab contract protocol-check` command for parity/resolver validation.
-- New public documentation: `docs/protocol_flexibility.md`.
-
-### Changed
-- `krab_core::http` auth open-path allowlist includes `/api/v1/auth/capabilities`.
-- Tracing includes additional protocol attributes:
-  - `krab.protocol`
-  - `krab.operation`
-  - `krab.selection_source`
-- Environment template expanded with `KRAB_PROTOCOL_*` configuration guidance.
-- Deployment and API docs updated with capability endpoint + split-topology notes.
-
-### Governance
-- Added protocol parity and exposure-mode policy section to `plans/api_governance.md`.

@@ -8,7 +8,7 @@ on:
       - 'services/service_frontend/**'
       - 'crates/tooling/krab_cli/**'
       - 'crates/framework/krab_core/src/http.rs'
-      - 'plans/protocol_flexibility/**'
+      - 'internal/plans/protocol_flexibility/**'
       - 'monitoring/**'
       - '.env.example'
   push:

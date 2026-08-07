@@ -12,8 +12,8 @@ from typing import List, Dict, Any
 
 # Paths
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-CONFIG_PATH = ROOT / "plans" / "load_test_artifacts" / "benchmark_config.json"
-RESULTS_DIR = ROOT / "plans" / "load_test_artifacts"
+CONFIG_PATH = ROOT / "benchmarks" / "benchmark_config.json"
+RESULTS_DIR = ROOT / "benchmarks"
 RESULTS_JSON = RESULTS_DIR / "external_results.json"
 RESULTS_MD = RESULTS_DIR / "external_summary.md"
 

@@ -5,8 +5,8 @@ import os
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-THRESHOLDS_PATH = ROOT / "plans" / "load_test_artifacts" / "thresholds.json"
-SUMMARY_PATH = ROOT / "plans" / "load_test_artifacts" / "latest_summary.md"
+THRESHOLDS_PATH = ROOT / "benchmarks" / "thresholds.json"
+SUMMARY_PATH = ROOT / "benchmarks" / "latest_summary.md"
 
 
 def load_json(path):

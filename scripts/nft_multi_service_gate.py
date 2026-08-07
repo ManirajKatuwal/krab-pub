@@ -9,8 +9,8 @@ import urllib.error
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-THRESHOLDS_PATH = ROOT / "plans" / "load_test_artifacts" / "thresholds.json"
-RESULT_PATH = ROOT / "plans" / "load_test_artifacts" / "latest_summary.md"
+THRESHOLDS_PATH = ROOT / "benchmarks" / "thresholds.json"
+RESULT_PATH = ROOT / "benchmarks" / "latest_summary.md"
 
 
 def env(name, default):

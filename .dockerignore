@@ -19,11 +19,16 @@ frontend_stdout.txt
 frontend_stderr.txt
 *.log
 
-# Audit and generated evidence artifacts (not needed to compile service bins)
-audit/evidence/
-plans/load_test_artifacts/*.json
-plans/load_test_artifacts/*.md
-plans/load_test_artifacts/*.csv
+# Internal documentation, audits, and evidence (not needed to compile service bins)
+internal/
+
+# Generated benchmark artifacts
+benchmarks/*.json
+benchmarks/*.md
+benchmarks/*.csv
+
+# Documentation (not needed to compile service bins)
+docs/
 
 # OS junk
 .DS_Store

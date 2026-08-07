@@ -6,7 +6,7 @@ from typing import Dict, List
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-TREND_PATH = ROOT / "plans" / "load_test_artifacts" / "trend_history.csv"
+TREND_PATH = ROOT / "benchmarks" / "trend_history.csv"
 
 
 FIELDNAMES = [

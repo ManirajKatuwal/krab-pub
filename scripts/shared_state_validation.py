@@ -9,7 +9,7 @@ from typing import Optional, Tuple
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-OUT = ROOT / "plans" / "load_test_artifacts" / "shared_state_validation.json"
+OUT = ROOT / "benchmarks" / "shared_state_validation.json"
 
 
 def env(name: str, default: str) -> str:

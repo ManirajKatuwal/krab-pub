@@ -95,15 +95,15 @@ Krab follows a server-first, client-opt-in architecture organized as a Cargo wor
 
 | Crate                                                    | Purpose                                                                                 |
 | -------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| [`krab_core`](crates/framework/krab_core/)               | Shared config, HTTP middleware, resilience, telemetry, DB governance, and signal system |
-| [`krab_macros`](crates/framework/krab_macros/)           | Procedural macros (`view!`, `#[island]`)                                                |
-| [`krab_client`](crates/framework/krab_client/)           | WASM runtime for island hydration (browser)                                             |
-| [`krab_server`](crates/framework/krab_server/)           | Hyper/Tower server foundations                                                          |
-| [`service_auth`](services/service_auth/)                 | Authentication service (REST — JWT/OIDC token issuance)                                 |
-| [`service_users`](services/service_users/)               | Users service (GraphQL + PostgreSQL/SQLite)                                             |
-| [`service_frontend`](services/service_frontend/)         | SSR frontend service with island hydration                                              |
-| [`krab_orchestrator`](crates/tooling/krab_orchestrator/) | Multi-service process orchestrator                                                      |
-| [`krab_cli`](crates/tooling/krab_cli/)                   | Developer CLI helpers (env-check, bootstrap)                                            |
+| [`krab_core`](crates/framework/krab_core)               | Shared config, HTTP middleware, resilience, telemetry, DB governance, and signal system |
+| [`krab_macros`](crates/framework/krab_macros)           | Procedural macros (`view!`, `#[island]`)                                                |
+| [`krab_client`](crates/framework/krab_client)           | WASM runtime for island hydration (browser)                                             |
+| [`krab_server`](crates/framework/krab_server)           | Hyper/Tower server foundations                                                          |
+| [`service_auth`](services/service_auth)                 | Authentication service (REST — JWT/OIDC token issuance)                                 |
+| [`service_users`](services/service_users)               | Users service (GraphQL + PostgreSQL/SQLite)                                             |
+| [`service_frontend`](services/service_frontend)         | SSR frontend service with island hydration                                              |
+| [`krab_orchestrator`](crates/tooling/krab_orchestrator) | Multi-service process orchestrator                                                      |
+| [`krab_cli`](crates/tooling/krab_cli)                   | Developer CLI helpers (env-check, bootstrap)                                            |
 
 ---
 
@@ -198,7 +198,7 @@ In `staging` and `prod` environments, secrets must be provided via file mount or
 | Login users        | `KRAB_AUTH_LOGIN_USERS_JSON_FILE`   | `KRAB_AUTH_LOGIN_USERS_JSON_VAULT_REF`   |
 | Database URL       | `DATABASE_URL_FILE`                 | —                                        |
 
-For the full environment template with validation rules, see [`plans/environment_template.md`](plans/environment_template.md).
+For the full environment template with validation rules, see [`docs/reference/environment.md`](docs/reference/environment.md).
 
 ---
 
@@ -251,32 +251,52 @@ All gates must pass before merge. Automated workflows enforce quality at every P
 | [`CHANGELOG.md`](CHANGELOG.md)           | Release history (Keep a Changelog format)                       |
 | [`RELEASE_POLICY.md`](RELEASE_POLICY.md) | Release channels, promotion criteria, and versioning            |
 
-### Technical references (`docs/`)
+Full index: [`docs/README.md`](docs/README.md).
 
-| Document                                                     | Purpose                                                         |
-| ------------------------------------------------------------ | --------------------------------------------------------------- |
-| [`docs/API.md`](docs/API.md)                                 | Public API contract for all HTTP and GraphQL endpoints          |
-| [`docs/signal_safety.md`](docs/signal_safety.md)             | Signal system threading constraints and SSR usage patterns      |
-| [`docs/security.md`](docs/security.md)                       | Security architecture, secret management, and threat model      |
-| [`docs/database.md`](docs/database.md)                       | Database architecture, migrations, and multi-driver support     |
-| [`docs/deployment.md`](docs/deployment.md)                   | Deployment guide for containerized and self-hosted environments |
-| [`docs/reference_apps.md`](docs/reference_apps.md)           | Official reference app tracks and starter mapping               |
-| [`docs/migration_guide.md`](docs/migration_guide.md)         | Migration notes from Axum, Leptos, and JS full-stack frameworks |
-| [`docs/why_krab.md`](docs/why_krab.md)                       | Krab's product position and differentiators                     |
-| [`docs/server_functions.md`](docs/server_functions.md)       | Server-function endpoint contract and safety patterns           |
-| [`docs/service_composition.md`](docs/service_composition.md) | Service graph, topology, orchestrator, and boundary rules       |
+### Guides — task-oriented walkthroughs
 
-### Planning documents (`plans/`)
+| Document | Purpose |
+| --- | --- |
+| [`docs/guides/why_krab.md`](docs/guides/why_krab.md) | Krab's product position and differentiators |
+| [`docs/guides/ide_setup.md`](docs/guides/ide_setup.md) | Editor and toolchain setup |
+| [`docs/guides/dev_workflow.md`](docs/guides/dev_workflow.md) | Local dev loop, watch mode, and build outputs |
+| [`docs/guides/migration_guide.md`](docs/guides/migration_guide.md) | Migration notes from Axum, Leptos, and JS full-stack frameworks |
+| [`docs/guides/reference_apps.md`](docs/guides/reference_apps.md) | Official reference app tracks and starter mapping |
 
-| Document                                                                 | Purpose                                                           |
-| ------------------------------------------------------------------------ | ----------------------------------------------------------------- |
-| [`plans/01_vision_and_philosophy.md`](plans/01_vision_and_philosophy.md) | Core mission, pillars, and differentiators                        |
-| [`plans/02_architecture_design.md`](plans/02_architecture_design.md)     | Detailed architecture: subsystems, routing, islands, data loading |
-| [`plans/03_roadmap.md`](plans/03_roadmap.md)                             | Phase 0 roadmap, governance, epic breakdown, risk log             |
-| [`plans/08_production_readiness.md`](plans/08_production_readiness.md)   | Production readiness checklist and gate definitions               |
-| [`plans/oncall_playbook.md`](plans/oncall_playbook.md)                   | On-call runbook and incident response procedures                  |
-| [`plans/db_rollback_runbook.md`](plans/db_rollback_runbook.md)           | Database rollback procedures and disaster recovery                |
-| [`plans/environment_template.md`](plans/environment_template.md)         | Environment variable reference and validation                     |
+### Reference
+
+| Document | Purpose |
+| --- | --- |
+| [`docs/reference/api.md`](docs/reference/api.md) | Public API contract for all HTTP and GraphQL endpoints |
+| [`docs/reference/environment.md`](docs/reference/environment.md) | Environment variable reference and validation rules |
+| [`docs/reference/security.md`](docs/reference/security.md) | Security architecture, secret management, and threat model |
+| [`docs/reference/database.md`](docs/reference/database.md) | Database architecture, migrations, and multi-driver support |
+| [`docs/reference/deployment.md`](docs/reference/deployment.md) | Deployment guide for containerized and self-hosted environments |
+| [`docs/reference/server_functions.md`](docs/reference/server_functions.md) | Server-function endpoint contract and safety patterns |
+
+### Architecture
+
+| Document | Purpose |
+| --- | --- |
+| [`docs/architecture/vision.md`](docs/architecture/vision.md) | Core mission, pillars, and differentiators |
+| [`docs/architecture/design.md`](docs/architecture/design.md) | Subsystems, routing, islands, and data loading |
+| [`docs/architecture/hydration.md`](docs/architecture/hydration.md) | Island hydration model and markers |
+| [`docs/architecture/render_policy.md`](docs/architecture/render_policy.md) | SSR / SSG / ISR render policy resolution |
+| [`docs/architecture/service_composition.md`](docs/architecture/service_composition.md) | Service graph, topology, orchestrator, and boundary rules |
+| [`docs/architecture/protocol_flexibility.md`](docs/architecture/protocol_flexibility.md) | Exposure modes, protocol selection, and parity rules |
+| [`docs/architecture/signal_safety.md`](docs/architecture/signal_safety.md) | Signal system threading constraints and SSR usage patterns |
+| [`docs/adr/`](docs/adr/) | Architecture Decision Records |
+
+### Operations
+
+| Document | Purpose |
+| --- | --- |
+| [`docs/operations/production_readiness.md`](docs/operations/production_readiness.md) | Production readiness checklist and gate definitions |
+| [`docs/operations/oncall_playbook.md`](docs/operations/oncall_playbook.md) | On-call runbook and incident response procedures |
+| [`docs/operations/db_rollback_runbook.md`](docs/operations/db_rollback_runbook.md) | Database rollback procedures and disaster recovery |
+| [`docs/operations/slo_alerts.md`](docs/operations/slo_alerts.md) | Service Level Objectives and burn-rate alerts |
+| [`docs/operations/api_governance.md`](docs/operations/api_governance.md) | API versioning, schema, and change policy |
+| [`docs/roadmap.md`](docs/roadmap.md) | Phased roadmap, governance, epic breakdown, and risk log |
 
 ---
 
@@ -297,7 +317,7 @@ Current security posture:
 - CORS, compression, and request-id middleware on all services
 - Non-development startup rejects empty CORS allowlists, requiring `KRAB_CORS_ORIGINS` in staging and production
 
-For the full security architecture, see [`docs/security.md`](docs/security.md).
+For the full security architecture, see [`docs/reference/security.md`](docs/reference/security.md).
 
 ---
 

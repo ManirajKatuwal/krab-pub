@@ -105,7 +105,7 @@ jobs:
         run: cargo install cargo-deny --locked
 
       - name: Generate release certification evidence
-        run: cargo run --package krab_cli -- release certify --out audit/release-certify/run-${{ github.run_id }} --json
+        run: cargo run --package krab_cli -- release certify --out internal/audit/release-certify/run-${{ github.run_id }} --json
 
       - name: Upload release certification evidence
         if: always()
@@ -113,6 +113,6 @@ jobs:
         with:
           name: release-certification-${{ github.run_id }}
           path: |
-            audit/release-certify/run-${{ github.run_id }}
-            audit/release-certify/latest.json
-            audit/release-certify/latest.md
+            internal/audit/release-certify/run-${{ github.run_id }}
+            internal/audit/release-certify/latest.json
+            internal/audit/release-certify/latest.md
