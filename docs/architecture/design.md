@@ -46,37 +46,72 @@ src/
 Components are standard Rust functions. To make a component interactive on the client, it must be marked.
 
 ```rust
-// src/components/Counter.rs
+// src/components/counter.rs
+
+use krab_core::signal::create_signal;
+use krab_core::IntoNode;
+use krab_macros::{island, view};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CounterProps {
+    pub initial: i32,
+}
 
 #[island] // This macro marks it for WASM compilation
-pub fn Counter(initial: i32) -> impl View {
-    let (count, set_count) = create_signal(initial);
+pub fn Counter(props: CounterProps) -> krab_core::Node {
+    let (count, set_count) = create_signal(props.initial);
     view! {
-        <button on:click=move |_| set_count.update(|n| *n += 1)>
-            "Count: " {count}
+        <button on:click={move |_| set_count.update(|n| *n += 1)}>
+            "Count: "
+            {move || count.get().into_node()}
         </button>
     }
 }
 ```
 
-- **Server behavior**: Calls `Counter(initial)`, renders HTML string.
+`#[island]` requires exactly one argument — a `Clone + Serialize + Deserialize`
+props struct — and a `krab_core::Node` return type. Multiple arguments and
+generic islands are rejected at compile time, because hydration needs a concrete
+registration and a serialisable payload per boundary.
+
+- **Server behavior**: Calls `Counter(CounterProps { initial })`, renders an HTML
+  string wrapped in `data-island` / `data-krab-boundary` markers.
 - **Client behavior**: Downloads `counter.wasm` (or a chunk), attaches event listeners to the existing HTML.
 
 ### Data Loading Pattern
-Each route can export a loader function that runs *only* on the server.
+
+**Implemented today.** A route module exports `pub async fn handler()`. The
+build script (`services/service_frontend/build.rs`) discovers every
+`src/routes/<stem>.rs` and registers `<module>::handler` at `/<stem>` — or `/`
+for `index.rs`. Data loading happens inside the handler, which runs only on the
+server. Per-route middleware is declared with a `//# middleware: name` comment.
 
 ```rust
-// src/routes/user/[id].rs
+// src/routes/profile.rs
+//# middleware: require_auth
 
-pub async fn loader(params: Params) -> Result<User, Error> {
-    // DB calls here
-    db::get_user(params.id).await
-}
+use axum::response::Html;
+use krab_core::Render;
+use krab_macros::view;
 
-pub fn Page(user: User) -> impl View {
-    view! { <h1>{user.name}</h1> }
+pub async fn handler() -> Html<String> {
+    let user = load_user().await;
+
+    Html(
+        view! {
+            <h1>{user.name}</h1>
+        }
+        .render(),
+    )
 }
 ```
+
+> **Not yet implemented.** A separate `loader` convention — a server-only
+> function whose typed return is injected into the page component, with dynamic
+> `[id]`-style path segments — is a design goal, not current behaviour. There is
+> no `loader` hook in the codebase today, and dynamic segments are handled by
+> declaring an Axum path parameter in the handler itself.
 
 ## 4. State Management
 - **Local State**: Signals (`create_signal`).

@@ -44,6 +44,20 @@ jobs:
       - name: Clippy strict check
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Runs the whole suite, including doc examples. Without this, krab_core's
+      # auth/db/api/server_fn tests and every rustdoc example are only ever
+      # exercised locally.
+      - name: Workspace tests (default features)
+        run: cargo test --workspace
+
+      # Deliberately NOT `--workspace --all-features`: that would enable
+      # service_frontend's `nft` feature, whose latency assertions (6ms p95)
+      # are only meaningful on the dedicated runners in nft.yaml. krab_core has
+      # no such feature, and this is the only way its `grpc` and `web` code
+      # paths get compiled at all — no workspace member enables them.
+      - name: krab_core tests (all features)
+        run: cargo test -p krab_core --all-features
+
       - name: Rustdoc build check
         env:
           RUSTDOCFLAGS: -D warnings

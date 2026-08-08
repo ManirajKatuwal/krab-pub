@@ -24,3 +24,6 @@ krab_core = { path = "../krab_core", features = ["rest"] }
 trybuild = { version = "1.0", features = ["diff"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+# `#[server]` expands to code referencing `axum` directly, so any crate using it
+# needs axum in scope. Present here so the doc examples are actually compiled.
+axum = { workspace = true }

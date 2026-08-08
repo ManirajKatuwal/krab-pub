@@ -164,17 +164,29 @@ where
 ///
 /// # Usage
 ///
-/// ```rust,ignore
+/// ```rust
 /// use krab_core::http::PropagationHeaders;
 ///
 /// // Inside an Axum handler, extract the inbound headers:
-/// let prop = PropagationHeaders::from_request_headers(req.headers());
+/// let mut headers = axum::http::HeaderMap::new();
+/// headers.insert("x-request-id", "req-123".parse().unwrap());
+/// let prop = PropagationHeaders::from_request_headers(&headers);
 ///
-/// // Then inject them into every outbound reqwest / hyper request:
+/// assert_eq!(prop.request_id.as_deref(), Some("req-123"));
+///
+/// // Then inject them into every outbound request. `as_header_pairs` suits
+/// // builder-style clients:
 /// let client = reqwest::Client::new();
 /// let mut builder = client.get("http://service_users:3002/api/v1/graphql");
-/// builder = prop.inject(builder);
-/// let resp = builder.send().await?;
+/// for (name, value) in prop.as_header_pairs() {
+///     builder = builder.header(name, value);
+/// }
+/// # let _ = builder;
+///
+/// // `inject_into_headers` suits anything holding a `HeaderMap` directly:
+/// let mut outbound = axum::http::HeaderMap::new();
+/// prop.inject_into_headers(&mut outbound);
+/// assert_eq!(outbound.get("x-request-id").unwrap(), "req-123");
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct PropagationHeaders {

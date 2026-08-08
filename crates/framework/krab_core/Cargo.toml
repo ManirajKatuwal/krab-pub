@@ -61,3 +61,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 
 [dev-dependencies]
 serial_test = "3"
+# Dev-only, so the krab_macros <-> krab_core cycle is permitted by Cargo.
+# Needed so doc examples that use `#[server]` are compiled rather than skipped.
+krab_macros = { path = "../krab_macros" }

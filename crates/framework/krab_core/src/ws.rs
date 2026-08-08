@@ -4,11 +4,30 @@
 //!
 //! ## Usage
 //!
-//! ```rust,ignore
-//! use krab_core::ws::{WsRoom, WsMessage, WsHandler};
+//! ```rust
+//! use krab_core::ws::{WsMessage, WsRoom};
 //!
 //! let room = WsRoom::new("chat");
-//! room.broadcast(WsMessage::text("Hello everyone!"));
+//!
+//! // Subscribers receive everything broadcast after they subscribe.
+//! let mut rx = room.subscribe();
+//! let delivered = room.broadcast(WsMessage::text("Hello everyone!"));
+//!
+//! assert_eq!(delivered, 1);
+//! assert_eq!(rx.try_recv().unwrap().to_text(), "Hello everyone!");
+//! ```
+//!
+//! Use [`WsRoomManager`] to keep a set of named rooms:
+//!
+//! ```rust
+//! use krab_core::ws::WsRoomManager;
+//!
+//! let rt = tokio::runtime::Runtime::new().unwrap();
+//! rt.block_on(async {
+//!     let manager = WsRoomManager::new();
+//!     let _room = manager.room("chat").await;
+//!     assert_eq!(manager.room_names().await, vec!["chat".to_string()]);
+//! });
 //! ```
 
 use std::collections::HashMap;

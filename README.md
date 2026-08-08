@@ -114,12 +114,23 @@ Krab follows a server-first, client-opt-in architecture organized as a Cargo wor
 Pages are server-rendered as static HTML by default. Interactive components are marked with `#[island]` and selectively hydrated via WebAssembly:
 
 ```rust
+use krab_core::signal::create_signal;
+use krab_core::IntoNode;
+use krab_macros::{island, view};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CounterProps {
+    pub initial: i32,
+}
+
 #[island]
-pub fn Counter(initial: i32) -> impl View {
-    let (count, set_count) = create_signal(initial);
+pub fn Counter(props: CounterProps) -> krab_core::Node {
+    let (count, set_count) = create_signal(props.initial);
     view! {
-        <button on:click=move |_| set_count.update(|n| *n += 1)>
-            "Count: " {count}
+        <button on:click={move |_| set_count.update(|n| *n += 1)}>
+            "Count: "
+            {move || count.get().into_node()}
         </button>
     }
 }
@@ -127,6 +138,12 @@ pub fn Counter(initial: i32) -> impl View {
 
 - Server: renders HTML
 - Client: downloads targeted WASM and attaches event listeners to the existing DOM
+
+An `#[island]` takes exactly one serialisable props struct and returns
+`krab_core::Node` — the props are what get serialised into the markup and
+replayed during hydration. This example is compiled and asserted by
+`readme_counter_example_renders_on_the_server` in
+[`crates/framework/krab_macros/tests/island_expansion.rs`](crates/framework/krab_macros/tests/island_expansion.rs).
 
 ### Multi-database support
 

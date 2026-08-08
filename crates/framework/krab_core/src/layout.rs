@@ -4,25 +4,30 @@
 //!
 //! ## Usage
 //!
-//! ```rust,ignore
+//! ```rust
+//! use krab_core::head::HeadContext;
 //! use krab_core::layout::{Layout, LayoutTree, Outlet};
 //!
 //! // Define a root layout
-//! let root = Layout::new("root", |outlet, head| {
+//! let root = Layout::new("root", |outlet: &Outlet, head: &HeadContext| {
 //!     format!(r#"<!DOCTYPE html>
 //!     <html><head>{}</head>
 //!     <body><nav>Krab App</nav><main>{}</main></body>
-//!     </html>"#, head.render(), outlet.content)
+//!     </html>"#, head.render_tags(), outlet.content)
 //! });
 //!
 //! // Define a nested blog layout
-//! let blog = Layout::new("blog", |outlet, _head| {
+//! let blog = Layout::new("blog", |outlet: &Outlet, _head: &HeadContext| {
 //!     format!(r#"<div class="blog-layout"><aside>Blog Nav</aside>{}</div>"#, outlet.content)
 //! });
 //!
 //! // Build a layout tree
 //! let tree = LayoutTree::new(root)
 //!     .nest("/blog", blog);
+//!
+//! let html = tree.render("/blog/hello", "<h1>Hello</h1>".to_string(), &HeadContext::new());
+//! assert!(html.contains("blog-layout"));
+//! assert!(html.contains("<h1>Hello</h1>"));
 //! ```
 
 use crate::head::HeadContext;

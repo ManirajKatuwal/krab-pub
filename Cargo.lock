@@ -1666,6 +1666,7 @@ dependencies = [
  "config",
  "js-sys",
  "jsonwebtoken",
+ "krab_macros",
  "redis",
  "reqwest",
  "serde",
@@ -1686,6 +1687,7 @@ dependencies = [
 name = "krab_macros"
 version = "0.1.1"
 dependencies = [
+ "axum",
  "krab_core",
  "proc-macro2",
  "quote",

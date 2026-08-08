@@ -83,6 +83,19 @@ Covers work merged after `0.1.1` (2026-03-11) through commit `bac72c5`
 
 ### Changed
 
+- **CI now runs the test suite.** `ops-hardening.yaml` gained
+  `cargo test --workspace` and `cargo test -p krab_core --all-features`. No
+  workflow previously ran either; the only test invocations were
+  `-p service_users`, `-p service_frontend`, and
+  `cargo test -p krab_core --features rest protocol` — where `protocol` is a
+  test-name filter, not a second feature. `krab_core`'s auth, db, api, and
+  server-function suites, and every doc example, therefore ran only on
+  developer machines. The second step is scoped to `krab_core` rather than
+  `--workspace --all-features` on purpose: the latter would enable
+  `service_frontend`'s `nft` feature, whose 6 ms p95 latency assertions are
+  only meaningful on the dedicated runners in `nft.yaml`. Scoping it to
+  `krab_core` is also the only thing that compiles its `grpc` and `web` code
+  paths at all — no workspace member enables either feature.
 - `service_frontend` render policy behaviour updated (`src/render_policy.rs`).
 - `krab_core` public module surface (`lib.rs`) re-exported to match the HTTP and
   protocol module split.
@@ -130,6 +143,50 @@ Covers work merged after `0.1.1` (2026-03-11) through commit `bac72c5`
 
 ### Fixed
 
+- **`collect_server_fns!` now compiles.** The macro expanded to
+  `paste::paste! { ... }`, but `paste` was not a dependency of `krab_core` or
+  any workspace crate, so the documented registration pattern in
+  `docs/reference/server_functions.md` failed at every call site. `#[server]`
+  now emits a hidden marker type implementing the new
+  `krab_core::server_fn::ServerFn` trait, and the macro resolves each
+  function's name, URL, and dispatch handler through it — no identifier
+  concatenation and no new dependency. (`paste` is unmaintained per
+  RUSTSEC-2024-0436, so adding it was not an option.) The marker is declared as
+  `struct {name} {}` so it occupies only the type namespace and does not
+  collide with the function it is named after.
+- **`krab gen component` and `krab gen route` generated code that could not
+  compile.** Both templates were written against another framework's API,
+  referencing `krab_core::prelude`, `#[component]`, `#[route(...)]`, and
+  `impl IntoView` — none of which exist in Krab. Components now return
+  `krab_core::Node`, and routes emit `pub async fn handler()`, matching the
+  discovery contract in `services/service_frontend/build.rs`. Both templates
+  are now unit-tested, including an assertion that the phantom API cannot
+  reappear.
+- **Islands example in `README.md` and `docs/architecture/design.md`
+  corrected.** It showed `pub fn Counter(initial: i32) -> impl View`; there is
+  no `View` trait, and `#[island]` requires exactly one serialisable props
+  struct and a `krab_core::Node` return. The published example is now compiled
+  and asserted by `readme_counter_example_renders_on_the_server` in
+  `crates/framework/krab_macros/tests/island_expansion.rs`.
+- **All 11 rustdoc examples are now compiled instead of skipped.** Every
+  example carried a ```` ```rust,ignore ```` fence, so none were ever checked.
+  Un-ignoring them surfaced three further stale references, now fixed:
+  `krab_core::ws::WsHandler` (does not exist), `PropagationHeaders::inject`
+  (the method is `inject_into_headers`, with `as_header_pairs` for
+  builder-style clients), and `HeadContext::render` (it is `render_tags`).
+- **Documented `#[server]`'s dependency requirements.** The expansion
+  references `axum`, `serde`, `serde_json`, and `krab_core` by path, so all
+  four must be direct dependencies of the calling crate, and `krab_core` must
+  carry the `rest` feature — the expansion implements
+  `krab_core::server_fn::ServerFn`, which is gated behind it. A proc macro
+  cannot observe the calling crate's feature flags, so neither requirement can
+  be checked at expansion time; both were previously undocumented and only
+  discoverable from a macro-expansion error.
+- **Data-loading section of `docs/architecture/design.md` corrected.** It
+  documented a `loader` convention and `[id]`-style dynamic segments as
+  existing behaviour; neither is implemented. The section now shows the real
+  `pub async fn handler()` contract and marks the loader pattern explicitly as
+  a design goal.
 - **Workspace version corrected to `0.1.1`.** `[workspace.package]` still read
   `0.1.0` even though `0.1.1` was recorded as released on 2026-03-11. All
   workspace members now inherit it, including `krab_cli` and

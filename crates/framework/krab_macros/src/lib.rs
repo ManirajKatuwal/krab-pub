@@ -23,21 +23,50 @@ use syn::{
 /// - The function must be `async`.
 /// - The return type must be `Result<T, ServerFnError>` where `T: Serialize + Deserialize`.
 /// - All arguments must implement `Serialize + Deserialize`.
+/// - The expansion references `axum`, `serde`, `serde_json`, and `krab_core` by
+///   path, so the calling crate must have all four as direct dependencies.
+/// - `krab_core` must be built with the `rest` feature. On non-wasm targets the
+///   expansion implements `krab_core::server_fn::ServerFn`, and that trait is
+///   gated behind `rest`; without it the impl fails to resolve. A proc macro
+///   cannot observe the calling crate's feature flags, so this cannot be
+///   detected at expansion time — it surfaces as a missing-trait error.
+///
+/// Alongside the function, the macro generates an Axum handler
+/// (`{name}_handler`), a dispatch shim (`__{name}_handler`), and a hidden
+/// marker type named `{name}` implementing `krab_core::server_fn::ServerFn`.
+/// The marker is what `krab_core::collect_server_fns!` resolves; it is
+/// declared as `struct {name} {}` so it occupies only the type namespace and
+/// does not collide with the function itself.
+///
+/// (Not an intra-doc link: `krab_core` is a dev-dependency of this crate — a
+/// proc-macro crate cannot take it as a normal one — so rustdoc cannot resolve
+/// a path into it.)
 ///
 /// ## Example
 ///
-/// ```rust,ignore
-/// use krab_macros::server;
+/// ```rust
 /// use krab_core::server_fn::ServerFnError;
+/// use krab_macros::server;
+/// use serde::{Deserialize, Serialize};
+///
+/// #[derive(Serialize, Deserialize)]
+/// pub struct User {
+///     pub id: String,
+///     pub name: String,
+/// }
 ///
 /// #[server]
 /// pub async fn get_user(id: String) -> Result<User, ServerFnError> {
-///     db::find_user(&id).await
+///     find_user(&id).await
 ///         .map_err(|e| ServerFnError::new(e.to_string()))
 /// }
 ///
 /// // On the server, wire it into your router:
 /// // .route("/api/rpc/get_user", post(get_user_handler))
+///
+/// # async fn find_user(id: &str) -> Result<User, std::io::Error> {
+/// #     Ok(User { id: id.to_string(), name: "Ada".to_string() })
+/// # }
 /// ```
 #[proc_macro_attribute]
 pub fn server(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -259,9 +288,32 @@ pub fn server(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // Marker type carrying this function's registration metadata, consumed by
+    // `krab_core::collect_server_fns!`. Declared as `struct name {}` so it
+    // occupies only the type namespace and does not collide with the function
+    // of the same name in the value namespace.
+    let registration_impl = quote! {
+        #[cfg(not(target_arch = "wasm32"))]
+        #[doc(hidden)]
+        #[allow(non_camel_case_types)]
+        #vis struct #fn_name {}
+
+        #[cfg(not(target_arch = "wasm32"))]
+        impl krab_core::server_fn::ServerFn for #fn_name {
+            const NAME: &'static str = #fn_name_str;
+            const URL: &'static str = #url;
+            fn dispatch(
+                args: serde_json::Value,
+            ) -> krab_core::server_fn::BoxFuture<axum::response::Response> {
+                #dispatch_handler_name(args)
+            }
+        }
+    };
+
     let output = quote! {
         #args_struct
         #server_impl
+        #registration_impl
         #client_impl
     };
 

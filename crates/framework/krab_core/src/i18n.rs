@@ -4,7 +4,7 @@
 //!
 //! ## Usage
 //!
-//! ```rust,ignore
+//! ```rust
 //! use krab_core::i18n::{I18n, Locale, TranslationBundle};
 //!
 //! let mut bundle = TranslationBundle::new();

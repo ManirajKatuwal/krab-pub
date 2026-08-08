@@ -5,14 +5,25 @@
 //!
 //! ## Usage
 //!
-//! ```rust,ignore
-//! use krab_macros::server;
+//! ```rust
 //! use krab_core::server_fn::ServerFnError;
+//! use krab_macros::server;
+//! use serde::{Deserialize, Serialize};
+//!
+//! #[derive(Serialize, Deserialize)]
+//! pub struct User {
+//!     pub id: String,
+//!     pub name: String,
+//! }
 //!
 //! #[server]
 //! pub async fn get_user(id: String) -> Result<User, ServerFnError> {
-//!     db::find_user(&id).await.map_err(|e| ServerFnError::new(e.to_string()))
+//!     find_user(&id).await.map_err(|e| ServerFnError::new(e.to_string()))
 //! }
+//!
+//! # async fn find_user(id: &str) -> Result<User, std::io::Error> {
+//! #     Ok(User { id: id.to_string(), name: "Ada".to_string() })
+//! # }
 //! ```
 //!
 //! On the server, this keeps the function as-is and generates an Axum handler.
@@ -268,26 +279,49 @@ const _: fn() = || {
     assert_send_sync::<ServerFnRegistration>();
 };
 
+/// Compile-time metadata for a server function.
+///
+/// `#[server]` generates a hidden marker type named after the annotated
+/// function and implements this trait for it. The marker lives only in the type
+/// namespace (it is declared as `struct name {}`), so it coexists with the
+/// function of the same name in the value namespace.
+///
+/// This is what lets [`collect_server_fns!`](crate::collect_server_fns) build a
+/// registration table from bare function names without concatenating
+/// identifiers — something `macro_rules!` cannot do on its own.
+#[cfg(feature = "rest")]
+pub trait ServerFn {
+    /// The function name, as written in the source.
+    const NAME: &'static str;
+    /// The URL the generated handler is mounted at.
+    const URL: &'static str;
+    /// Decode JSON arguments, invoke the function, and encode the response.
+    fn dispatch(args: serde_json::Value) -> BoxFuture<axum::response::Response>;
+}
+
 /// Build an Axum router from a list of server function registrations.
 ///
 /// Each registration is mounted at its declared URL as a POST endpoint.
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use krab_core::server_fn::server_fn_router;
+/// ```rust
+/// use krab_core::collect_server_fns;
+/// use krab_core::server_fn::{server_fn_router, ServerFn, ServerFnError, ServerFnRegistration};
+/// use krab_macros::server;
 ///
-/// let rpc_routes = server_fn_router(&[
-///     ServerFnRegistration {
-///         name: "get_user",
-///         url: "/api/rpc/get_user",
-///         handler: __get_user_handler,
-///     },
-/// ]);
+/// #[server]
+/// pub async fn get_user(id: String) -> Result<String, ServerFnError> {
+///     Ok(format!("user:{id}"))
+/// }
 ///
-/// let app = Router::new()
+/// static SERVER_FNS: &[ServerFnRegistration] = &collect_server_fns![get_user];
+///
+/// let rpc_routes = server_fn_router(SERVER_FNS);
+///
+/// let app: axum::Router = axum::Router::new()
 ///     .merge(rpc_routes)
-///     .route("/health", get(health));
+///     .route("/health", axum::routing::get(|| async { "ok" }));
 /// ```
 #[cfg(feature = "rest")]
 pub fn server_fn_router(registrations: &'static [ServerFnRegistration]) -> axum::Router {
@@ -438,24 +472,45 @@ pub async fn call_server_fn<A: Serialize, T: serde::de::DeserializeOwned>(
 
 // ── Convenience Macro ───────────────────────────────────────────────────────
 
-/// Macro to collect server function registrations into a static slice.
+/// Collect server function registrations into an array.
+///
+/// Takes the bare names of `#[server]`-annotated functions and resolves each
+/// one's name, URL, and dispatch handler through the
+/// [`ServerFn`](crate::server_fn::ServerFn) marker type that `#[server]`
+/// generates. Requires the `rest` feature.
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
 /// use krab_core::collect_server_fns;
+/// use krab_core::server_fn::{ServerFn, ServerFnError};
+/// use krab_macros::server;
+///
+/// #[server]
+/// pub async fn get_user(id: String) -> Result<String, ServerFnError> {
+///     Ok(format!("user:{id}"))
+/// }
+///
+/// #[server]
+/// pub async fn list_items() -> Result<Vec<String>, ServerFnError> {
+///     Ok(vec!["a".to_string()])
+/// }
 ///
 /// static SERVER_FNS: &[krab_core::server_fn::ServerFnRegistration] =
-///     &collect_server_fns![get_user, list_items, create_item];
+///     &collect_server_fns![get_user, list_items];
+///
+/// assert_eq!(SERVER_FNS.len(), 2);
+/// assert_eq!(SERVER_FNS[0].name, "get_user");
+/// assert_eq!(SERVER_FNS[0].url, "/api/rpc/get_user");
 /// ```
 #[macro_export]
 macro_rules! collect_server_fns {
     ($($fn_name:ident),* $(,)?) => {
         [
             $($crate::server_fn::ServerFnRegistration {
-                name: stringify!($fn_name),
-                url: concat!("/api/rpc/", stringify!($fn_name)),
-                handler: paste::paste! { [<__ $fn_name _handler>] },
+                name: <$fn_name as $crate::server_fn::ServerFn>::NAME,
+                url: <$fn_name as $crate::server_fn::ServerFn>::URL,
+                handler: <$fn_name as $crate::server_fn::ServerFn>::dispatch,
             }),*
         ]
     };

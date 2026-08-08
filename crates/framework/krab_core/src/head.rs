@@ -5,7 +5,7 @@
 //!
 //! ## Usage
 //!
-//! ```rust,ignore
+//! ```rust
 //! use krab_core::head::HeadContext;
 //!
 //! let head = HeadContext::new()
@@ -19,6 +19,7 @@
 //!
 //! // In SSR, render the head tags
 //! let tags = head.render_tags();
+//! assert!(tags.contains("<title>Blog Post Title</title>"));
 //! ```
 
 use std::collections::HashMap;

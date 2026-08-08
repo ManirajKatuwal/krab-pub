@@ -4,7 +4,7 @@
 //!
 //! ## Usage
 //!
-//! ```rust,ignore
+//! ```rust
 //! use krab_core::loading::{LoadingState, LoadingFallback, RouteTransition};
 //!
 //! // Define a loading fallback for a route

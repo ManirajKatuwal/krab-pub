@@ -4,7 +4,7 @@
 //!
 //! ## Usage
 //!
-//! ```rust,ignore
+//! ```rust
 //! use krab_core::isr::{IsrCache, IsrEntry, IsrPolicy};
 //! use std::time::Duration;
 //!

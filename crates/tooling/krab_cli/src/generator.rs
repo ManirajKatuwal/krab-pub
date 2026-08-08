@@ -276,24 +276,35 @@ fn generate_component(name: &str) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    let content = format!(
-        r#"use krab_core::prelude::*;
+    let content = render_component(name);
+    fs::write(&path, content)?;
+    println!("✅ Component '{}' created at {:?}", name, path);
+    Ok(())
+}
 
-#[component]
-pub fn {}() -> impl IntoView {{
+/// Render a plain (non-island) component.
+///
+/// Components are ordinary functions returning [`krab_core::Node`]; `view!`
+/// builds the node tree. Interactive components additionally carry `#[island]`
+/// and take a single serialisable props struct.
+fn render_component(name: &str) -> String {
+    format!(
+        r#"use krab_core::Node;
+use krab_macros::view;
+
+/// Renders the `{name}` component.
+#[allow(non_snake_case)]
+pub fn {name}() -> Node {{
     view! {{
-        <div class="{}">
+        <div class="{class}">
             "We are crabs"
         </div>
     }}
 }}
 "#,
-        name,
-        name.to_lowercase()
-    );
-    fs::write(&path, content)?;
-    println!("✅ Component '{}' created at {:?}", name, path);
-    Ok(())
+        name = name,
+        class = name.to_lowercase()
+    )
 }
 
 fn generate_route(name: &str) -> Result<()> {
@@ -303,25 +314,39 @@ fn generate_route(name: &str) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    let content = format!(
-        r#"use krab_core::prelude::*;
-
-#[route(path = "/{}")]
-pub fn {}() -> impl IntoView {{
-    view! {{
-        <div>
-            "Route: {}"
-        </div>
-    }}
-}}
-"#,
-        name.to_lowercase(),
-        name,
-        name
-    );
+    let content = render_route(name);
     fs::write(&path, content)?;
     println!("✅ Route '{}' created at {:?}", name, path);
     Ok(())
+}
+
+/// Render a route module.
+///
+/// `service_frontend/build.rs` discovers `src/routes/<stem>.rs` and registers
+/// `<module>::handler` at `/<stem>` (or `/` for `index.rs`), so the exported
+/// item must be `pub async fn handler()` returning an Axum response. Declare
+/// per-route middleware with a `//# middleware: name` comment.
+fn render_route(name: &str) -> String {
+    format!(
+        r#"use axum::response::Html;
+use krab_core::Render;
+use krab_macros::view;
+
+/// Handles `GET /{path}`.
+pub async fn handler() -> Html<String> {{
+    Html(
+        view! {{
+            <div>
+                "Route: {name}"
+            </div>
+        }}
+        .render(),
+    )
+}}
+"#,
+        path = name.to_lowercase(),
+        name = name
+    )
 }
 
 fn generate_server_function(name: &str) -> Result<()> {
@@ -354,7 +379,26 @@ pub async fn {}(input: String) -> Result<String, ServerFnError> {{
 
 #[cfg(test)]
 mod tests {
-    use super::render_server_function;
+    use super::{render_component, render_route, render_server_function};
+
+    /// Items that do not exist in Krab. Earlier templates were written against
+    /// another framework's API and generated code that could not compile.
+    const PHANTOM_API: &[&str] = &[
+        "krab_core::prelude",
+        "IntoView",
+        "impl View",
+        "#[component]",
+        "#[route(",
+    ];
+
+    fn assert_no_phantom_api(rendered: &str) {
+        for item in PHANTOM_API {
+            assert!(
+                !rendered.contains(item),
+                "generated code references `{item}`, which does not exist in Krab:\n{rendered}"
+            );
+        }
+    }
 
     #[test]
     fn server_function_generator_uses_supported_macro_contract() {
@@ -364,5 +408,30 @@ mod tests {
         assert!(!rendered.contains("endpoint ="));
         assert!(rendered.contains("validate_server_fn"));
         assert!(rendered.contains("Result<String, ServerFnError>"));
+        assert_no_phantom_api(&rendered);
+    }
+
+    #[test]
+    fn component_generator_uses_supported_node_contract() {
+        let rendered = render_component("Counter");
+
+        assert!(rendered.contains("use krab_core::Node;"));
+        assert!(rendered.contains("use krab_macros::view;"));
+        assert!(rendered.contains("pub fn Counter() -> Node {"));
+        assert!(rendered.contains("view! {"));
+        assert!(rendered.contains(r#"class="counter""#));
+        assert_no_phantom_api(&rendered);
+    }
+
+    #[test]
+    fn route_generator_matches_build_script_discovery_contract() {
+        let rendered = render_route("About");
+
+        // build.rs registers `<module>::handler` for every src/routes/*.rs.
+        assert!(rendered.contains("pub async fn handler() -> Html<String> {"));
+        assert!(rendered.contains("use krab_core::Render;"));
+        assert!(rendered.contains(".render(),"));
+        assert!(rendered.contains("GET /about"));
+        assert_no_phantom_api(&rendered);
     }
 }
