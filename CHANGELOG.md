@@ -21,6 +21,56 @@ Covers work merged after `0.1.1` (2026-03-11) through commit `bac72c5`
 
 ### Added
 
+- **The workspace is publishable.** Every inter-crate dependency now carries a
+  `version` alongside its `path`, declared once in `[workspace.dependencies]`.
+  Previously all six framework and tooling crates were path-only and
+  `cargo publish` rejected them outright, so Krab was consumable only by cloning
+  this repository. `cargo publish --workspace --dry-run` now exits 0 and is
+  enforced by the `publish-dry-run` job in `ops-hardening`. Publication order
+  and preconditions are documented in
+  [`RELEASE_POLICY.md`](RELEASE_POLICY.md#crate-publication).
+- **`krab_cli` installs a binary named `krab`.** Added an explicit `[[bin]]`
+  section. The binary previously inherited the package name `krab_cli`, so
+  `cargo install krab_cli` produced a command that matched none of the
+  documented invocations (`krab doctor`, `krab new`, `krab release certify`).
+  The package cannot be renamed — the crates.io name `krab` was registered in
+  2023 by an unrelated crate.
+- **Installation section in [`README.md`](README.md)** covering `cargo add` and
+  `cargo install`, with the per-crate breakdown and the `krab_core` feature
+  list. No documentation previously showed adding Krab as a dependency.
+- **Inter-crate version-pin check** in `scripts/check_workspace_layout.py`:
+  every `krab_*` entry in `[workspace.dependencies]` must carry a `path` and a
+  `version` matching `[workspace.package] version`. Cargo has no
+  `version.workspace = true` for workspace dependencies, so the value is
+  duplicated by necessity; without this check a stale pin surfaces only at
+  publish time.
+- **`view!` accepts hyphenated, namespaced, and keyword names.** Tag and
+  attribute names now parse as `Ident (('-' | ':') (Ident | LitInt))*` with
+  raw-identifier support, so `data-testid`, `aria-label`, `xlink:href`,
+  `<my-widget>`, `<input type="text">`, and `<label for="email">` all work.
+  Names previously parsed as a bare `syn::Ident`, which cannot contain `-` or
+  `:` and rejects Rust keywords — which is why `#[island]` builds its
+  `data-island` / `data-krab-boundary-*` wrapper by constructing
+  `krab_core::Attribute` values directly, and why the reference frontend
+  hand-writes HTML strings for island markup.
+- **`krab new --path-deps <KRAB_REPO_ROOT>`** points a generated project at a
+  local Krab checkout instead of crates.io. Required by the new
+  `generated-project` gate, which must build scaffolded output before that
+  version is published.
+- **`generated-project` CI workflow** builds, tests, clippy-checks, and
+  format-checks a real `krab new` output for all four templates. The primary
+  onboarding path was previously unguarded — the only tests asserted that files
+  existed and contained given substrings.
+- **`krab --version`.** The CLI had no version flag.
+- **SQLite is a framework driver.** `krab_core`'s `db` feature is split into
+  `db-postgres` and `db-sqlite`, and driver selection — `DbDriver`,
+  `resolve_db_driver`, `default_db_url_for_driver` — moves from
+  `services/service_users` into `krab_core::db`. `krab_core`'s `sqlx`
+  dependency previously enabled `postgres` unconditionally and nothing else, so
+  `KRAB_DB_DRIVER=postgres|sqlite` was documented as a framework choice that
+  only a reference application could actually make. Both driver features are
+  now compiled independently in CI. `db` remains a deprecated alias for
+  `db-postgres` for one minor version.
 - **`krab_core` HTTP layer split** into focused modules: `http_auth`,
   `http_error`, `http_headers`, `http_observability`, `http_protocol`,
   `http_runtime`, and `http_security`, alongside the existing `http`.
@@ -83,6 +133,24 @@ Covers work merged after `0.1.1` (2026-03-11) through commit `bac72c5`
 
 ### Changed
 
+- **Release profile split: server binaries now build for speed, the WASM client
+  for size.** `[profile.release]` moves from `opt-level = "z"` to
+  `opt-level = 3`, with `opt-level = "z"` scoped to `krab_client` via
+  `[profile.release.package.krab_client]`. Size optimisation had applied
+  workspace-wide, so every service binary traded throughput to shrink an
+  artifact that is never shipped over a network — while the browser bundle,
+  where size genuinely matters, is separately gated at 500 KB raw / 150 KB gzip
+  and keeps `"z"` plus `wasm-opt -Oz`. Downstream consumers should expect
+  larger, faster release binaries. Measured WASM impact: the bundle grows from
+  1,422 B to 16,420 B raw (897 B → 7,178 B gzip) — a 11.5× relative increase
+  that is still **3% of the 500 KB raw budget**, because the per-package
+  override applies to `krab_client` itself but not to its dependencies. If the
+  client bundle ever approaches the budget, move the WASM build to a dedicated
+  `[profile.wasm-release]` so the whole dependency graph is size-optimised.
+  `panic` is
+  deliberately left at `unwind`: Tower and Axum contain a panicking request to
+  its own connection, whereas `abort` would terminate the process and every
+  in-flight request with it.
 - **CI now runs the test suite.** `ops-hardening.yaml` gained
   `cargo test --workspace` and `cargo test -p krab_core --all-features`. No
   workflow previously ran either; the only test invocations were
@@ -143,6 +211,37 @@ Covers work merged after `0.1.1` (2026-03-11) through commit `bac72c5`
 
 ### Fixed
 
+- **An unset `KRAB_DB_DRIVER` now selects Postgres, not SQLite.**
+  `.env.example`, [`docs/reference/environment.md`](docs/reference/environment.md),
+  and `CLAUDE.md` all documented `postgres` as the default; the code in
+  `service_users` defaulted to `sqlite`. Falling back to the driver *without*
+  migration governance because a variable was unset is the more dangerous
+  direction, so the code now matches the documentation. Every CI and compose
+  configuration already set the variable explicitly and is unaffected.
+- **The `edge-ssr` template's ISR cache is actually used.** It was constructed
+  into `AppState` and never read, which failed the `-D warnings` clippy that the
+  generated project's own CI workflow runs. `/` now serves through the cache
+  with stale-while-revalidate, and the starter-scope note no longer disclaims
+  the ISR serving the template performs.
+- **`krab new` output now compiles.** Three independent defects in the generated
+  `Cargo.toml`, none caught by the substring-matching template tests:
+  the `krab_core` version was a hard-coded `"0.1.0"` that had fallen behind the
+  workspace's `0.1.1`; the `saas` template emitted
+  `features = ["db, rest"]` — a single feature literally named `db, rest`,
+  which Cargo rejects; and `krab_macros` was absent entirely, putting `view!`,
+  `#[island]`, and `#[server]` out of reach of a scaffolded project. The version
+  is now derived from the CLI's own package version, features are rendered from
+  a list, and the template tests parse the manifest rather than grepping it.
+- **A scaffolded project passes its own generated CI.** The `default` template's
+  route registration exceeded 100 columns once the project name was
+  substituted, so `cargo fmt --all --check` — which the generated CI workflow
+  runs — failed on the first commit of every new project. The template now uses
+  named handler functions whose width does not depend on the project name.
+- **`view!` reports capitalised tags as an error.** `<MyComponent/>` previously
+  emitted the literal markup `<MyComponent>`, which no browser renders, with no
+  diagnostic at any stage. `view!` has no component composition; the error names
+  the working alternative. See
+  [ADR 0006](docs/adr/0006-view-component-composition.md).
 - **`collect_server_fns!` now compiles.** The macro expanded to
   `paste::paste! { ... }`, but `paste` was not a dependency of `krab_core` or
   any workspace crate, so the documented registration pattern in
@@ -230,6 +329,20 @@ Covers work merged after `0.1.1` (2026-03-11) through commit `bac72c5`
 
 ### Governance
 
+- **Workspace layout is now a CI gate.** `scripts/check_workspace_layout.py`
+  runs in `ops-hardening` and fails on a workspace member outside
+  `crates/framework/`, `crates/tooling/`, or `services/`; on a member whose
+  `Cargo.toml` is missing; or on a crate directory at the repository root — the
+  last catching a stray crate before it reaches `members`. The layout standard
+  had been convention-only since the reorg, so nothing stopped a root-level
+  crate from landing.
+- **ADR 0004 — Protocol selection by explicit endpoint.** Records the resolution
+  order the code actually implements (allowed set → route family → gated client
+  header → service default) and why header-driven negotiation stays off by
+  default: the adapter determines the authorization, rate-limit, and audit
+  surface, so a client able to steer the adapter can steer the policy applied to
+  it. Two planning documents had specified contradictory selection models since
+  the feature was designed, and neither matched the implementation.
 - Release certification evidence is now generated in CI by
   `krab release certify` and uploaded as a workflow artifact.
 - Provenance hashes (`Cargo.lock`, `.env.example`) recorded by

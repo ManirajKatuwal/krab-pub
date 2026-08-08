@@ -46,6 +46,53 @@ All conditions below must be satisfied before a beta release can be promoted to 
 
 ---
 
+## Crate Publication
+
+Krab is consumed from crates.io, not by cloning this repository. Six crates are
+published; the four under `services/` carry `publish = false` and are reference
+applications, not distributables.
+
+### Published crates and order
+
+Cargo will not accept a crate whose dependencies are not already on the index,
+so publication is ordered by the dependency graph:
+
+| Order | Crate | Depends on |
+|---|---|---|
+| 1 | `krab_macros` | — |
+| 2 | `krab_core` | — |
+| 3 | `krab_server` | `krab_core` |
+| 4 | `krab_client` | `krab_core`, `krab_macros` |
+| 5 | `krab_cli` | `krab_core` |
+| 6 | `krab_orchestrator` | `krab_core` |
+
+`cargo publish --workspace` computes this order itself and is the supported way
+to release; the table exists so a human recovering from a partial publish knows
+where to resume.
+
+### Preconditions
+
+- `cargo publish --workspace --dry-run` exits 0. This is enforced on every push
+  by the `publish-dry-run` job in
+  [`ops-hardening.yaml`](.github/workflows/ops-hardening.yaml) and is a
+  promotion blocker, not an advisory check.
+- The `version` values in `[workspace.dependencies]` match
+  `[workspace.package] version` in the root [`Cargo.toml`](Cargo.toml).
+  `scripts/check_workspace_layout.py` enforces this.
+- Inter-crate **dev**-dependencies remain path-only and version-less.
+  `krab_core` and `krab_macros` dev-depend on each other; Cargo strips
+  version-less path dev-dependencies on publish, which is the only reason that
+  cycle is publishable. Adding a version to either makes the pair unpublishable
+  with no crate to start from.
+
+### Binary name
+
+`krab_cli` publishes a binary named `krab` via an explicit `[[bin]]` section.
+The package cannot be named `krab` — that name was registered on crates.io in
+2023 by an unrelated crate. `cargo install krab_cli` puts `krab` on `PATH`.
+
+---
+
 ## Versioning Policy
 
 - **Format**: Semantic Versioning — `MAJOR.MINOR.PATCH`

@@ -25,7 +25,55 @@ Krab also includes built-in service composition for frontend, authentication, an
 
 ---
 
+## Installation
+
+> **Not yet on crates.io.** The workspace is publishable — `cargo publish
+> --workspace --dry-run` passes and is enforced in CI — but the first release
+> has not been cut. Until it is, use the path-dependency form below. Publication
+> preconditions and ordering are in [RELEASE_POLICY.md](RELEASE_POLICY.md).
+
+Krab is six crates. Most applications need two:
+
+| Crate | Purpose |
+|---|---|
+| [`krab_core`](crates/framework/krab_core/) | Runtime: config, HTTP, database, telemetry, signals, protocol |
+| [`krab_macros`](crates/framework/krab_macros/) | `view!`, `#[island]`, `#[server]` |
+| [`krab_client`](crates/framework/krab_client/) | WASM island hydration, for the browser bundle |
+| [`krab_server`](crates/framework/krab_server/) | Hyper/Tower server foundations |
+| [`krab_cli`](crates/tooling/krab_cli/) | The `krab` binary: scaffolding, dev workflow, governance |
+| [`krab_orchestrator`](crates/tooling/krab_orchestrator/) | Multi-process service runner driven by `krab.toml` |
+
+### Add to a project
+
+```sh
+# Once published:
+cargo add krab_core --features rest
+cargo add krab_macros
+
+# Until then, against a local checkout:
+#   krab_core   = { path = "../krab/crates/framework/krab_core", features = ["rest"] }
+#   krab_macros = { path = "../krab/crates/framework/krab_macros" }
+```
+
+`krab_core` ships **no default features**. Pick what you need: `rest`,
+`graphql`, `grpc`, `db`, `redis-store`, `web`.
+
+### Install the CLI
+
+```sh
+cargo install krab_cli          # installs a binary named `krab`
+krab --version
+```
+
+The package is `krab_cli`; the binary is `krab`. The crates.io name `krab` was
+taken in 2023 by an unrelated crate.
+
+---
+
 ## Quick Start
+
+This section runs **this repository's** reference services. To build your own
+application, see the Installation section above.
 
 ### Prerequisites
 
@@ -38,7 +86,7 @@ Krab also includes built-in service composition for frontend, authentication, an
 
 ```sh
 # Clone and configure
-git clone https://github.com/your-org/krab.git
+git clone https://github.com/krab-framework/krab.git
 cd krab
 cp .env.example .env
 # Edit .env with your local settings (DATABASE_URL, KRAB_AUTH_MODE, etc.)
@@ -256,7 +304,7 @@ All gates must pass before merge. Automated workflows enforce quality at every P
 
 | Workflow            | File                                                                                       | Purpose                                          |
 | ------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------ |
-| Ops Hardening       | [`.github/workflows/ops-hardening.yaml`](.github/workflows/ops-hardening.yaml)             | `fmt`, `clippy`, `rustdoc`, and `cargo-deny`     |
+| Ops Hardening       | [`.github/workflows/ops-hardening.yaml`](.github/workflows/ops-hardening.yaml)             | Workspace layout, `fmt`, `clippy`, `rustdoc`, and `cargo-deny` |
 | Dependency Security | [`.github/workflows/dependency-security.yaml`](.github/workflows/dependency-security.yaml) | `cargo-audit` and SBOM generation                |
 | API Contract        | [`.github/workflows/api-contract.yaml`](.github/workflows/api-contract.yaml)               | API contract validation                          |
 | DB Lifecycle        | [`.github/workflows/db-lifecycle.yaml`](.github/workflows/db-lifecycle.yaml)               | Migration, rollback simulation, and drift checks |

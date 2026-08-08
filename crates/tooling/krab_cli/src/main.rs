@@ -26,6 +26,10 @@ use crate::topology::dispatch_topology_action;
 #[derive(Parser)]
 #[command(name = "krab")]
 #[command(about = "Krab Framework CLI", long_about = None)]
+// Reports the `krab_cli` package version, which is the workspace version. Users
+// installing from crates.io need this to tell which release they have, and CI
+// uses `krab --version` as the smoke test that `[[bin]] name = "krab"` took.
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -40,6 +44,14 @@ enum Commands {
         /// Starter template to use
         #[arg(long, value_enum, default_value_t = ProjectTemplate::Default)]
         template: ProjectTemplate,
+        /// Depend on a local Krab checkout instead of crates.io.
+        ///
+        /// Point this at the root of the krab repository. Used by the
+        /// `generated-project` CI gate, which must build scaffolded output
+        /// before that version exists on crates.io, and useful when testing a
+        /// framework change against a fresh project.
+        #[arg(long, value_name = "KRAB_REPO_ROOT")]
+        path_deps: Option<PathBuf>,
     },
     /// Build the full stack application
     Build {
@@ -382,8 +394,12 @@ fn dispatch_command(command: &Commands) -> Result<()> {
         } => dispatch_doctor_command(*diagnostics, *strict)?,
         Commands::Topology { action } => dispatch_topology_action(action)?,
         Commands::Gen { resource } => dispatch_gen_resource(resource)?,
-        Commands::New { name, template } => {
-            generate_project_from_template(name, template)?;
+        Commands::New {
+            name,
+            template,
+            path_deps,
+        } => {
+            generate_project_from_template(name, template, path_deps.as_deref())?;
         }
     }
 

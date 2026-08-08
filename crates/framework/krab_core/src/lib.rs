@@ -48,10 +48,14 @@ fn escape_html_text(s: &str) -> String {
 #[cfg(not(target_arch = "wasm32"))]
 pub mod service;
 
-#[cfg(feature = "db")]
+// Driver selection is available under either driver; the Postgres runtime
+// inside is gated on `db-postgres`.
+#[cfg(any(feature = "db-postgres", feature = "db-sqlite"))]
 pub mod db;
 
-#[cfg(feature = "db")]
+// `UserRepository` is the port applications implement per driver, so it is
+// not Postgres-specific.
+#[cfg(any(feature = "db-postgres", feature = "db-sqlite"))]
 pub mod repository;
 
 #[cfg(feature = "rest")]
@@ -75,7 +79,7 @@ pub mod store;
 #[cfg(all(feature = "rest", test))]
 mod auth_tests;
 
-#[cfg(all(feature = "db", test))]
+#[cfg(all(feature = "db-postgres", test))]
 mod db_tests;
 
 #[cfg(all(feature = "rest", test))]

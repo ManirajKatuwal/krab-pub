@@ -1,9 +1,11 @@
 use proc_macro::TokenStream;
+use proc_macro2::Span;
 use quote::{quote, ToTokens};
 use syn::{
+    ext::IdentExt,
     parse::{Parse, ParseStream},
-    parse_macro_input, token, Expr, FnArg, GenericArgument, Ident, ItemFn, LitStr, PathArguments,
-    Result, ReturnType, Token, Type, TypePath,
+    parse_macro_input, token, Expr, FnArg, GenericArgument, Ident, ItemFn, LitInt, LitStr,
+    PathArguments, Result, ReturnType, Token, Type, TypePath,
 };
 
 // ── Server Function Macro ───────────────────────────────────────────────────
@@ -398,6 +400,23 @@ fn to_pascal_case(s: &str) -> String {
         .collect()
 }
 
+/// `MyComponent` -> `my_component`, for suggesting the function to call in the
+/// diagnostic emitted when `view!` sees a capitalised tag.
+fn to_snake_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for (index, ch) in s.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if index != 0 {
+                out.push('_');
+            }
+            out.extend(ch.to_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 #[proc_macro_attribute]
 pub fn island(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut input_fn = parse_macro_input!(item as ItemFn);
@@ -582,20 +601,81 @@ enum Node {
 }
 
 struct Element {
-    name: Ident,
+    name: String,
     attributes: Vec<Attribute>,
     events: Vec<EventListener>,
     children: Vec<Node>,
 }
 
 struct Attribute {
-    name: Ident,
+    name: String,
     value: Expr,
 }
 
 struct EventListener {
-    name: Ident,
+    name: String,
     value: Expr,
+}
+
+/// Parse an HTML tag or attribute name into its source text.
+///
+/// Grammar: `Ident (('-' | ':') (Ident | LitInt))*`
+///
+/// Tag and attribute names were parsed as a bare [`syn::Ident`], which cannot
+/// represent most real HTML. Two separate consequences:
+///
+/// - A Rust identifier contains no `-` or `:`, so `data-testid`, `aria-label`,
+///   `xlink:href`, and every custom element (`<my-widget>`) were unparseable.
+///   The framework's own `#[island]` macro builds `data-island` and
+///   `data-krab-boundary-id` by constructing `krab_core::Attribute` values
+///   directly, because `view!` could not express them.
+/// - Rust keywords are not `Ident`s to `syn`'s default parser, so `type`,
+///   `for`, `as`, and `loop` were rejected — meaning no `<input type="text">`
+///   and no `<label for="name">`. [`IdentExt::parse_any`] accepts them.
+///
+/// Returns the reassembled name and the span of its first segment, which is
+/// what diagnostics point at.
+fn parse_html_name(input: ParseStream) -> Result<(String, Span)> {
+    let first = Ident::parse_any(input)?;
+    let span = first.span();
+    let mut name = strip_raw(&first);
+
+    loop {
+        // `::` is a path separator, never part of an HTML name. Leaving it to
+        // the caller keeps `{some::path}` expressions parsing as before.
+        let separator = if input.peek(Token![-]) {
+            input.parse::<Token![-]>()?;
+            '-'
+        } else if input.peek(Token![:]) && !input.peek(Token![::]) {
+            input.parse::<Token![:]>()?;
+            ':'
+        } else {
+            break;
+        };
+        name.push(separator);
+
+        if input.peek(Ident::peek_any) {
+            name.push_str(&strip_raw(&Ident::parse_any(input)?));
+        } else if input.peek(LitInt) {
+            let segment: LitInt = input.parse()?;
+            name.push_str(&segment.to_string());
+        } else {
+            return Err(input.error(format!(
+                "expected a name segment after '{separator}' in '{name}'.\n  \
+                 Names are made of segments joined by '-' or ':':\n    \
+                 <div data-testid=\"x\">\n    \
+                 <use xlink:href=\"#icon\"/>"
+            )));
+        }
+    }
+
+    Ok((name, span))
+}
+
+/// `r#type` reaches the parser with its raw prefix intact; HTML wants `type`.
+fn strip_raw(ident: &Ident) -> String {
+    let text = ident.to_string();
+    text.strip_prefix("r#").unwrap_or(&text).to_string()
 }
 
 impl Parse for Node {
@@ -644,7 +724,29 @@ impl Parse for Node {
 impl Parse for Element {
     fn parse(input: ParseStream) -> Result<Self> {
         input.parse::<Token![<]>()?;
-        let name: Ident = input.parse()?;
+        let (name, name_span) = parse_html_name(input)?;
+
+        // No HTML or SVG element name begins with an uppercase letter, so a
+        // capitalised tag is always an attempt at component composition —
+        // `<MyComponent/>`. `view!` does not support that: it would emit the
+        // literal markup `<MyComponent>`, which no browser renders and no test
+        // catches. Failing loudly beats silently producing broken HTML.
+        //
+        // Whether to support component composition is open; see
+        // docs/adr/0006-view-component-composition.md.
+        if name.starts_with(|c: char| c.is_ascii_uppercase()) {
+            return Err(syn::Error::new(
+                name_span,
+                format!(
+                    "`view!` has no component composition, so <{name}> would be emitted as a \
+                     literal HTML tag named '{name}'.\n  \
+                     Call the function and interpolate its node instead:\n    \
+                     view! {{ <div>{{{}(props)}}</div> }}\n  \
+                     For an interactive component, annotate it with #[island].",
+                    to_snake_case(&name)
+                ),
+            ));
+        }
 
         let mut attributes = Vec::new();
         let mut events = Vec::new();
@@ -653,11 +755,20 @@ impl Parse for Element {
                 break;
             }
 
-            let attr_name: Ident = input.parse()?;
-            let attr_name_str = attr_name.to_string();
-            if attr_name_str == "on" && input.peek(Token![:]) {
-                input.parse::<Token![:]>()?;
-                let event_name: Ident = input.parse()?;
+            let (attr_name_str, attr_span) = parse_html_name(input)?;
+
+            // `on:click` now parses as a single name, because ':' is a legal
+            // separator. Event handlers are therefore recognised by prefix
+            // after the fact, rather than by special-casing a bare `on`
+            // followed by ':' during parsing — the old approach becomes
+            // ambiguous once ':' can appear inside a name at all.
+            if let Some(event_name) = attr_name_str.strip_prefix("on:") {
+                if event_name.is_empty() {
+                    return Err(syn::Error::new(
+                        attr_span,
+                        "event handler needs a name after 'on:', e.g. on:click={handler}",
+                    ));
+                }
                 input.parse::<Token![=]>()?;
 
                 let value: Expr = if input.peek(token::Brace) {
@@ -665,11 +776,14 @@ impl Parse for Element {
                     syn::braced!(content in input);
                     content.parse()?
                 } else {
-                    return Err(input.error("Expected expression block for event handler"));
+                    return Err(input.error(format!(
+                        "Expected expression block for event handler '{attr_name_str}'.\n  \
+                         Example: on:click={{move |_| count.set(count.get() + 1)}}"
+                    )));
                 };
 
                 events.push(EventListener {
-                    name: event_name,
+                    name: event_name.to_string(),
                     value,
                 });
                 continue;
@@ -695,7 +809,7 @@ impl Parse for Element {
             };
 
             attributes.push(Attribute {
-                name: attr_name,
+                name: attr_name_str,
                 value,
             });
         }
@@ -723,15 +837,16 @@ impl Parse for Element {
 
         input.parse::<Token![<]>()?;
         input.parse::<Token![/]>()?;
-        let closing_name: Ident = input.parse()?;
+        // Parsed with the same grammar as the opening tag so the comparison is
+        // on full names — `</my-widget>` must match `<my-widget>`, and the
+        // diagnostic must print the hyphenated name rather than its first
+        // segment.
+        let (closing_name, closing_span) = parse_html_name(input)?;
 
         if closing_name != name {
             return Err(syn::Error::new(
-                closing_name.span(),
-                format!(
-                    "Mismatched closing tag: expected </{}>, found </{}>",
-                    name, closing_name
-                ),
+                closing_span,
+                format!("Mismatched closing tag: expected </{name}>, found </{closing_name}>"),
             ));
         }
 
@@ -750,7 +865,7 @@ impl ToTokens for Node {
     fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
         match self {
             Node::Element(el) => {
-                let name = &el.name.to_string();
+                let name = &el.name;
                 let attrs = &el.attributes;
                 let events = &el.events;
                 let children = &el.children;
@@ -786,7 +901,7 @@ impl ToTokens for Node {
 
 impl ToTokens for Attribute {
     fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
-        let name = &self.name.to_string();
+        let name = &self.name;
         let value = &self.value;
         tokens.extend(quote! {
             krab_core::Attribute {
@@ -799,7 +914,7 @@ impl ToTokens for Attribute {
 
 impl ToTokens for EventListener {
     fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
-        let name = &self.name.to_string();
+        let name = &self.name;
         let value = &self.value;
         tokens.extend(quote! {
             #[cfg(feature = "web")]

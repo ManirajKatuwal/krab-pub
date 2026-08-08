@@ -30,7 +30,12 @@ axum = { workspace = true, optional = true }
 async-graphql = { workspace = true, optional = true }
 
 # Database (Optional)
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "uuid", "time"], optional = true }
+#
+# Driver features are NOT listed here — they come from `db-postgres` /
+# `db-sqlite` below, so enabling one driver does not compile the other in.
+# `postgres` was unconditional, which is why SQLite support could only ever
+# live in an application crate.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "macros", "uuid", "time"], optional = true }
 
 [features]
 default = []
@@ -39,8 +44,19 @@ redis-store = ["dep:redis"]
 
 graphql = ["dep:async-graphql"]
 grpc = []
-db = ["dep:sqlx"]
 web = ["dep:web-sys", "dep:js-sys", "dep:wasm-bindgen"]
+
+# Postgres: connection pooling plus the full migration governance surface —
+# checksum validation, drift detection, rollback, promotion policy.
+db-postgres = ["dep:sqlx", "sqlx/postgres"]
+
+# SQLite: the driver only. Migration governance is Postgres-specific and does
+# not apply; see docs/reference/database.md.
+db-sqlite = ["dep:sqlx", "sqlx/sqlite"]
+
+# Deprecated alias for `db-postgres`, kept for one minor version per the
+# breaking-change policy in RELEASE_POLICY.md. Remove no earlier than 0.2.0.
+db = ["db-postgres"]
 
 [dependencies.web-sys]
 version = "0.3"
@@ -63,4 +79,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serial_test = "3"
 # Dev-only, so the krab_macros <-> krab_core cycle is permitted by Cargo.
 # Needed so doc examples that use `#[server]` are compiled rather than skipped.
+#
+# DO NOT give this a version, and do not switch it to `workspace = true`.
+# Cargo strips version-less path dev-dependencies from the published manifest,
+# which is the only reason this cycle can be published at all. Adding a version
+# here makes `krab_core` require a published `krab_macros` and `krab_macros`
+# require a published `krab_core` — a deadlock with no first crate to publish.
 krab_macros = { path = "../krab_macros" }

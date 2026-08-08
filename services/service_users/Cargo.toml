@@ -18,7 +18,7 @@ tracing-subscriber.workspace = true
 serde_json.workspace = true
 tower.workspace = true
 tower-http = { workspace = true, features = ["cors", "compression-gzip", "request-id", "trace"] }
-krab_core = { path = "../../crates/framework/krab_core", features = ["graphql", "rest", "db", "redis-store"] }
+krab_core = { workspace = true, features = ["graphql", "rest", "db-postgres", "db-sqlite", "redis-store"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "sqlite", "uuid", "time"] }
 anyhow.workspace = true
 async-trait.workspace = true

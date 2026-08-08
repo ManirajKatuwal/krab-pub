@@ -4,6 +4,75 @@ use std::path::{Path, PathBuf};
 
 use crate::ProjectTemplate;
 
+/// Version requirement written into generated `Cargo.toml` files.
+///
+/// Derived from the CLI's own package version, which is the workspace version,
+/// so a `krab` release always scaffolds against the matching `krab_core`. This
+/// was previously a hard-coded `"0.1.0"` literal that silently fell a version
+/// behind the workspace and produced projects that could not resolve.
+const FRAMEWORK_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// How a generated project should depend on the framework crates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DependencySource {
+    /// Resolve from crates.io at [`FRAMEWORK_VERSION`]. The default, and what a
+    /// real user gets.
+    Registry,
+    /// Resolve from a local checkout of this repository. Used by the
+    /// `generated-project` CI gate, which must build scaffolded output before
+    /// the corresponding version exists on crates.io — and by anyone testing a
+    /// framework change against a fresh project.
+    Path(PathBuf),
+}
+
+/// Render a filesystem path for embedding in a `Cargo.toml` string.
+///
+/// Two Windows-specific hazards, both of which produce a manifest Cargo
+/// refuses to parse:
+///
+/// - `Path::canonicalize` returns a verbatim path (`\\?\C:\...`). Cargo rejects
+///   it with `invalid path url`, so the prefix is stripped.
+/// - A backslash is an invalid escape inside a TOML basic string, so separators
+///   are normalised to `/`. Cargo accepts forward slashes on every platform.
+fn path_for_toml(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let stripped = text
+        .strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .or_else(|| text.strip_prefix(r"\\?\").map(str::to_string))
+        .unwrap_or_else(|| text.to_string());
+    stripped.replace('\\', "/")
+}
+
+impl DependencySource {
+    /// Render one dependency line, e.g. `krab_core = { ... }`.
+    ///
+    /// `crate_dir` is the crate's location relative to the repository root; it
+    /// is only consulted for [`DependencySource::Path`].
+    fn render(&self, crate_name: &str, crate_dir: &str, features: &[&str]) -> String {
+        let features = if features.is_empty() {
+            String::new()
+        } else {
+            let list = features
+                .iter()
+                .map(|f| format!("\"{f}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(", features = [{list}]")
+        };
+
+        match self {
+            DependencySource::Registry => {
+                format!("{crate_name} = {{ version = \"{FRAMEWORK_VERSION}\"{features} }}")
+            }
+            DependencySource::Path(root) => {
+                let path = path_for_toml(&root.join(crate_dir));
+                format!("{crate_name} = {{ path = \"{path}\"{features} }}")
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct TemplateMetadata {
     flag: &'static str,
@@ -11,7 +80,13 @@ struct TemplateMetadata {
     starter_scope: Option<&'static str>,
     axum_dep: &'static str,
     extra_deps: &'static str,
-    extra_features: &'static str,
+    /// Cargo features to enable on `krab_core`, one per element.
+    ///
+    /// This was a single comma-joined string interpolated straight into
+    /// `features = ["{...}"]`, which produced `features = ["db, rest"]` — one
+    /// feature literally named `db, rest`, which does not exist. Every `saas`
+    /// project ever scaffolded failed to resolve.
+    extra_features: &'static [&'static str],
 }
 
 fn template_metadata(template: &ProjectTemplate) -> TemplateMetadata {
@@ -28,18 +103,20 @@ fn template_metadata(template: &ProjectTemplate) -> TemplateMetadata {
 argon2 = "0.5"
 jsonwebtoken = "9.0"
 "#,
-            extra_features: "db, rest",
+            // `db-postgres`, not the deprecated `db` alias — a scaffolded
+            // project should start on the name that will still exist at 0.2.0.
+            extra_features: &["db-postgres", "rest"],
         },
         ProjectTemplate::EdgeSsr => TemplateMetadata {
             flag: "edge-ssr",
             description: "Edge SSR policy skeleton with explicit SSR, ISR, and streaming metadata",
             starter_scope: Some(
-                "This starter demonstrates route render-policy wiring and edge eligibility metadata. It does not ship full ISR cache serving or streamed SSR output out of the box.",
+                "This starter wires route render policy, edge eligibility metadata, and stale-while-revalidate ISR serving on `/`. It does not ship streamed SSR output out of the box.",
             ),
             axum_dep: r#"axum = "0.8"
 "#,
             extra_deps: "",
-            extra_features: "rest",
+            extra_features: &["rest"],
         },
         ProjectTemplate::EventStream => TemplateMetadata {
             flag: "event-stream",
@@ -50,7 +127,7 @@ jsonwebtoken = "9.0"
             extra_deps: r#"tokio-stream = "0.1"
 futures-util = "0.3"
 "#,
-            extra_features: "rest",
+            extra_features: &["rest"],
         },
         ProjectTemplate::Default => TemplateMetadata {
             flag: "default",
@@ -59,7 +136,7 @@ futures-util = "0.3"
             axum_dep: r#"axum = "0.8"
 "#,
             extra_deps: "",
-            extra_features: "rest",
+            extra_features: &["rest"],
         },
     }
 }
@@ -110,7 +187,12 @@ kubectl apply -f deploy/kubernetes.yaml
     )
 }
 
-fn write_project_from_template(path: &Path, name: &str, template: &ProjectTemplate) -> Result<()> {
+fn write_project_from_template(
+    path: &Path,
+    name: &str,
+    template: &ProjectTemplate,
+    deps: &DependencySource,
+) -> Result<()> {
     if path.exists() {
         anyhow::bail!("Directory '{}' already exists", path.display());
     }
@@ -152,7 +234,8 @@ edition = "2021"
 description = "{template_desc}"
 
 [dependencies]
-krab_core = {{ version = "0.1.0", features = ["{extra_features}"] }}
+{krab_core_dep}
+{krab_macros_dep}
 tokio = {{ version = "1.0", features = ["full"] }}
 {axum_dep}serde = {{ version = "1.0", features = ["derive"] }}
 serde_json = "1.0"
@@ -161,7 +244,16 @@ tracing-subscriber = {{ version = "0.3", features = ["json", "env-filter"] }}
 {extra_deps}
 "#,
         template_desc = metadata.description,
-        extra_features = metadata.extra_features,
+        krab_core_dep = deps.render(
+            "krab_core",
+            "crates/framework/krab_core",
+            metadata.extra_features
+        ),
+        // `view!`, `#[island]`, and `#[server]` are the framework's headline
+        // features and live in `krab_macros`. It was absent from every
+        // generated manifest, so a scaffolded project could not use any of
+        // them without the user working out the dependency themselves.
+        krab_macros_dep = deps.render("krab_macros", "crates/framework/krab_macros", &[]),
         axum_dep = metadata.axum_dep,
         extra_deps = metadata.extra_deps
     );
@@ -228,13 +320,35 @@ KRAB_SECRETS_SOURCE=env
 ///
 /// The generator writes a minimal but release-aware project skeleton including source layout,
 /// environment template, CI workflow, deployment manifest, Dockerfile, and README.
-pub(super) fn generate_project_from_template(name: &str, template: &ProjectTemplate) -> Result<()> {
+///
+/// `path_deps` points the generated manifest at a local checkout of this
+/// repository instead of crates.io. It exists so the `generated-project` CI
+/// gate can build scaffolded output against the working tree.
+pub(super) fn generate_project_from_template(
+    name: &str,
+    template: &ProjectTemplate,
+    path_deps: Option<&Path>,
+) -> Result<()> {
     println!(
         "🦀 Scaffolding new Krab project '{}' (template: {:?})...",
         name, template
     );
+
+    let deps = match path_deps {
+        // Canonicalise so the generated manifest holds an absolute path. A
+        // relative one would be interpreted relative to the *generated*
+        // project, not the working directory the user typed it in.
+        Some(root) => DependencySource::Path(root.canonicalize().map_err(|err| {
+            anyhow::anyhow!(
+                "--path-deps root '{}' is not readable: {err}",
+                root.display()
+            )
+        })?),
+        None => DependencySource::Registry,
+    };
+
     let path = PathBuf::from(name);
-    write_project_from_template(&path, name, template)
+    write_project_from_template(&path, name, template, &deps)
 }
 
 /// Generate the default minimal service entrypoint used by `krab new`.
@@ -247,6 +361,22 @@ use krab_core::telemetry::init_tracing;
 use serde_json::json;
 use std::net::SocketAddr;
 
+// Named handlers rather than inline closures: the closure form put the whole
+// route on one line, whose width depends on the project name, so `cargo fmt
+// --check` failed for any name long enough to push it past 100 columns. The
+// generated project runs that exact check in its own CI.
+async fn index() -> Json<serde_json::Value> {{
+    Json(json!({{ "service": "{name}", "status": "ok" }}))
+}}
+
+async fn health() -> Json<serde_json::Value> {{
+    Json(json!({{ "status": "ok" }}))
+}}
+
+async fn ready() -> Json<serde_json::Value> {{
+    Json(json!({{ "status": "ready" }}))
+}}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {{
     init_tracing("{name}");
@@ -255,9 +385,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {{
     let addr: SocketAddr = format!("{{}}:{{}}", cfg.host, cfg.port).parse()?;
 
     let app = Router::new()
-        .route("/", get(|| async {{ Json(json!({{ "service": "{name}", "status": "ok" }})) }}))
-        .route("/health", get(|| async {{ Json(json!({{ "status": "ok" }})) }}))
-        .route("/ready", get(|| async {{ Json(json!({{ "status": "ready" }})) }}));
+        .route("/", get(index))
+        .route("/health", get(health))
+        .route("/ready", get(ready));
 
     tracing::info!(service = "{name}", %addr, "listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -331,11 +461,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {{
 
 fn generate_edge_ssr_main(name: &str) -> String {
     format!(
-        r###"use axum::response::Html;
+        r###"use axum::extract::State;
+use axum::response::Html;
 use axum::routing::get;
-use axum::{{Router, Json}};
+use axum::{{Json, Router}};
 use krab_core::config::KrabConfig;
-use krab_core::isr::IsrCache;
+use krab_core::isr::{{IsrCache, IsrPolicy}};
 use krab_core::render_policy::{{CacheMode, EdgeCapability, RenderMode, RouteRenderPolicy}};
 use krab_core::telemetry::init_tracing;
 use serde_json::json;
@@ -359,9 +490,33 @@ fn home_render_policy() -> RouteRenderPolicy {{
     .with_streaming(true)
 }}
 
-async fn home_handler() -> Html<String> {{
+const HOME_REVALIDATE: Duration = Duration::from_secs(30);
+
+/// Serve `/` through the ISR cache: fresh entries are returned as-is, stale
+/// entries are returned immediately and re-rendered behind the response, and a
+/// miss renders and populates.
+async fn home_handler(State(state): State<AppState>) -> Html<String> {{
+    if let Some((cached, stale)) = state.isr_cache.serve("/") {{
+        if !stale {{
+            return Html(cached);
+        }}
+        // Stale-while-revalidate: answer from cache, refresh for the next hit.
+        state
+            .isr_cache
+            .put("/", render_home(), IsrPolicy::revalidate(HOME_REVALIDATE));
+        return Html(cached);
+    }}
+
+    let html = render_home();
+    state
+        .isr_cache
+        .put("/", html.clone(), IsrPolicy::revalidate(HOME_REVALIDATE));
+    Html(html)
+}}
+
+fn render_home() -> String {{
     let policy = home_render_policy();
-    Html(format!(
+    format!(
         r##"<!DOCTYPE html>
 <html>
 <head>
@@ -376,7 +531,7 @@ async fn home_handler() -> Html<String> {{
 </body>
 </html>"##,
         policy.route_pattern
-    ))
+    )
 }}
 
 async fn health_handler() -> Json<serde_json::Value> {{
@@ -423,7 +578,7 @@ fn generate_event_stream_main(name: &str) -> String {
 use axum::response::{{sse, Sse}};
 use axum::routing::get;
 use axum::{{Json, Router}};
-use futures_util::{{SinkExt, StreamExt}};
+use futures_util::StreamExt;
 use krab_core::config::KrabConfig;
 use krab_core::telemetry::init_tracing;
 use serde_json::json;
@@ -448,15 +603,19 @@ async fn dashboard_handler() -> Json<serde_json::Value> {{
     }}))
 }}
 
+fn unix_millis() -> u128 {{
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}}
+
 async fn events_sse() -> Sse<impl futures_util::Stream<Item = Result<sse::Event, Infallible>>> {{
-    let stream = IntervalStream::new(tokio::time::interval(Duration::from_secs(1)))
-        .map(|_| {{
-            let data = json!({{ "ts": std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(), "event": "tick" }});
-            Ok(sse::Event::default().data(data.to_string()))
-        }});
+    let ticks = IntervalStream::new(tokio::time::interval(Duration::from_secs(1)));
+    let stream = ticks.map(|_| {{
+        let data = json!({{ "ts": unix_millis(), "event": "tick" }});
+        Ok(sse::Event::default().data(data.to_string()))
+    }});
     Sse::new(stream)
 }}
 
@@ -692,7 +851,7 @@ hmr_signal_path = "dist/.hmr_signal"
 mod tests {
     use super::{
         generate_ci_workflow, generate_deploy_manifest, generate_edge_ssr_main,
-        write_project_from_template,
+        write_project_from_template, DependencySource, FRAMEWORK_VERSION,
     };
     use crate::ProjectTemplate;
     use anyhow::Result;
@@ -701,9 +860,17 @@ mod tests {
     use tempfile::TempDir;
 
     fn generate_fixture(name: &str, template: &ProjectTemplate) -> Result<(TempDir, PathBuf)> {
+        generate_fixture_with(name, template, &DependencySource::Registry)
+    }
+
+    fn generate_fixture_with(
+        name: &str,
+        template: &ProjectTemplate,
+        deps: &DependencySource,
+    ) -> Result<(TempDir, PathBuf)> {
         let temp_dir = TempDir::new()?;
         let project_dir = temp_dir.path().join(name);
-        write_project_from_template(&project_dir, name, template)?;
+        write_project_from_template(&project_dir, name, template, deps)?;
         Ok((temp_dir, project_dir))
     }
 
@@ -732,6 +899,180 @@ mod tests {
         let readme = fs::read_to_string(project_dir.join("README.md"))?;
         assert!(readme.contains("krab doctor --diagnostics"));
         assert!(readme.contains("krab release certify --out release-evidence"));
+        Ok(())
+    }
+
+    const ALL_TEMPLATES: [ProjectTemplate; 4] = [
+        ProjectTemplate::Default,
+        ProjectTemplate::Saas,
+        ProjectTemplate::EdgeSsr,
+        ProjectTemplate::EventStream,
+    ];
+
+    /// Feature names `krab_core` actually declares, read from its manifest.
+    ///
+    /// Read rather than hard-coded so renaming or splitting a `krab_core`
+    /// feature fails this test instead of silently shipping a template that
+    /// requests a feature which no longer exists.
+    fn krab_core_features() -> Vec<String> {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../framework/krab_core/Cargo.toml")
+            .canonicalize()
+            .expect("krab_core manifest not found");
+        let parsed: toml::Value =
+            toml::from_str(&fs::read_to_string(manifest).expect("krab_core manifest unreadable"))
+                .expect("krab_core manifest is not valid TOML");
+
+        parsed
+            .get("features")
+            .and_then(|f| f.as_table())
+            .expect("krab_core declares no [features]")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn generated_dependencies(project_dir: &Path) -> toml::value::Table {
+        let raw = fs::read_to_string(project_dir.join("Cargo.toml"))
+            .expect("generated Cargo.toml unreadable");
+        let parsed: toml::Value = toml::from_str(&raw)
+            .unwrap_or_else(|e| panic!("generated Cargo.toml is not valid TOML: {e}\n{raw}"));
+        parsed
+            .get("dependencies")
+            .and_then(|d| d.as_table())
+            .expect("generated Cargo.toml has no [dependencies]")
+            .clone()
+    }
+
+    /// The `saas` template used to emit `features = ["db, rest"]` — a single
+    /// feature named `db, rest`, which does not exist. Cargo rejected it, so
+    /// every `krab new --template saas` produced a project that could not
+    /// resolve. Substring assertions did not catch it; parsing does.
+    #[test]
+    fn every_template_requests_only_real_krab_core_features() -> Result<()> {
+        let declared = krab_core_features();
+
+        for template in ALL_TEMPLATES {
+            let (_temp, project_dir) = generate_fixture("demo-features", &template)?;
+            let deps = generated_dependencies(&project_dir);
+
+            let requested = deps
+                .get("krab_core")
+                .and_then(|d| d.get("features"))
+                .and_then(|f| f.as_array())
+                .unwrap_or_else(|| panic!("{template:?}: krab_core features is not an array"));
+
+            assert!(
+                !requested.is_empty(),
+                "{template:?}: krab_core has no features; it has no default features either"
+            );
+
+            for feature in requested {
+                let name = feature
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{template:?}: non-string feature {feature:?}"));
+                assert!(
+                    declared.iter().any(|d| d == name),
+                    "{template:?}: requests krab_core feature {name:?}, which krab_core does \
+                     not declare. Declared: {declared:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The template pinned a hard-coded `"0.1.0"` while the workspace moved to
+    /// `0.1.1`, so generated projects requested a version that did not exist.
+    #[test]
+    fn every_template_pins_the_current_framework_version() -> Result<()> {
+        for template in ALL_TEMPLATES {
+            let (_temp, project_dir) = generate_fixture("demo-version", &template)?;
+            let deps = generated_dependencies(&project_dir);
+
+            for crate_name in ["krab_core", "krab_macros"] {
+                let version = deps
+                    .get(crate_name)
+                    .unwrap_or_else(|| panic!("{template:?}: {crate_name} is not a dependency"))
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_else(|| panic!("{template:?}: {crate_name} has no version"));
+
+                assert_eq!(
+                    version, FRAMEWORK_VERSION,
+                    "{template:?}: {crate_name} pinned to {version}, expected {FRAMEWORK_VERSION}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// `--path-deps` is what lets the `generated-project` CI gate build
+    /// scaffolded output before the version is on crates.io.
+    #[test]
+    fn path_deps_emit_local_paths_and_no_version() -> Result<()> {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .canonicalize()?;
+        let (_temp, project_dir) = generate_fixture_with(
+            "demo-path-deps",
+            &ProjectTemplate::Default,
+            &DependencySource::Path(repo_root),
+        )?;
+        let deps = generated_dependencies(&project_dir);
+
+        for (crate_name, expected_suffix) in [
+            ("krab_core", "crates/framework/krab_core"),
+            ("krab_macros", "crates/framework/krab_macros"),
+        ] {
+            let entry = deps
+                .get(crate_name)
+                .unwrap_or_else(|| panic!("{crate_name} is not a dependency"));
+
+            let path = entry
+                .get("path")
+                .and_then(|p| p.as_str())
+                .unwrap_or_else(|| panic!("{crate_name} has no path"));
+
+            assert!(
+                path.ends_with(expected_suffix),
+                "{crate_name} path {path:?} does not end with {expected_suffix:?}"
+            );
+            // Backslashes are an invalid escape inside a TOML basic string, so
+            // a Windows-rendered path would make the manifest unparseable.
+            assert!(
+                !path.contains('\\'),
+                "{crate_name} path {path:?} contains a backslash"
+            );
+            // `\\?\C:\...` normalises to `//?/C:/...`, which passes both checks
+            // above and still makes Cargo fail with `invalid path url`.
+            assert!(
+                !path.starts_with("//?/"),
+                "{crate_name} path {path:?} kept the Windows verbatim prefix"
+            );
+            assert!(
+                entry.get("version").is_none(),
+                "{crate_name} must not carry a version when using --path-deps; the local \
+                 checkout is the point"
+            );
+            assert!(
+                Path::new(path).join("Cargo.toml").is_file(),
+                "{crate_name} path {path:?} does not point at a crate"
+            );
+        }
+
+        // The assertions above are all satisfiable by a manifest Cargo still
+        // refuses — `//?/C:/...` passed every one of them. Only Cargo's own
+        // parser settles it.
+        let output = std::process::Command::new(env!("CARGO"))
+            .args(["metadata", "--format-version", "1", "--no-deps"])
+            .current_dir(&project_dir)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "cargo cannot parse the generated manifest:\n{}\n---\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            fs::read_to_string(project_dir.join("Cargo.toml"))?
+        );
         Ok(())
     }
 
@@ -806,9 +1147,19 @@ mod tests {
         assert!(main_rs.contains("RouteRenderPolicy"));
         assert!(main_rs.contains("Render policy skeleton"));
 
+        // The ISR cache was held in `AppState` and never read, which failed the
+        // `-D warnings` clippy the generated CI runs. It is now wired into the
+        // `/` handler, so the starter-scope note must not still disclaim it.
+        assert!(main_rs.contains("isr_cache.serve("));
+        assert!(main_rs.contains("IsrPolicy::revalidate"));
+
         let readme = fs::read_to_string(project_dir.join("README.md"))?;
         assert!(readme.contains("Edge SSR policy skeleton"));
-        assert!(readme.contains("does not ship full ISR cache serving or streamed SSR output"));
+        assert!(readme.contains("stale-while-revalidate ISR serving"));
+        assert!(
+            !readme.contains("does not ship full ISR cache serving"),
+            "starter-scope note still disclaims ISR serving that the template now does"
+        );
         Ok(())
     }
 

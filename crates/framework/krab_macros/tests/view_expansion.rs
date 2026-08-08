@@ -111,3 +111,102 @@ fn void_elements_do_not_double_close() {
         );
     }
 }
+
+// ── Hyphenated, namespaced, and keyword names ───────────────────────────────
+//
+// Tag and attribute names were parsed as `syn::Ident`, which cannot contain
+// `-` or `:` and rejects Rust keywords. That made `data-*`, `aria-*`,
+// `xlink:*`, custom elements, `<input type=...>`, and `<label for=...>` all
+// unrepresentable — so the reference frontend hand-wrote HTML strings for the
+// island markup the macro could not produce.
+
+#[test]
+fn data_attributes_render() {
+    let html = view! { <div data-testid="row"></div> }.render();
+    assert_eq!(html, "<div data-testid=\"row\"></div>");
+}
+
+#[test]
+fn aria_attributes_render() {
+    let html = view! { <button aria-label="Close" aria-hidden="false"></button> }.render();
+    assert_eq!(
+        html,
+        "<button aria-label=\"Close\" aria-hidden=\"false\"></button>"
+    );
+}
+
+#[test]
+fn multi_segment_attribute_names_render() {
+    let html = view! { <div data-krab-boundary-id="root-0"></div> }.render();
+    assert_eq!(html, "<div data-krab-boundary-id=\"root-0\"></div>");
+}
+
+#[test]
+fn namespaced_attributes_render() {
+    // `<use>` is an SVG element, not one of HTML's void elements, so the
+    // renderer emits a closing tag for it even when the source self-closes.
+    // What matters here is the `xlink:href` name surviving the parser.
+    let html = view! { <use xlink:href="#icon"/> }.render();
+    assert_eq!(html, "<use xlink:href=\"#icon\"></use>");
+}
+
+#[test]
+fn custom_element_tags_render_and_match_closing_tag() {
+    let html = view! { <my-widget class="a">"hi"</my-widget> }.render();
+    assert_eq!(html, "<my-widget class=\"a\">hi</my-widget>");
+}
+
+#[test]
+fn rust_keywords_are_valid_attribute_names() {
+    // `type`, `for`, and `as` are Rust keywords; `syn::Ident`'s default parser
+    // rejects them, so `<input type="text">` did not compile.
+    let html = view! { <input type="text"/> }.render();
+    assert_eq!(html, "<input type=\"text\"/>");
+
+    let html = view! { <label for="email">"Email"</label> }.render();
+    assert_eq!(html, "<label for=\"email\">Email</label>");
+}
+
+#[test]
+fn numeric_name_segments_render() {
+    let html = view! { <div data-col-2="x"></div> }.render();
+    assert_eq!(html, "<div data-col-2=\"x\"></div>");
+}
+
+#[test]
+fn hyphenated_names_accept_expression_values() {
+    let boundary = "island-7";
+    let html = view! { <div data-krab-boundary-id={boundary}></div> }.render();
+    assert_eq!(html, "<div data-krab-boundary-id=\"island-7\"></div>");
+}
+
+/// The concrete gap from the audit: `#[island]` constructs the hydration
+/// wrapper by building `krab_core::Attribute` values by hand because `view!`
+/// could not express any of these names. It can now.
+#[test]
+fn view_can_emit_a_complete_island_wrapper() {
+    let props = r#"{"count":0}"#;
+    let html = view! {
+        <div
+            data-island="Counter"
+            data-props={props}
+            data-krab-boundary="Counter"
+            data-krab-boundary-id="Counter-0"
+            data-krab-boundary-state="ssr"
+        >
+            <span>"0"</span>
+        </div>
+    }
+    .render();
+
+    for marker in [
+        "data-island=\"Counter\"",
+        "data-krab-boundary=\"Counter\"",
+        "data-krab-boundary-id=\"Counter-0\"",
+        "data-krab-boundary-state=\"ssr\"",
+    ] {
+        assert!(html.contains(marker), "missing {marker} in {html}");
+    }
+    // Serialized props are HTML-escaped, as any attribute value is.
+    assert!(html.contains("data-props="), "missing props in {html}");
+}

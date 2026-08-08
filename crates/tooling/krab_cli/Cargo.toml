@@ -10,13 +10,22 @@ description = "The `krab` CLI: dev workflow, generators, governance, and release
 keywords = ["krab", "cli", "web", "framework", "codegen"]
 categories = ["command-line-utilities", "development-tools", "web-programming"]
 
+# The package is `krab_cli` because the crates.io name `krab` was taken in 2023
+# by an unrelated crate. The *binary* is `krab`, which is how every document in
+# the repository invokes it (`krab doctor`, `krab new`, `krab release certify`)
+# and what `cargo install krab_cli` puts on PATH. Without this section the
+# binary would inherit the package name and none of those commands would work.
+[[bin]]
+name = "krab"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4.4", features = ["derive"] }
 anyhow.workspace = true
 serde_json.workspace = true
 serde = { workspace = true, features = ["derive"] }
 toml = "0.8"
-krab_core = { path = "../../framework/krab_core" }
+krab_core = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

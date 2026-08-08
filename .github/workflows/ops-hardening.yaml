@@ -38,6 +38,12 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # Cheap and fails fast: keeps every crate under crates/framework,
+      # crates/tooling, or services. See
+      # internal/plans/09_workspace_structure_standard.md §6 Phase C.
+      - name: Workspace layout check
+        run: python3 scripts/check_workspace_layout.py
+
       - name: Cargo fmt check
         run: cargo fmt --all -- --check
 
@@ -58,6 +64,16 @@ jobs:
       - name: krab_core tests (all features)
         run: cargo test -p krab_core --all-features
 
+      # Each driver feature compiled on its own. `--all-features` above enables
+      # both at once, which hides a driver that only builds because the other
+      # one pulled something in. SQLite support previously lived in
+      # service_users, so the framework-level SQLite path was never compiled.
+      - name: krab_core tests (db-postgres only)
+        run: cargo test -p krab_core --features db-postgres
+
+      - name: krab_core tests (db-sqlite only)
+        run: cargo test -p krab_core --features db-sqlite
+
       - name: Rustdoc build check
         env:
           RUSTDOCFLAGS: -D warnings
@@ -71,6 +87,32 @@ jobs:
 
       - name: Verify alert routing + on-call delivery path
         run: python3 scripts/verify_oncall_delivery_path.py
+
+  # Krab is consumed from crates.io. A path-only inter-crate dependency compiles
+  # fine in the workspace and makes the crate unpublishable — the failure is
+  # invisible until release day. This job catches it on every push.
+  #
+  # `--workspace` rather than six per-crate runs: sibling crates are not on
+  # crates.io yet, so a per-crate `--dry-run` fails with "no matching package
+  # named `krab_core`". The workspace form resolves siblings against the locally
+  # packaged versions and verifies all six together, in dependency order.
+  publish-dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish dry run (all publishable crates)
+        run: cargo publish --workspace --dry-run
+
+      # `cargo install` is how users actually get the CLI, and it resolves the
+      # binary name from `[[bin]]`. Every document invokes it as `krab`.
+      - name: CLI installs as `krab`
+        run: |
+          cargo install --path crates/tooling/krab_cli --force
+          krab --version
 
   migration-contract-e2e-gates:
     runs-on: ubuntu-latest

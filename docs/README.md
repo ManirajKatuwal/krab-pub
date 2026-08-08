@@ -61,6 +61,10 @@ immutable once accepted — supersede rather than edit.
 | [0001](adr/0001-hydration-markers.md) | Hydration markers |
 | [0002](adr/0002-render-policy.md) | Render policy |
 | [0003](adr/0003-server-functions-public-endpoints.md) | Server functions as public endpoints |
+| [0004](adr/0004-protocol-selection-by-explicit-endpoint.md) | Protocol selection by explicit endpoint |
+| [0005](adr/0005-krab-server-disposition.md) | Disposition of `krab_server` — **Proposed** |
+| [0006](adr/0006-view-component-composition.md) | `view!` has no component composition |
+| [0007](adr/0007-grpc-feature-disposition.md) | The `grpc` feature is renamed, not implemented — **Proposed** |
 
 ## Planning
 

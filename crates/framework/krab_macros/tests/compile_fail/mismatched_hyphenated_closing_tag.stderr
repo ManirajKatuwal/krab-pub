@@ -1,0 +1,5 @@
+error: Mismatched closing tag: expected </my-widget>, found </my-panel>
+ --> tests/compile_fail/mismatched_hyphenated_closing_tag.rs:7:37
+  |
+7 |     let _ = view! { <my-widget>"x"</my-panel> }.render();
+  |                                     ^^

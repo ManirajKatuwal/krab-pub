@@ -92,9 +92,13 @@ wasm-pack build krab_client --release --target web
 
 | Gate | Workflow | Required |
 |---|---|---|
+| Workspace layout + inter-crate version pinning | `ops-hardening` (`scripts/check_workspace_layout.py`) | Yes |
 | Formatting / Linting / Tests | `ops-hardening` | Yes |
 | Dependency governance | `ops-hardening` (`cargo-deny`) | Yes |
+| Crates publishable + CLI installs as `krab` | `ops-hardening` (`publish-dry-run`) | Yes |
+| `krab new` output builds, tests, lints, formats | `generated-project` (all four templates) | Yes |
 | API contract checks | `api-contract` | Yes |
+| Protocol parity & protocol matrix | `api-contract` (`krab contract protocol-check`) | Yes |
 | DB lifecycle checks | `db-lifecycle` | Yes |
 | E2E depth checks | `e2e-depth` | Yes |
 | NFT suite | `nft` | When triggered by workflow/label policy |

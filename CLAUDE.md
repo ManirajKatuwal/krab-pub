@@ -149,7 +149,8 @@ cargo test -p krab_core --all-features
 cargo test -p krab_macros            # trybuild compile-fail suite
 ```
 
-Features: `rest`, `graphql`, `grpc`, `db`, `redis-store`, `web` (wasm).
+Features: `rest`, `graphql`, `grpc`, `db-postgres`, `db-sqlite`, `redis-store`,
+`web` (wasm). `db` is a deprecated alias for `db-postgres`.
 
 ### WASM client
 
@@ -198,7 +199,8 @@ violations.
 
 | Workflow | Enforces |
 |---|---|
-| [ops-hardening.yaml](.github/workflows/ops-hardening.yaml) | fmt, clippy `-D warnings`, rustdoc, `cargo-deny`, on-call delivery path, release certify |
+| [ops-hardening.yaml](.github/workflows/ops-hardening.yaml) | workspace layout, inter-crate version pinning, fmt, clippy `-D warnings`, rustdoc, `cargo-deny`, on-call delivery path, publish dry-run, release certify |
+| [generated-project.yaml](.github/workflows/generated-project.yaml) | `krab new` output builds, tests, clippy `-D warnings`, `fmt --check` — all four templates |
 | [dependency-security.yaml](.github/workflows/dependency-security.yaml) | `cargo-audit`, SBOM |
 | [api-contract.yaml](.github/workflows/api-contract.yaml) | contract check, protocol parity, protocol matrix |
 | [db-lifecycle.yaml](.github/workflows/db-lifecycle.yaml) | migration lifecycle, rollback sim, drift, rehearsal evidence |
@@ -228,11 +230,21 @@ violations.
   gate uses before claiming a test passes.
 - **Two database drivers.** `KRAB_DB_DRIVER=postgres` (default, full migration
   governance) or `sqlite`. MySQL was removed deliberately (pulled in `rsa`) —
-  do not reintroduce it.
+  do not reintroduce it. Driver selection (`DbDriver`, `resolve_db_driver`)
+  lives in `krab_core::db`; the Cargo features are `db-postgres` and
+  `db-sqlite`, with `db` a deprecated alias for `db-postgres`. Compiling a
+  driver in and selecting one at runtime are separate — enable both features
+  and choose per environment if you need to.
 - **Forwarded headers are untrusted by default** (`KRAB_TRUST_PROXY_HEADERS=false`).
-- **`benchmarks/` mixes tracked inputs with ignored results.** `thresholds.json`,
-  `benchmark_config.json`, and `trend_history.csv` are tracked; `latest_summary*`,
-  `*_replica_results.json`, and the evidence bundle are not.
+- **`benchmarks/` mixes tracked inputs with ignored results**, and not every
+  result is ignored. Tracked: `thresholds.json`, `benchmark_config.json`,
+  `trend_history.csv`, and — deliberately — the committed result snapshots
+  `external_results.json`, `external_summary.md`, and
+  `targeted_hardening_results.json`. Ignored: `latest_summary*`,
+  `*_replica_results.json`, `shared_state_validation.json`, and the evidence
+  bundle. [`benchmarks/README.md`](benchmarks/README.md) holds the authoritative
+  table — check it before adding an artifact, and add a matching `.gitignore`
+  rule in the same change if the new artifact is meant to be generated.
 - **`target/` and `dist/` are build output.** Never edit; never commit.
 - **`.env` is local and untracked.** Copy from [.env.example](.env.example).
 

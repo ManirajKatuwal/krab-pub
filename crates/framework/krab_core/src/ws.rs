@@ -59,7 +59,7 @@ impl WsMessage {
     }
 
     /// Create a JSON message from a serializable value.
-    #[cfg(any(feature = "rest", feature = "db"))]
+    #[cfg(any(feature = "rest", feature = "db-postgres", feature = "db-sqlite"))]
     pub fn json_value(value: &serde_json::Value) -> Self {
         Self::Text(serde_json::to_string(value).unwrap_or_default())
     }

@@ -51,6 +51,29 @@ clippy_workspace   cargo clippy --workspace --all-targets -- -D warnings
 test_workspace     cargo test --workspace
 doc_workspace      cargo doc --workspace --no-deps
 dependency_gate    cargo run -p krab_cli -- security dependency-gate --diagnostics
+layout_check       python3 scripts/check_workspace_layout.py
+```
+
+**Run the gates in the order listed — Core, then Feature, then the rest.**
+Cargo keys build artifacts on the resolved feature union, so alternating
+between `--workspace` (default features) and `-p krab_core --all-features`
+rebuilds the dependency graph *each time you switch*. On 2026-08-08 that turned
+a `test_workspace` run into 8741s of which only 267s was actually running
+tests; `clippy_workspace` immediately afterwards reused the same cache and took
+43s. Group same-feature-set gates together and the whole bundle costs a
+fraction of that.
+
+### Prerequisites when running in a container
+
+`rust:latest` ships **without** `rustfmt`, `clippy`, or `cargo-deny`. Omit these
+and `fmt_check`, `clippy_workspace`, `dependency_gate`, and every
+`release check` / `release certify` step that shells out to them report
+**failure for a missing binary, not a real violation** — a false red that is
+easy to log as genuine:
+
+```
+rustup component add rustfmt clippy
+cargo install cargo-deny --locked      # ops-hardening.yaml does the same
 ```
 
 ### Feature

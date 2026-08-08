@@ -50,11 +50,19 @@ By default (`KRAB_PROTOCOL_ALLOW_RUNTIME_SWITCH_HEADER=false`), runtime switchin
 
 ## 4. Resolution priority
 
-Typical order:
+Order:
 
-1. Explicit route family policy (`/api/v1/graphql`, `/api/v1/rpc`, etc.)
-2. Runtime client hint (only when enabled)
-3. Service default protocol
+1. **Allowed set** — enabled protocols, narrowed by `restricted_operations`
+   for the operation, then by `tenant_overrides` for the request tenant
+2. Explicit route family (`/api/v1/users*` → REST, `/api/v1/graphql*` →
+   GraphQL, `/api/v1/rpc*` → RPC). A route whose protocol is outside the
+   allowed set is **rejected**, not downgraded to another protocol
+3. Runtime client hint (only when enabled, and only for paths with no
+   route-family match)
+4. Service default protocol
+
+The normative statement of this order, and the reasoning behind keeping step 3
+off by default, is [ADR 0004](../adr/0004-protocol-selection-by-explicit-endpoint.md).
 
 Frontend downstream calls resolve protocol from discovered capabilities and operation allowances, with fallback to alternative allowed protocols when the primary call fails.
 

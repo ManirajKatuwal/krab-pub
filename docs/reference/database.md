@@ -19,10 +19,31 @@ Krab's database layer is centralized in `krab_core::db` and provides:
 
 ## Supported Drivers
 
-| Driver | `KRAB_DB_DRIVER` | Default URL | Features |
-|---|---|---|---|
-| **PostgreSQL** | `postgres` | `postgres://postgres@localhost:5432/krab_users` | Full governance (migrations, drift, promotion, rollback) |
-| **SQLite** | `sqlite` | `sqlite://krab_users.sqlite?mode=rwc` | Schema bootstrap, lightweight dev/testing |
+| Driver | `KRAB_DB_DRIVER` | Cargo feature | Default URL | Governance |
+|---|---|---|---|---|
+| **PostgreSQL** | `postgres` | `db-postgres` | `postgres://postgres@localhost:5432/krab_users` | Full — migrations, drift, promotion, rollback |
+| **SQLite** | `sqlite` | `db-sqlite` | `sqlite://krab.sqlite?mode=rwc` | None — driver only |
+
+Compiling a driver in and selecting one at runtime are separate steps. Enable
+whichever features you need, then pick between them with `KRAB_DB_DRIVER`:
+
+```toml
+# Postgres only — the usual production choice
+krab_core = { version = "0.1.1", features = ["db-postgres"] }
+
+# Both, selected per environment
+krab_core = { version = "0.1.1", features = ["db-postgres", "db-sqlite"] }
+```
+
+> **`db` is a deprecated alias for `db-postgres`.** It is kept for one minor
+> version per the breaking-change policy in
+> [`RELEASE_POLICY.md`](../../RELEASE_POLICY.md) and will be removed no earlier
+> than `0.2.0`. Use the explicit driver feature.
+>
+> Before this split, `krab_core`'s `sqlx` dependency enabled `postgres`
+> unconditionally and nothing else. SQLite existed only inside
+> `services/service_users`, a reference application, so a framework consumer
+> could not select it however the documentation described `KRAB_DB_DRIVER`.
 
 ### Selecting a driver
 
@@ -31,8 +52,17 @@ Krab's database layer is centralized in `krab_core::db` and provides:
 KRAB_DB_DRIVER=postgres DATABASE_URL="postgres://user:pass@host:5432/dbname"
 
 # SQLite (development / testing / portable)
-KRAB_DB_DRIVER=sqlite DATABASE_URL="sqlite://krab_users.sqlite?mode=rwc"
+KRAB_DB_DRIVER=sqlite DATABASE_URL="sqlite://krab.sqlite?mode=rwc"
 ```
+
+`krab_core::db::resolve_db_driver()` reads the variable and returns a
+[`DbDriver`]. **An unset or blank value selects Postgres**, not SQLite — a
+service that quietly fell back to a local SQLite file because a variable was
+missing would lose migration governance without failing. Ask
+`DbDriver::supports_migration_governance()` rather than matching on the variant,
+so a driver added later does not silently inherit guarantees it cannot honour.
+
+[`DbDriver`]: https://docs.rs/krab_core/latest/krab_core/db/enum.DbDriver.html
 
 ---
 

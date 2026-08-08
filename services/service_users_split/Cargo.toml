@@ -21,7 +21,7 @@ tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
-krab_core = { path = "../../crates/framework/krab_core", features = ["graphql", "rest"] }
+krab_core = { workspace = true, features = ["graphql", "rest"] }
 
 [dev-dependencies]
 tower.workspace = true

@@ -4,36 +4,15 @@ use krab_core::repository::UserRepository;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DbDriver {
-    Postgres,
-    Sqlite,
-}
-
-impl DbDriver {
-    pub(crate) fn parse(input: &str) -> Result<Self> {
-        match input.trim().to_ascii_lowercase().as_str() {
-            "postgres" => Ok(Self::Postgres),
-            "sqlite" => Ok(Self::Sqlite),
-            other => anyhow::bail!(
-                "unsupported KRAB_DB_DRIVER='{}'; supported values are postgres|sqlite",
-                other
-            ),
-        }
-    }
-}
-
-pub(crate) fn resolve_db_driver() -> Result<DbDriver> {
-    let raw = std::env::var("KRAB_DB_DRIVER").unwrap_or_else(|_| "sqlite".to_string());
-    DbDriver::parse(&raw)
-}
-
-pub(crate) fn default_db_url_for_driver(driver: DbDriver) -> &'static str {
-    match driver {
-        DbDriver::Postgres => "postgres://postgres@localhost:5432/krab_users",
-        DbDriver::Sqlite => "sqlite://krab_users.sqlite?mode=rwc",
-    }
-}
+// Driver selection is framework surface, not application code. `DbDriver`,
+// `resolve_db_driver`, and `default_db_url_for_driver` were defined here — in a
+// reference service — so `KRAB_DB_DRIVER` was advertised as a framework-level
+// choice that no framework consumer could actually make. They now live in
+// `krab_core::db`; these re-exports keep the call sites in this crate unchanged.
+//
+// What stays here is genuinely application-specific: the pool wrapper and the
+// repository implementations, which depend on this service's schema.
+pub(crate) use krab_core::db::{default_db_url_for_driver, resolve_db_driver, DbDriver};
 
 #[derive(Clone)]
 pub(crate) enum UsersDbPool {

@@ -24,6 +24,25 @@ keywords = ["web", "ssr", "islands", "wasm", "framework"]
 categories = ["web-programming", "wasm", "development-tools"]
 
 [workspace.dependencies]
+# Inter-crate dependencies carry BOTH `version` and `path`. Cargo uses `path`
+# for workspace builds and rewrites the dependency to `version` on publish; a
+# path-only dependency makes the crate unpublishable outright:
+#
+#     error: all dependencies must have a version requirement specified when
+#            publishing. dependency `krab_core` does not specify a version
+#
+# Keep this version in step with `[workspace.package] version` above — Cargo
+# does not allow `version.workspace = true` inside `[workspace.dependencies]`,
+# so it is duplicated deliberately and checked by `scripts/check_workspace_layout.py`.
+#
+# NOTE: these entries are for *normal* dependencies only. `krab_core` and
+# `krab_macros` dev-depend on each other; see the comments at those two sites
+# for why those must stay path-only.
+krab_core = { version = "0.1.1", path = "crates/framework/krab_core" }
+krab_macros = { version = "0.1.1", path = "crates/framework/krab_macros" }
+krab_client = { version = "0.1.1", path = "crates/framework/krab_client" }
+krab_server = { version = "0.1.1", path = "crates/framework/krab_server" }
+
 axum = "=0.8.8"
 async-graphql = "=7.2.1"
 async-graphql-axum = "=7.2.1"
@@ -38,11 +57,25 @@ tower = "0.5"
 tower-http = "0.6"
 http-body-util = "0.1"
 
+# Server binaries are long-lived processes: throughput matters, binary size does
+# not. `opt-level = "z"` previously applied workspace-wide, which cost server
+# throughput to shrink artifacts nobody ships over a network.
+#
+# Note: `panic = "abort"` is deliberately NOT set. Tower/Axum isolate a
+# panicking request to its own connection; under `abort` a single bad request
+# terminates the process and every in-flight request with it. On
+# wasm32-unknown-unknown abort is already the default and needs no setting.
 [profile.release]
 lto = true
-opt-level = "z"
+opt-level = 3
 strip = true
 codegen-units = 1
+
+# The browser bundle IS size-critical and is gated at 500 KB raw / 150 KB gzip
+# by .github/workflows/wasm-size.yaml, so the client keeps size optimisation.
+# `wasm-opt -Oz` in the release pipeline does the rest.
+[profile.release.package.krab_client]
+opt-level = "z"
 
 [profile.dev]
 debug = true

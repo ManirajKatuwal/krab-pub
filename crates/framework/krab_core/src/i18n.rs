@@ -77,7 +77,7 @@ impl TranslationBundle {
     }
 
     /// Add translations from a JSON string: `{ "key": "value", ... }`.
-    #[cfg(any(feature = "rest", feature = "db"))]
+    #[cfg(any(feature = "rest", feature = "db-postgres", feature = "db-sqlite"))]
     pub fn add_locale_json(&mut self, locale: Locale, json: &str) -> Result<(), String> {
         let map: HashMap<String, String> =
             serde_json::from_str(json).map_err(|e| format!("Invalid i18n JSON: {}", e))?;
@@ -355,7 +355,7 @@ mod tests {
         assert_eq!(strip_locale_prefix("/about", "en"), "/about");
     }
 
-    #[cfg(any(feature = "rest", feature = "db"))]
+    #[cfg(any(feature = "rest", feature = "db-postgres", feature = "db-sqlite"))]
     #[test]
     fn bundle_json_loading() {
         let mut bundle = TranslationBundle::new();

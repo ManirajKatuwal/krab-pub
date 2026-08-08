@@ -1,0 +1,8 @@
+error: `view!` has no component composition, so <MyComponent> would be emitted as a literal HTML tag named 'MyComponent'.
+         Call the function and interpolate its node instead:
+           view! { <div>{my_component(props)}</div> }
+         For an interactive component, annotate it with #[island].
+ --> tests/compile_fail/component_tag_unsupported.rs:7:22
+  |
+7 |     let _ = view! { <MyComponent/> }.render();
+  |                      ^^^^^^^^^^^
