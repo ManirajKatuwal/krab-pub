@@ -3,9 +3,13 @@ name = "krab_macros"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/krab_macros"
+description = "Procedural macros for the Krab framework: view!, #[island], and #[server]"
+keywords = ["krab", "macros", "proc-macro", "view", "islands"]
+categories = ["web-programming", "development-tools"]
 
 [lib]
 proc-macro = true

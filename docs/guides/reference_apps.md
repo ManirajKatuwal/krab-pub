@@ -2,7 +2,15 @@
 
 Krab maintains five official reference tracks. Each track maps to a starter or service topology and shows which framework capability it exercises.
 
-| Use case | Reference path | Start from | Exercises |
+> **These tracks are guides, not vendored applications.** Each directory under
+> `examples/reference_apps/` holds a walkthrough README — what to generate, what
+> to inspect, and where to extend. The application code is produced by the
+> `krab new` / `krab topology split` command in the "Generate with" column, so
+> it always matches the current templates. Nothing under
+> `examples/reference_apps/` is compiled or exercised by CI. The services that
+> *are* built and gated live in [`services/`](../../services/).
+
+| Use case | Track guide | Generate with | Exercises |
 | --- | --- | --- | --- |
 | Content site | `examples/reference_apps/content_site` | `krab new content-site --template default` | static routes, render policy, deployment basics |
 | SaaS dashboard | `examples/reference_apps/saas_dashboard` | `krab new saas-dashboard --template saas` | auth-ready HTTP layers, tenant API scaffolding, release checks |

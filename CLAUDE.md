@@ -177,8 +177,14 @@ violations.
 5. **Migrations need `rollback_sql`** unless explicitly irreversible and
    documented. `destructive: true` migrations always require it. See
    [docs/reference/database.md](docs/reference/database.md).
-6. **Zero dependency-advisory ignores.** [deny.toml](deny.toml) `ignore` is empty
-   and stays empty. Fix at the crate level; do not suppress.
+6. **Dependency advisories are fixed, not suppressed.** [deny.toml](deny.toml)
+   has no `ignore` list and stays that way — fix at the crate level, usually a
+   `cargo update -p <crate>`. There is exactly **one** standing exception, in
+   [.cargo/audit.toml](.cargo/audit.toml): `RUSTSEC-2023-0071` (`rsa`), reached
+   only through `sqlx-mysql`, which `sqlx-macros-core` depends on
+   unconditionally. Krab compiles Postgres and SQLite drivers only, so the code
+   path is unreachable, and there is no upstream fix. Adding a second entry to
+   either file requires an ADR.
 7. **Breaking API changes** require notes in [docs/reference/api.md](docs/reference/api.md)
    and a `CHANGELOG.md` entry, plus one minor version of deprecation warning.
 8. **Write output to the right place.** Generated artifacts go under `internal/`

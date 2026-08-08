@@ -170,6 +170,14 @@ Protected users endpoint.
 
 Returns users service capability metadata for protocol-aware clients.
 
+### `POST /api/v1/rpc`
+
+RPC protocol surface for the users domain, mounted when `rpc` is in
+`KRAB_PROTOCOL_ENABLED`. Carries the same operations as the REST and GraphQL
+surfaces; the envelope is the shared RPC wire format. Internally the users
+service adapter mounts this at `/rpc`; `/api/v1/rpc` is the published path
+advertised by the capability endpoint.
+
 ## 5. Protocol capability discovery and selection
 
 Protocol-aware services expose capability endpoints to publish default protocol,
@@ -201,6 +209,21 @@ Base URL: `http://localhost:3000`
 | `GET` | `/data/dashboard` | Dashboard payload |
 | `GET` | `/asset-manifest.json` | Asset integrity manifest |
 | `POST` | `/api/contact` | Contact form submission endpoint |
+| `GET` | `/{locale}` | Locale-prefixed home page. See the i18n route family |
+| `GET` | `/robots.txt` | Crawler directives. Uses `KRAB_PUBLIC_BASE_URL` for the sitemap link |
+| `GET` | `/sitemap.xml` | Sitemap. URLs are absolute against `KRAB_PUBLIC_BASE_URL` |
+| `GET` | `/api/hmr` | Dev-only hot-module-reload channel |
+
+### WebSocket endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/ws/chat` | WebSocket upgrade for the chat stream |
+| `POST` | `/api/ws/publish` | Publish a message to connected `/api/ws/chat` subscribers |
+
+`/api/ws/chat` is an upgrade endpoint, not a JSON route — it does not return the
+standard error envelope. Connection failures surface as HTTP status codes on the
+upgrade handshake.
 
 Example `POST /api/contact` request:
 

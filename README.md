@@ -139,6 +139,14 @@ Krab supports pluggable database backends via the `KRAB_DB_DRIVER` environment v
 
 PostgreSQL includes enterprise features: versioned migrations with checksums, drift detection, promotion policy enforcement, and rollback rehearsal requirements.
 
+> **On the dependency graph.** MySQL was removed as a supported driver because it
+> pulled in `rsa`. `rsa` is still present in `Cargo.lock`: `sqlx-macros-core`
+> depends on `sqlx-mysql` unconditionally, so the crate is resolved even though
+> no MySQL driver is compiled into any Krab binary. `RUSTSEC-2023-0071` against
+> it is therefore unreachable and is the single documented exception in
+> [`.cargo/audit.toml`](.cargo/audit.toml). The two supported drivers above carry
+> no known advisories.
+
 ### Authentication and security
 
 - **JWT/OIDC** token issuance with key rotation (`KeyRing` with multiple `kid` support)

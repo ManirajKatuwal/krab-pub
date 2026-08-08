@@ -25,6 +25,9 @@ Covers work merged after `0.1.1` (2026-03-11) through commit `bac72c5`
   `http_error`, `http_headers`, `http_observability`, `http_protocol`,
   `http_runtime`, and `http_security`, alongside the existing `http`.
 - **GraphQL and gRPC protocol modules** in `krab_core` (`graphql.rs`, `grpc.rs`).
+  GraphQL is a full integration via `async-graphql`. The `grpc` feature provides
+  gRPC **status-code and metadata semantics** for protocol negotiation — it does
+  not bundle a transport.
 - **`service_contract` and `render_policy` modules** in `krab_core`.
 - **`krab_cli` restructured** into dedicated modules — `dev_workflow`, `doctor`,
   `generator`, `governance`, `project_model`, `project_template`, `release_ops`,
@@ -66,6 +69,17 @@ Covers work merged after `0.1.1` (2026-03-11) through commit `bac72c5`
   `.claude/skills/`.
 - **Documentation indexes**: `docs/README.md` (public documentation map) and
   `internal/README.md` (internal boundary and generated-artifact map).
+- **Per-crate `README.md` for all six publishable crates** — `krab_core`,
+  `krab_client`, `krab_macros`, `krab_server`, `krab_cli`, `krab_orchestrator`.
+- **crates.io publish metadata** on those crates: `description`, `keywords`,
+  `categories`, `documentation`, and `readme`. `krab_cli` and
+  `krab_orchestrator` previously carried no description at all, which blocks
+  publishing outright. The four reference services under `services/` are now
+  explicitly `publish = false`.
+- **WebSocket, RPC, and crawler endpoints documented** in
+  `docs/reference/api.md`: `POST /api/v1/rpc`, `GET /api/ws/chat`,
+  `POST /api/ws/publish`, `GET /{locale}`, `/robots.txt`, `/sitemap.xml`, and
+  `/api/hmr`.
 
 ### Changed
 
@@ -116,6 +130,16 @@ Covers work merged after `0.1.1` (2026-03-11) through commit `bac72c5`
 
 ### Fixed
 
+- **Workspace version corrected to `0.1.1`.** `[workspace.package]` still read
+  `0.1.0` even though `0.1.1` was recorded as released on 2026-03-11. All
+  workspace members now inherit it, including `krab_cli` and
+  `krab_orchestrator`, which had hardcoded `0.1.0`.
+- **512 broken relative links repaired** across `internal/` documentation (534 →
+  22), left dangling by the `crates/` and `services/` reorganisation. Every
+  rewrite was verified to resolve to an existing file. The 22 that remain are
+  intentional: 12 name a proposed `http/` submodule layout the implementation
+  did not adopt, and 10 name files deleted or renamed after the dated audit that
+  cites them. Both groups are annotated in place.
 - `krab db rehearsal` now creates the parent directory of its `--out` path
   before writing, instead of failing when the directory does not yet exist.
 - `scripts/__pycache__/*.pyc` removed from version control and `__pycache__/`
@@ -127,9 +151,25 @@ Covers work merged after `0.1.1` (2026-03-11) through commit `bac72c5`
 
 ### Security
 
+- **Five dependency advisories remediated** by lockfile update, restoring both
+  `cargo audit` and `cargo deny check` to green:
+
+  | Advisory | Crate | Resolution |
+  |---|---|---|
+  | RUSTSEC-2026-0185 | `quinn-proto` (via `reqwest`) | 0.11.14 → 0.11.16 — 7.5 High, remote memory exhaustion from unbounded out-of-order stream reassembly |
+  | RUSTSEC-2026-0205 | `scc` (via `serial_test`) | removed — `serial_test` 3.4.0 → 3.5.0 no longer depends on it |
+  | RUSTSEC-2026-0190 | `anyhow` | 1.0.102 → 1.0.104 — unsoundness in `Error::downcast_mut()` |
+  | RUSTSEC-2026-0221 | `event-listener` | 5.4.1 → 5.4.2 — `!Send` tags crossing thread boundaries via `StackSlot` |
+  | yanked | `spin` | 0.9.8 → 0.9.9 |
+
+  No source changes were required; no advisory was suppressed.
 - Runtime configuration hardening across services (`d54db0a`).
 - `docs/security.md` updated for the current threat model and secret-sourcing
   behaviour.
+- **`KRAB_CSRF_ENABLED`, `KRAB_AUTH_COOKIE_SESSION_ENABLED`, and
+  `KRAB_AUTH_REQUIRE_TENANT_CLAIM` are now documented.** All three are
+  security-relevant, default to off, and were previously undocumented in both
+  `.env.example` and the environment reference.
 
 ### Governance
 
@@ -137,12 +177,36 @@ Covers work merged after `0.1.1` (2026-03-11) through commit `bac72c5`
   `krab release certify` and uploaded as a workflow artifact.
 - Provenance hashes (`Cargo.lock`, `.env.example`) recorded by
   `release-attestation.yaml`.
+- **Rule 6 in `CLAUDE.md` reconciled with reality.** It claimed zero
+  dependency-advisory ignores; `.cargo/audit.toml` has always carried one
+  (`RUSTSEC-2023-0071`, `rsa` reached only through `sqlx-mysql`, which
+  `sqlx-macros-core` depends on unconditionally). The exception is now stated
+  explicitly with its justification, and a second entry requires an ADR.
+- **Correction to the `[0.1.0]` entry below.** That release recorded "`rsa`
+  crate entirely removed from the dependency tree" and "`deny.toml` `ignore`
+  array emptied — zero advisory exceptions". The second is still true. The
+  first is not: `rsa 0.9.10` is present in `Cargo.lock` today, resolved through
+  `sqlx-macros-core` → `sqlx-mysql` regardless of which drivers are enabled.
+  Removing MySQL as a *supported driver* did not remove the crate from the
+  *resolution graph*. Released entries are not rewritten, so the correction is
+  recorded here.
+- **The `2026-06-04` pre-release GO sign-off is re-opened as NO-GO.** Its cited
+  certification bundle does not exist, advisories broke the gates after it was
+  recorded, and the tree has since been reorganised. See §6 of
+  `internal/reports/PRE_RELEASE_AUDIT_REPORT.md`.
 
-> **Verification status.** No verification run has been logged at `bac72c5`. The
-> most recent recorded evidence bundle predates these changes — see
+> **Verification status (2026-08-07).** Partial. `cargo fmt --all --check`,
+> `cargo audit`, and `cargo deny check advisories licenses bans sources` all
+> pass at HEAD — bundle:
+> [`internal/audit/evidence/2026-08-07_remediation/`](internal/audit/evidence/2026-08-07_remediation).
+>
+> Everything requiring a linker is **unrun**: `cargo test --workspace`, the
+> feature-gated `krab_core` suites, `cargo clippy --all-targets`, `cargo doc`,
+> and every `krab` governance command. The current machine has no MSVC C++
+> Build Tools, so proc-macro and binary targets cannot link. This is an
+> environment gap, not a code failure, but it means **this section is a record
+> of merged changes, not an attestation that all gates are green at HEAD.** See
 > [`internal/audit/VERIFICATION_EVIDENCE_LOG.md`](internal/audit/VERIFICATION_EVIDENCE_LOG.md) §7.
-> This section is a record of merged changes, not an attestation that gates are
-> green at HEAD.
 
 ---
 

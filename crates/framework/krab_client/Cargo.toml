@@ -3,9 +3,13 @@ name = "krab_client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/krab_client"
+description = "WASM island hydration runtime for the Krab framework"
+keywords = ["krab", "wasm", "hydration", "islands", "frontend"]
+categories = ["wasm", "web-programming"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]

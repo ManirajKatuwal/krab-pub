@@ -3,9 +3,13 @@ name = "krab_core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/krab_core"
+description = "Shared runtime for the Krab framework: config, HTTP, database, telemetry, resilience, signals, and protocol governance"
+keywords = ["krab", "web", "ssr", "runtime", "framework"]
+categories = ["web-programming", "web-programming::http-server", "development-tools"]
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }

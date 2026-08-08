@@ -1,8 +1,14 @@
 [package]
 name = "krab_cli"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+description = "The `krab` CLI: dev workflow, generators, governance, and release operations for the Krab framework"
+keywords = ["krab", "cli", "web", "framework", "codegen"]
+categories = ["command-line-utilities", "development-tools", "web-programming"]
 
 [dependencies]
 clap = { version = "4.4", features = ["derive"] }
