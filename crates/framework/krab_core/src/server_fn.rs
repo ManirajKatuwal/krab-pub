@@ -258,19 +258,29 @@ impl axum::response::IntoResponse for ServerFnError {
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 /// A registered server function entry point.
+///
+/// Two variants, selected by feature. The `rest` form carries the dispatch
+/// handler; the client form is metadata only, because a browser build has no
+/// axum `Response` to hand back. Previously only the field was gated while the
+/// struct itself was not, so with `rest` off both definitions landed in the same
+/// namespace — invisible while the whole module was gated behind `rest`, and an
+/// immediate `E0428` once it was not.
+#[cfg(feature = "rest")]
 pub struct ServerFnRegistration {
     /// Function name (snake_case).
     pub name: &'static str,
     /// URL path for this function (e.g., `/api/rpc/get_user`).
     pub url: &'static str,
     /// Handler that accepts JSON args and returns an Axum response (can be streaming).
-    #[cfg(feature = "rest")]
     pub handler: fn(serde_json::Value) -> BoxFuture<axum::response::Response>,
 }
 
+/// Client-side registration metadata. See the `rest` variant above.
 #[cfg(not(feature = "rest"))]
 pub struct ServerFnRegistration {
+    /// Function name (snake_case).
     pub name: &'static str,
+    /// URL path for this function (e.g., `/api/rpc/get_user`).
     pub url: &'static str,
 }
 
@@ -389,9 +399,9 @@ pub async fn call_server_fn<A: Serialize, T: serde::de::DeserializeOwned>(
     let window = web_sys::window().ok_or_else(|| ServerFnError::new("no window object"))?;
     let body = serde_json::to_string(args).map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    let mut opts = web_sys::RequestInit::new();
-    opts.method("POST");
-    opts.body(Some(&wasm_bindgen::JsValue::from_str(&body)));
+    let opts = web_sys::RequestInit::new();
+    opts.set_method("POST");
+    opts.set_body(&wasm_bindgen::JsValue::from_str(&body));
 
     let request = web_sys::Request::new_with_str_and_init(url, &opts)
         .map_err(|_| ServerFnError::new("failed to create request"))?;

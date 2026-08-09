@@ -16,6 +16,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 wasm-bindgen = "0.2"
+# The router awaits a `fetch` promise from a synchronous click handler.
+wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 krab_core = { workspace = true, features = ["web"] }
 krab_macros = { workspace = true }
@@ -38,7 +40,24 @@ features = [
     "Text",
     "Comment",
     "DocumentFragment",
+    # Client-side routing: anchor inspection, click details, history, and the
+    # fetch of the destination document.
+    "HtmlAnchorElement",
+    "MouseEvent",
+    "History",
+    "Location",
+    "Headers",
+    "Request",
+    "RequestInit",
+    "Response",
 ]
+
+[dev-dependencies]
+# The hydration path mutates real DOM, so it cannot be covered by
+# `cargo test --workspace` — that compiles for the host, where there is no
+# document. These tests run under `wasm-pack test --headless`, which is the only
+# way this crate's actual behaviour gets exercised.
+wasm-bindgen-test = "0.3"
 
 [features]
 web = []

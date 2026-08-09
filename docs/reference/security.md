@@ -84,6 +84,49 @@ When `KRAB_ENVIRONMENT` is `staging`, `prod`, or any non-dev value:
 
 ---
 
+## Password credentials
+
+Login passwords are verified as **Argon2id** hashes in [PHC string format]. The
+parameters are the `argon2` crate defaults, which are the [RFC 9106] second
+recommended configuration: `v=19, m=19456 KiB, t=2, p=1`.
+
+Generate a credential with the CLI rather than a side tool, so the format
+matches what the service verifies:
+
+```sh
+krab auth hash-password --username admin
+# reads the password from stdin, prints:
+# {"admin":"$argon2id$v=19$m=19456,t=2,p=1$<salt>$<digest>"}
+```
+
+Three properties are enforced, each with a test in
+`krab_core::credentials` and `service_auth`:
+
+1. **No plaintext comparison exists on any request path.** Verification is
+   `Argon2::verify_password` against a stored PHC hash.
+2. **An unknown username costs the same as a wrong password.** The store
+   verifies against a fixed dummy hash when the user is absent, so response
+   timing does not enumerate valid usernames.
+3. **Non-PHC credentials cannot reach production.** Outside `dev`/`local`,
+   startup rejects any value in `KRAB_AUTH_BOOTSTRAP_PASSWORD` or
+   `KRAB_AUTH_LOGIN_USERS_JSON` that is not a parseable Argon2 hash carrying
+   both a salt and a digest — including values sourced from `*_FILE` or
+   `*_VAULT_REF`. Correct sourcing of a plaintext secret is still a plaintext
+   secret.
+
+In `dev`/`local` a plaintext value is accepted and hashed once at startup, so
+`KRAB_AUTH_BOOTSTRAP_PASSWORD=change-me` still works for development without
+weakening the production path.
+
+Applications can supply their own backing store by implementing
+`krab_core::credentials::CredentialStore`; `EnvHashCredentialStore` is the
+environment-sourced implementation the reference service uses.
+
+[PHC string format]: https://github.com/P-H-C/phc-string-format/blob/master/phc-sf-spec.md
+[RFC 9106]: https://www.rfc-editor.org/rfc/rfc9106.html#section-4
+
+---
+
 ## Rate Limiting
 
 Rate limiting is applied globally via `krab_core::http` middleware:

@@ -105,7 +105,22 @@ pub async fn cache_middleware(State(state): State<AppState>, req: Request, next:
     let distributed_key = distributed_eligible.then(|| distributed_cache_key(&cache_key));
 
     if isr_eligible {
-        if let Some(entry) = state.isr_cache.get(&cache_key) {
+        // A cache read that fails is a degraded cache, not a failed request:
+        // fall through and render the page rather than 500.
+        let cached = match state.isr_cache.get(&cache_key).await {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(
+                    event = "isr_cache_read_failed",
+                    http.route = %path,
+                    %error,
+                    "serving uncached after an ISR read failure"
+                );
+                None
+            }
+        };
+
+        if let Some(entry) = cached {
             let state_header = if entry.is_stale() { "stale" } else { "fresh" };
 
             let mut res = Response::new(Body::from(entry.html.into_bytes()));
@@ -269,14 +284,34 @@ pub async fn cache_middleware(State(state): State<AppState>, req: Request, next:
             );
         } else if let Some(html) = html_for_isr {
             if is_finalized_ssr_snapshot(&html) {
-                state.isr_cache.put(
-                    &cache_key,
-                    html,
-                    IsrPolicy::revalidate(isr_revalidate_duration()),
-                );
+                // A failed write means the next request re-renders — worse for
+                // latency, correct for content. Never fail the response over it.
+                let stored = state
+                    .isr_cache
+                    .put(
+                        &cache_key,
+                        html,
+                        IsrPolicy::revalidate(isr_revalidate_duration()),
+                    )
+                    .await;
+
+                let isr_state = match stored {
+                    Ok(()) => "fresh",
+                    Err(error) => {
+                        tracing::warn!(
+                            event = "isr_cache_write_failed",
+                            cache_key = %cache_key,
+                            http.route = %path,
+                            %error,
+                            "response served but not cached"
+                        );
+                        "store-error"
+                    }
+                };
+
                 res.headers_mut().insert(
                     axum::http::header::HeaderName::from_static("x-isr-state"),
-                    axum::http::HeaderValue::from_static("fresh"),
+                    axum::http::HeaderValue::from_static(isr_state),
                 );
             } else {
                 tracing::warn!(

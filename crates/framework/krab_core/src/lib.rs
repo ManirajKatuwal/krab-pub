@@ -2,16 +2,36 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod config;
+#[cfg(feature = "auth")]
+pub mod credentials;
 pub mod error_boundary;
 #[cfg(feature = "graphql")]
 pub mod graphql;
-#[cfg(feature = "grpc")]
-pub mod grpc;
+#[cfg(feature = "grpc-semantics")]
+pub mod grpc_semantics;
+
+/// Deprecated alias for [`grpc_semantics`].
+///
+/// The name promised a transport this crate does not have. Kept for one minor
+/// version per the breaking-change policy in `RELEASE_POLICY.md`; deprecated in
+/// `0.2.0`, so removable no earlier than `0.3.0`. See ADR 0007.
+#[cfg(feature = "grpc-semantics")]
+#[deprecated(
+    since = "0.2.0",
+    note = "renamed to `grpc_semantics`: this module provides gRPC status-code and \
+            timeout-header semantics for a gateway, not a gRPC transport. \
+            Update the feature name too: `grpc` -> `grpc-semantics`."
+)]
+pub use grpc_semantics as grpc;
 pub mod head;
 #[cfg(feature = "rest")]
 pub mod http_error;
 pub mod i18n;
 pub mod image;
+// Server-side: ISR caches rendered pages, and now does so through
+// `store::DistributedStore`, which needs `tokio`. Neither is meaningful in a
+// browser bundle.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod isr;
 pub mod layout;
 pub mod loading;
@@ -26,7 +46,15 @@ pub mod style_scope;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ws;
 
-#[cfg(feature = "rest")]
+// Available to both halves of a server function, not just the server half.
+//
+// This was `#[cfg(feature = "rest")]`, which gated out the entire module for a
+// browser build — including `call_server_fn`, which is what the `#[server]`
+// macro's wasm32 stub calls. The module's own internals already branch on
+// `not(feature = "rest")` and `target_arch = "wasm32"`, so it was written to
+// compile without `rest`; the module declaration made that code unreachable and
+// the client half of `#[server]` could never build.
+#[cfg(any(feature = "rest", feature = "web"))]
 pub mod server_fn;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -74,6 +102,12 @@ pub mod http_runtime;
 pub mod http_security;
 
 #[cfg(feature = "rest")]
+pub mod static_assets;
+// Gated on the target, not on `rest`. A shared key-value store has nothing to
+// do with having an HTTP surface, and `isr` — which is not feature-gated —
+// depends on it. It needs `tokio`, which is a non-wasm dependency, hence the
+// target gate rather than no gate at all.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod store;
 
 #[cfg(all(feature = "rest", test))]

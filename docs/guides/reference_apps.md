@@ -1,17 +1,37 @@
 # Reference Apps
 
-Krab maintains five official reference tracks. Each track maps to a starter or service topology and shows which framework capability it exercises.
+`examples/reference_apps/` holds two different kinds of thing. The distinction
+matters, so it is stated first.
 
-> **These tracks are guides, not vendored applications.** Each directory under
-> `examples/reference_apps/` holds a walkthrough README — what to generate, what
-> to inspect, and where to extend. The application code is produced by the
-> `krab new` / `krab topology split` command in the "Generate with" column, so
-> it always matches the current templates. Nothing under
-> `examples/reference_apps/` is compiled or exercised by CI. The services that
-> *are* built and gated live in [`services/`](../../services/).
+## One vendored application
+
+[`islands_rpc`](../../examples/reference_apps/islands_rpc/) is **real code**: a
+workspace member that compiles, tests, and builds a WASM bundle in CI. It is the
+end-to-end demonstration of Krab's core pitch — `view!` for all markup,
+`#[island]` hydration, and a `#[server]` function called from an island's event
+handler, all from one source file.
+
+```sh
+cargo run  -p reference_app_islands_rpc --bin islands_rpc_server   # http://127.0.0.1:3100
+cargo test -p reference_app_islands_rpc
+```
+
+Start here if you want to see the framework working before deciding anything.
+
+## Five generated tracks
+
+The other five directories are **guides, not vendored applications.** Each holds
+a walkthrough README — what to generate, what to inspect, and where to extend.
+The application code is produced by the `krab new` / `krab topology split`
+command in the "Generate with" column, so it always matches the current
+templates. Those five are not compiled by CI; the `krab new` output they
+describe is separately gated by
+[`generated-project.yaml`](../../.github/workflows/generated-project.yaml), and
+the services that are built and gated live in [`services/`](../../services/).
 
 | Use case | Track guide | Generate with | Exercises |
 | --- | --- | --- | --- |
+| **Islands + RPC** | **`examples/reference_apps/islands_rpc` — vendored code, no generation step** | — | **`view!`, `#[island]`, `#[server]`, SSR + hydration end to end** |
 | Content site | `examples/reference_apps/content_site` | `krab new content-site --template default` | static routes, render policy, deployment basics |
 | SaaS dashboard | `examples/reference_apps/saas_dashboard` | `krab new saas-dashboard --template saas` | auth-ready HTTP layers, tenant API scaffolding, release checks |
 | Edge-rendered app | `examples/reference_apps/edge_rendered` | `krab new edge-rendered --template edge-ssr` | explicit route render policy, ISR metadata, edge eligibility |

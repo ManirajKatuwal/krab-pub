@@ -107,6 +107,83 @@ mod tests {
     use krab_macros::view;
     use tower::ServiceExt;
 
+    /// ADR 0005 task 3.4 — regression cover for the two defects that decided
+    /// `krab_server`'s removal, asserted against the router that replaced it.
+    ///
+    /// The deleted trie router took a static child whenever one matched and kept
+    /// no alternatives stack, so with `/a/b` and `/:x/c` registered, `/a/c`
+    /// consumed `a` down the static branch, found no `c` child, and 404'd a
+    /// route that was registered. It also had no method routing at all —
+    /// `Method`, `GET`, and `POST` appear nowhere in that file — so a GET and a
+    /// POST to one path were indistinguishable.
+    ///
+    /// Axum's `matchit` router handles both. This test exists so that stays
+    /// true, and so the reason the crate went is recorded as executable fact
+    /// rather than only as prose in the ADR.
+    mod adr_0005_router_regressions {
+        use super::*;
+        use axum::routing::{get, post};
+
+        fn router() -> axum::Router {
+            axum::Router::new()
+                .route("/a/b", get(|| async { "static" }))
+                .route("/{x}/c", get(|| async { "dynamic" }))
+                .route("/verb", get(|| async { "got" }))
+                .route("/verb", post(|| async { "posted" }))
+        }
+
+        async fn call(method: &str, uri: &str) -> (StatusCode, String) {
+            let response = router()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8(bytes.to_vec()).unwrap())
+        }
+
+        #[tokio::test]
+        async fn dynamic_route_matches_when_the_static_branch_dead_ends() {
+            let (status, body) = call("GET", "/a/c").await;
+
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "/a/c must match /{{x}}/c after /a/b dead-ends"
+            );
+            assert_eq!(body, "dynamic");
+        }
+
+        #[tokio::test]
+        async fn the_static_route_still_wins_where_it_matches() {
+            let (status, body) = call("GET", "/a/b").await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, "static", "a static path must beat a dynamic one");
+        }
+
+        #[tokio::test]
+        async fn get_and_post_on_one_path_dispatch_separately() {
+            assert_eq!(call("GET", "/verb").await.1, "got");
+            assert_eq!(call("POST", "/verb").await.1, "posted");
+        }
+
+        #[tokio::test]
+        async fn an_unregistered_method_is_refused_not_silently_served() {
+            let (status, _) = call("DELETE", "/verb").await;
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        }
+    }
+
     #[test]
     fn ssr_snapshot_home_fragment() {
         let rendered = view! {

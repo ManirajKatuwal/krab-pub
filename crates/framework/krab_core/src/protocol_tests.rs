@@ -82,8 +82,9 @@ fn test_config_validation_tenant_override_protocol_must_be_enabled() {
 fn test_parse_protocol_kind_case_insensitive() {
     assert_eq!(ProtocolKind::parse("REST"), Some(ProtocolKind::Rest));
     assert_eq!(ProtocolKind::parse("Graphql"), Some(ProtocolKind::Graphql));
-    assert_eq!(ProtocolKind::parse("rpc"), Some(ProtocolKind::Rpc));
-    assert_eq!(ProtocolKind::parse("GRPC"), Some(ProtocolKind::Rpc));
+    assert_eq!(ProtocolKind::parse("RPC"), Some(ProtocolKind::Rpc));
+    // `GRPC` asserted `Some(Rpc)` here until ADR 0007. See
+    // `protocol_parse_rejects_grpc_instead_of_aliasing_it_to_rpc`.
 }
 
 #[test]
@@ -155,4 +156,33 @@ fn test_capabilities_struct_shape_is_constructible() {
         caps.protocol_routes.get(&ProtocolKind::Rest),
         Some(&"/api/v1/users".to_string())
     );
+}
+
+/// ADR 0007 — `grpc` is not a Krab transport, and configuration must say so
+/// rather than silently substituting Krab's JSON-over-HTTP RPC.
+#[test]
+fn protocol_parse_rejects_grpc_instead_of_aliasing_it_to_rpc() {
+    assert_eq!(ProtocolKind::parse("rpc"), Some(ProtocolKind::Rpc));
+
+    // Previously `Some(ProtocolKind::Rpc)`. A service configured with
+    // `KRAB_PROTOCOL_ENABLED=grpc` came up exposing Krab RPC and reported
+    // itself as satisfying a gRPC requirement it cannot satisfy.
+    assert_eq!(ProtocolKind::parse("grpc"), None);
+    assert_eq!(ProtocolKind::parse("GRPC"), None);
+}
+
+/// The supported set is exactly three, and none of them is gRPC.
+#[test]
+fn protocol_supported_set_is_rest_graphql_rpc() {
+    for (input, expected) in [
+        ("rest", ProtocolKind::Rest),
+        ("graphql", ProtocolKind::Graphql),
+        ("rpc", ProtocolKind::Rpc),
+    ] {
+        assert_eq!(ProtocolKind::parse(input), Some(expected));
+    }
+
+    for unsupported in ["grpc", "tonic", "soap", ""] {
+        assert_eq!(ProtocolKind::parse(unsupported), None, "{unsupported}");
+    }
 }

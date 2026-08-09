@@ -61,10 +61,9 @@ so publication is ordered by the dependency graph:
 |---|---|---|
 | 1 | `krab_macros` | — |
 | 2 | `krab_core` | — |
-| 3 | `krab_server` | `krab_core` |
-| 4 | `krab_client` | `krab_core`, `krab_macros` |
-| 5 | `krab_cli` | `krab_core` |
-| 6 | `krab_orchestrator` | `krab_core` |
+| 3 | `krab_client` | `krab_core`, `krab_macros` |
+| 4 | `krab_cli` | `krab_core` |
+| 5 | `krab_orchestrator` | `krab_core` |
 
 `cargo publish --workspace` computes this order itself and is the supported way
 to release; the table exists so a human recovering from a partial publish knows
@@ -99,6 +98,27 @@ The package cannot be named `krab` — that name was registered on crates.io in
 - **MAJOR**: Breaking API changes or incompatible architectural shifts
 - **MINOR**: New features, new endpoints, backward-compatible changes
 - **PATCH**: Bug fixes, security patches, documentation updates
+
+### While the version is below `1.0`
+
+The rule above describes a post-`1.0` crate and does **not** apply as written
+while Krab is on `0.x`. Cargo treats the leftmost non-zero field as the
+compatibility boundary, so for a `0.x.y` version the **minor** field plays the
+role of major:
+
+| Change | Post-`1.0` | On `0.x` |
+|---|---|---|
+| Breaking API change | `MAJOR` | **`MINOR`** — `0.1.z` → `0.2.0` |
+| Backward-compatible feature | `MINOR` | `PATCH` — `0.2.0` → `0.2.1` |
+| Bug fix, docs | `PATCH` | `PATCH` |
+
+`^0.1` and `^0.2` are incompatible requirements; `0.1.1` and `0.1.2` are not.
+Releasing a breaking change as a patch therefore breaks every downstream build
+with nothing in the version to signal it.
+
+Reaching `1.0` is a separate decision, gated on
+[`docs/operations/production_readiness.md`](docs/operations/production_readiness.md),
+not something a breaking change forces.
 
 ### Breaking Change Policy
 

@@ -1,3 +1,20 @@
+//! gRPC **semantics** for a gateway — not a gRPC transport.
+//!
+//! This module provides the vocabulary needed to map between HTTP and gRPC at a
+//! boundary: the canonical status codes, and `grpc-timeout` header parsing so a
+//! deadline propagated by a gRPC client can be honoured.
+//!
+//! It does **not** provide a transport. There is no codegen, no `.proto`
+//! handling, no service trait, no channel, and no client — `tonic` and `prost`
+//! appear nowhere in the workspace. Nothing here can speak gRPC to anything.
+//!
+//! The module and its feature were called `grpc`, which implied otherwise at
+//! the point of `cargo add` — before anyone reads a caveat. See
+//! [ADR 0007](https://github.com/krab-framework/krab/blob/main/docs/adr/0007-grpc-feature-disposition.md).
+//!
+//! A real transport is not foreclosed; it is simply a separate piece of work
+//! with its own ADR.
+
 use std::time::Duration;
 
 /// gRPC status codes as defined by the wire protocol.

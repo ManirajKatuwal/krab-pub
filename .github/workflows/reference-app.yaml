@@ -1,0 +1,126 @@
+name: Browser Runtime and Reference Application
+
+# `#[island]` and `#[server]` — the framework's headline features — had zero
+# usages outside the framework's own tests and documentation. Nothing proved
+# that SSR, hydration, and server functions worked *together*, and building the
+# first real consumer surfaced two defects that had been invisible:
+# `krab_core::server_fn` was gated behind the server-only `rest` feature, so the
+# client half of `#[server]` had never compiled, and `ServerFnRegistration` was
+# defined twice once that gate was lifted.
+#
+# This workflow keeps that from regressing. It builds and tests the vendored
+# reference application on both targets it has to work on: the native server and
+# the browser bundle.
+
+on:
+  pull_request:
+    paths:
+      - 'examples/reference_apps/islands_rpc/**'
+      - 'crates/framework/krab_core/**'
+      - 'crates/framework/krab_macros/**'
+      - 'crates/framework/krab_client/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/reference-app.yaml'
+  push:
+    branches:
+      - main
+
+jobs:
+  reference-app:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-reference-app-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      # --- Native (server) half -------------------------------------------
+
+      - name: Format check
+        run: cargo fmt -p reference_app_islands_rpc -- --check
+
+      - name: Clippy
+        run: cargo clippy -p reference_app_islands_rpc --all-targets -- -D warnings
+
+      - name: Build the server
+        run: cargo build -p reference_app_islands_rpc
+
+      # Asserts the SSR response carries the island hydration markers, that
+      # `view!` still emits hyphenated attribute names, and that the server
+      # function accepts a valid request and rejects a malformed one.
+      - name: Test
+        run: cargo test -p reference_app_islands_rpc
+
+      # --- Browser half ----------------------------------------------------
+
+      # The client half of `#[island]` and `#[server]` compiles only for wasm32
+      # with `--features web`. A native build passing says nothing about it.
+      - name: Clippy (wasm32)
+        run: |
+          cargo clippy -p reference_app_islands_rpc \
+            --target wasm32-unknown-unknown --features web --lib -- -D warnings
+
+      - name: Build the WASM bundle
+        run: |
+          wasm-pack build examples/reference_apps/islands_rpc \
+            --target web -- --features web
+
+      - name: Confirm the bundle was produced
+        run: |
+          set -euo pipefail
+          pkg="examples/reference_apps/islands_rpc/pkg"
+          test -f "$pkg/reference_app_islands_rpc_bg.wasm" \
+            || { echo "::error::no wasm artifact at $pkg"; exit 1; }
+          test -f "$pkg/reference_app_islands_rpc.js" \
+            || { echo "::error::no JS glue at $pkg"; exit 1; }
+          ls -l "$pkg"
+
+  # The hydration runtime mutates real DOM. `cargo test --workspace` compiles
+  # krab_client for the host, where there is no `document`, so it reaches only
+  # the pure planning functions — every DOM-mutating path (`hydrate`,
+  # `hydrate_recursive`, `create_dom_node`, `patch_dom`) had no test at all.
+  # A hydration defect shows up as a subtly wrong DOM in a user's browser, never
+  # as a red build, so this is the only gate that can catch one.
+  client-browser-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-client-browser-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Hydration browser tests
+        run: |
+          wasm-pack test --headless --chrome crates/framework/krab_client -- --features web

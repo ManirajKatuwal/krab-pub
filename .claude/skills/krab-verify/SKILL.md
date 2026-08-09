@@ -85,7 +85,20 @@ compiles a fraction of the surface and proves much less than CI.
 test_krab_core_all_features       cargo test -p krab_core --all-features
 test_krab_core_rest_protocol      cargo test -p krab_core --features rest protocol
 test_krab_macros                  cargo test -p krab_macros
+test_reference_app                cargo test -p reference_app_islands_rpc
 ```
+
+The reference app is the only consumer of `#[island]` + `#[server]` together.
+Its **browser** half is a separate compilation and is not covered by any native
+run — check it explicitly when touching `krab_core`, `krab_macros`, or
+`krab_client`:
+
+```
+check_reference_app_wasm  cargo clippy -p reference_app_islands_rpc \
+                            --target wasm32-unknown-unknown --features web --lib -- -D warnings
+```
+
+`#[server]`'s client half went years without compiling because nothing built it.
 
 `krab_macros` uses trybuild. A changed diagnostic means the `.stderr` fixtures in
 `crates/framework/krab_macros/tests/compile_fail/` need regenerating —

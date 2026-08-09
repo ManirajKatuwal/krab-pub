@@ -2,11 +2,14 @@
 
 ## Status
 
-**Proposed** — awaiting owner acceptance.
+**Accepted** — 2026-08-08, by the repository owner.
 
-This ADR recommends deleting a crate. That is not an action to take on an
-unreviewed recommendation, so the change is staged behind acceptance. Nothing in
-`crates/framework/krab_server/` has been modified.
+Implemented in the same change. The sequencing in decision step 1 was honoured:
+`resolve_static_pkg_path`, `static_mime_for`, and `normalize_static_mime` were
+ported to [`krab_core::static_assets`](../../crates/framework/krab_core/src/static_assets.rs)
+behind the `rest` feature, with their original tests plus four new cases
+(absolute paths in both spellings, a `..` nested mid-path, and a missing file),
+and verified green **before** `crates/framework/krab_server/` was removed.
 
 ## Context
 

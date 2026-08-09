@@ -1,6 +1,6 @@
 # Public Assets
 
-This directory contains static assets served by `krab_server`.
+This directory contains static assets served by Axum's `tower_http::services::ServeDir`.
 
 ## Building Client
 

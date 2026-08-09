@@ -7,6 +7,9 @@ use jsonwebtoken::{
 };
 use krab_core::config::KrabConfig;
 use krab_core::config::{env_non_empty, read_env_or_file};
+use krab_core::credentials::{
+    hash_password, is_valid_password_hash, CredentialStore as _, EnvHashCredentialStore,
+};
 use krab_core::http::{
     apply_common_http_layers, health, metrics, metrics_prometheus, readiness_with_dependencies,
     HasReadinessDependencies, HasRuntimeState, RuntimeState,
@@ -17,6 +20,7 @@ use krab_core::telemetry::init_tracing;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -26,11 +30,16 @@ const INSECURE_DEV_BOOTSTRAP_PASSWORD: &str = "change-me";
 
 struct AuthService {
     config: ServiceConfig,
+    credentials: Arc<EnvHashCredentialStore>,
 }
 
 #[derive(Clone)]
 struct AppState {
     runtime: RuntimeState,
+    /// Built once at startup. Argon2 verification is deliberately expensive, so
+    /// re-parsing the credential map per request would add that cost to every
+    /// login on top of the hashing itself.
+    credentials: Arc<EnvHashCredentialStore>,
 }
 
 #[derive(Clone)]
@@ -175,25 +184,99 @@ fn key_ring_from_env() -> Result<KeyRing> {
     Ok(KeyRing { active_kid, keys })
 }
 
-fn resolve_login_password(username: &str) -> Result<Option<String>> {
+/// Whether `KRAB_ENVIRONMENT` names an environment where developer conveniences
+/// — an unhashed bootstrap password, a default JWT secret — are tolerated.
+///
+/// Shared by the startup guard and [`resolve_credential_store`] so the two
+/// cannot drift into disagreeing about what counts as production.
+fn local_like_environment() -> bool {
+    let env = std::env::var("KRAB_ENVIRONMENT").unwrap_or_else(|_| "dev".to_string());
+    env.eq_ignore_ascii_case("dev") || env.eq_ignore_ascii_case("local")
+}
+
+/// Reject any configured credential that is not an Argon2id PHC hash.
+///
+/// Runs outside `local`-like environments only, and covers `*_FILE` and
+/// `*_VAULT_REF` sourcing as well as inline values — a plaintext password read
+/// from a mounted secret is still a plaintext password.
+fn enforce_hashed_credentials() -> Result<()> {
     if let Some(raw) = read_env_or_file("KRAB_AUTH_LOGIN_USERS_JSON")? {
-        let users = serde_json::from_str::<BTreeMap<String, String>>(&raw)
-            .context("KRAB_AUTH_LOGIN_USERS_JSON must be a JSON object of username->password")?;
-        if let Some(password) = users.get(username) {
-            return Ok(Some(password.clone()));
+        let configured = serde_json::from_str::<BTreeMap<String, String>>(&raw).context(
+            "KRAB_AUTH_LOGIN_USERS_JSON must be a JSON object of username -> Argon2id PHC hash",
+        )?;
+        for (username, value) in &configured {
+            anyhow::ensure!(
+                is_valid_password_hash(value),
+                "KRAB_AUTH_LOGIN_USERS_JSON entry for '{username}' is not an Argon2id PHC hash; \
+                 plaintext credentials are forbidden outside local environments. \
+                 Generate one with `krab auth hash-password`"
+            );
+        }
+    }
+
+    if let Some(password) = read_env_or_file("KRAB_AUTH_BOOTSTRAP_PASSWORD")? {
+        anyhow::ensure!(
+            is_valid_password_hash(&password),
+            "KRAB_AUTH_BOOTSTRAP_PASSWORD is not an Argon2id PHC hash; plaintext credentials \
+             are forbidden outside local environments. Generate one with `krab auth hash-password`"
+        );
+    }
+
+    Ok(())
+}
+
+/// Build the credential store from the environment, once, at startup.
+///
+/// `KRAB_AUTH_LOGIN_USERS_JSON` is a JSON object of `username -> Argon2id PHC
+/// hash`. It previously held plaintext passwords; see the migration guide.
+///
+/// In `local`-like environments a value that is not a PHC hash is accepted and
+/// hashed here, so `KRAB_AUTH_BOOTSTRAP_PASSWORD=change-me` still works for
+/// development without a hashing step. That conversion happens exactly once at
+/// startup, so no plaintext comparison exists on the request path and no
+/// Argon2 cost is paid per login. Outside `local` the startup guard rejects
+/// non-PHC values outright — see [`enforce_hashed_credentials`].
+fn resolve_credential_store() -> Result<EnvHashCredentialStore> {
+    let allow_plaintext = local_like_environment();
+    let mut users: BTreeMap<String, String> = BTreeMap::new();
+
+    if let Some(raw) = read_env_or_file("KRAB_AUTH_LOGIN_USERS_JSON")? {
+        let configured = serde_json::from_str::<BTreeMap<String, String>>(&raw).context(
+            "KRAB_AUTH_LOGIN_USERS_JSON must be a JSON object of username -> Argon2id PHC hash",
+        )?;
+        for (username, value) in configured {
+            users.insert(username, normalize_credential(&value, allow_plaintext)?);
         }
     }
 
     let default_user =
         std::env::var("KRAB_AUTH_BOOTSTRAP_USER").unwrap_or_else(|_| "admin".to_string());
-    if username == default_user {
-        return Ok(Some(
-            read_env_or_file("KRAB_AUTH_BOOTSTRAP_PASSWORD")?
-                .unwrap_or_else(|| INSECURE_DEV_BOOTSTRAP_PASSWORD.to_string()),
-        ));
+    if let std::collections::btree_map::Entry::Vacant(entry) = users.entry(default_user) {
+        let configured = read_env_or_file("KRAB_AUTH_BOOTSTRAP_PASSWORD")?
+            .unwrap_or_else(|| INSECURE_DEV_BOOTSTRAP_PASSWORD.to_string());
+        entry.insert(normalize_credential(&configured, allow_plaintext)?);
     }
 
-    Ok(None)
+    EnvHashCredentialStore::from_map(users)
+}
+
+/// Pass a PHC hash through unchanged; hash a plaintext value only where that is
+/// permitted.
+fn normalize_credential(value: &str, allow_plaintext: bool) -> Result<String> {
+    if is_valid_password_hash(value) {
+        return Ok(value.to_string());
+    }
+
+    anyhow::ensure!(
+        allow_plaintext,
+        "credential is not an Argon2id PHC hash; generate one with `krab auth hash-password`"
+    );
+
+    warn!(
+        event = "credential_plaintext_hashed_at_startup",
+        "a plaintext credential was hashed at startup; this is permitted only in local environments"
+    );
+    hash_password(value)
 }
 
 fn encode_hs256(kid: &str, secret: &str, claims: &AuthTokenClaims) -> Result<String> {
@@ -321,20 +404,28 @@ async fn login_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     Json(payload): Json<LoginRequest>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
-    let expected = match resolve_login_password(payload.username.trim()) {
-        Ok(value) => value,
+    // Argon2id verification against a stored PHC hash. An unknown username
+    // costs the same as a wrong password — see `EnvHashCredentialStore::verify`.
+    match state
+        .credentials
+        .verify(payload.username.trim(), payload.password.trim())
+        .await
+    {
+        Ok(Some(_identity)) => {}
+        Ok(None) => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(json!({"error":"invalid_credentials"})),
+            );
+        }
         Err(err) => {
+            // A verification fault is a misconfiguration, not a failed login;
+            // the detail never contains the submitted password.
             return (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error":"auth_config_error","detail":err.to_string()})),
-            )
+            );
         }
-    };
-    if expected.as_deref() != Some(payload.password.trim()) {
-        return (
-            axum::http::StatusCode::UNAUTHORIZED,
-            Json(json!({"error":"invalid_credentials"})),
-        );
     }
 
     match issue_token_pair(
@@ -576,6 +667,7 @@ impl ApiService for AuthService {
                     .clone()
                     .unwrap_or_else(ProtocolConfig::from_env),
             ),
+            credentials: Arc::clone(&self.credentials),
         };
 
         let app = build_app(state);
@@ -623,7 +715,7 @@ fn bootstrap_auth_service() -> Result<AuthService> {
     let auth_mode = std::env::var("KRAB_AUTH_MODE").unwrap_or_else(|_| "jwt".to_string());
     info!(%auth_mode, "auth_startup_mode_resolved");
     let env = std::env::var("KRAB_ENVIRONMENT").unwrap_or_else(|_| "dev".to_string());
-    let local_like_env = env.eq_ignore_ascii_case("dev") || env.eq_ignore_ascii_case("local");
+    let local_like_env = local_like_environment();
 
     if auth_mode.eq_ignore_ascii_case("jwt") || auth_mode.eq_ignore_ascii_case("oidc") {
         let issuer_present = std::env::var_os("KRAB_OIDC_ISSUER").is_some();
@@ -682,6 +774,11 @@ fn bootstrap_auth_service() -> Result<AuthService> {
                     "non-local auth mode forbids insecure/default KRAB_AUTH_BOOTSTRAP_PASSWORD"
                 );
             }
+
+            // Sourcing a secret from a file or vault says nothing about its
+            // format. This is what stops a plaintext password reaching a
+            // production login path through an otherwise-correct mount.
+            enforce_hashed_credentials()?;
         }
     } else if auth_mode.eq_ignore_ascii_case("static") && !local_like_env {
         anyhow::bail!(
@@ -690,7 +787,18 @@ fn bootstrap_auth_service() -> Result<AuthService> {
         );
     }
 
-    Ok(AuthService { config })
+    // Built here rather than per-request so a malformed credential map fails
+    // startup instead of the first login attempt.
+    let credentials = Arc::new(resolve_credential_store()?);
+    info!(
+        configured_users = credentials.len(),
+        "auth_credential_store_resolved"
+    );
+
+    Ok(AuthService {
+        config,
+        credentials,
+    })
 }
 
 #[tokio::main]
@@ -722,12 +830,191 @@ mod tests {
         format!("Bearer {token}")
     }
 
+    const TEST_LOGIN_USER: &str = "admin";
+    const TEST_LOGIN_PASSWORD: &str = "s3cret-for-tests";
+
+    /// A store holding a single Argon2id-hashed credential.
+    fn test_credential_store() -> Arc<EnvHashCredentialStore> {
+        let hash = hash_password(TEST_LOGIN_PASSWORD).expect("hashing should succeed");
+        let mut users = BTreeMap::new();
+        users.insert(TEST_LOGIN_USER.to_string(), hash);
+        Arc::new(EnvHashCredentialStore::from_map(users).expect("store should build"))
+    }
+
     fn test_app() -> Router {
         std::env::set_var("KRAB_AUTH_MODE", "static");
         std::env::set_var("KRAB_BEARER_TOKEN", TEST_BEARER_TOKEN);
         build_app(AppState {
             runtime: RuntimeState::new(),
+            credentials: test_credential_store(),
         })
+    }
+
+    async fn login_status(username: &str, password: &str) -> StatusCode {
+        let app = test_app();
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "username": username, "password": password }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    /// 6.7 — a correct password authenticates.
+    #[tokio::test]
+    async fn credential_correct_password_is_accepted() {
+        assert_ne!(
+            login_status(TEST_LOGIN_USER, TEST_LOGIN_PASSWORD).await,
+            StatusCode::UNAUTHORIZED,
+            "a valid credential must not be rejected"
+        );
+    }
+
+    /// 6.7 — a wrong password does not.
+    #[tokio::test]
+    async fn credential_wrong_password_is_rejected() {
+        assert_eq!(
+            login_status(TEST_LOGIN_USER, "not-the-password").await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// 6.7 — an unknown user is rejected the same way a wrong password is, and
+    /// with the same status, so the response cannot be used to enumerate users.
+    #[tokio::test]
+    async fn credential_unknown_user_is_rejected_indistinguishably() {
+        assert_eq!(
+            login_status("no-such-user", TEST_LOGIN_PASSWORD).await,
+            login_status(TEST_LOGIN_USER, "not-the-password").await
+        );
+    }
+
+    /// 6.7 — plaintext in the credential map fails the non-local startup guard,
+    /// even though it is well-formed JSON sourced correctly.
+    #[test]
+    fn credential_plaintext_map_fails_the_non_local_guard() {
+        let _guard = credential_env_guard();
+        std::env::set_var("KRAB_AUTH_LOGIN_USERS_JSON", r#"{"admin":"hunter2"}"#);
+
+        let err = enforce_hashed_credentials()
+            .expect_err("plaintext must not pass the guard")
+            .to_string();
+
+        assert!(err.contains("admin"), "error should name the user: {err}");
+        assert!(
+            err.contains("PHC"),
+            "error should name the required format: {err}"
+        );
+        assert!(
+            !err.contains("hunter2"),
+            "error must not echo the secret: {err}"
+        );
+    }
+
+    /// 6.7 — a properly hashed map passes the same guard.
+    #[test]
+    fn credential_hashed_map_passes_the_non_local_guard() {
+        let _guard = credential_env_guard();
+        let hash = hash_password(TEST_LOGIN_PASSWORD).unwrap();
+        std::env::set_var(
+            "KRAB_AUTH_LOGIN_USERS_JSON",
+            json!({ "admin": hash }).to_string(),
+        );
+
+        assert!(enforce_hashed_credentials().is_ok());
+    }
+
+    /// 6.7 — a plaintext `KRAB_AUTH_BOOTSTRAP_PASSWORD` is caught too. The
+    /// pre-existing `change-me` rejection covers only that one literal; this
+    /// covers every other plaintext value.
+    #[test]
+    fn credential_plaintext_bootstrap_password_fails_the_non_local_guard() {
+        let _guard = credential_env_guard();
+        std::env::set_var("KRAB_AUTH_BOOTSTRAP_PASSWORD", "a-strong-looking-plaintext");
+
+        let err = enforce_hashed_credentials()
+            .expect_err("plaintext must not pass the guard")
+            .to_string();
+        assert!(err.contains("PHC"), "unhelpful error: {err}");
+    }
+
+    /// 6.7 — the `local` convenience path still works: an unhashed dev password
+    /// is hashed at startup rather than compared in plaintext.
+    #[test]
+    fn credential_local_environment_hashes_plaintext_at_startup() {
+        let _guard = credential_env_guard();
+        std::env::set_var("KRAB_ENVIRONMENT", "local");
+        std::env::set_var(
+            "KRAB_AUTH_BOOTSTRAP_PASSWORD",
+            INSECURE_DEV_BOOTSTRAP_PASSWORD,
+        );
+
+        let store = resolve_credential_store().expect("local startup should succeed");
+        assert_eq!(store.len(), 1);
+    }
+
+    /// 6.7 — outside `local`, that same convenience is refused.
+    #[test]
+    fn credential_non_local_environment_refuses_to_hash_plaintext() {
+        let _guard = credential_env_guard();
+        std::env::set_var("KRAB_ENVIRONMENT", "prod");
+        std::env::set_var("KRAB_AUTH_BOOTSTRAP_PASSWORD", "some-plaintext");
+
+        assert!(
+            resolve_credential_store().is_err(),
+            "non-local startup must not accept a plaintext credential"
+        );
+    }
+
+    const CREDENTIAL_ENV_VARS: &[&str] = &[
+        "KRAB_ENVIRONMENT",
+        "KRAB_AUTH_LOGIN_USERS_JSON",
+        "KRAB_AUTH_BOOTSTRAP_PASSWORD",
+        "KRAB_AUTH_BOOTSTRAP_USER",
+    ];
+
+    /// Saves and restores the credential environment, and clears it for the
+    /// duration of a test. These tests mutate process-global state, so they are
+    /// serialised against each other.
+    fn credential_env_guard() -> CredentialEnvGuard {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let saved = CREDENTIAL_ENV_VARS
+            .iter()
+            .map(|name| (*name, std::env::var(name).ok()))
+            .collect();
+        for name in CREDENTIAL_ENV_VARS {
+            std::env::remove_var(name);
+        }
+
+        CredentialEnvGuard {
+            saved,
+            _lock: guard,
+        }
+    }
+
+    struct CredentialEnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for CredentialEnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -823,7 +1110,13 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/auth/login")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"username":"admin","password":"change-me"}"#))
+                    .body(Body::from(
+                        json!({
+                            "username": TEST_LOGIN_USER,
+                            "password": TEST_LOGIN_PASSWORD,
+                        })
+                        .to_string(),
+                    ))
                     .unwrap(),
             )
             .await

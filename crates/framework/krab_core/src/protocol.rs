@@ -47,11 +47,18 @@ pub enum ProtocolKind {
 
 impl ProtocolKind {
     /// Parse from a case-insensitive string.
+    ///
+    /// `"grpc"` is **not** accepted. It used to map to [`Self::Rpc`], so a
+    /// service configured with `KRAB_PROTOCOL_ENABLED=grpc` came up exposing
+    /// Krab's JSON-over-HTTP RPC and reported itself as satisfying a gRPC
+    /// requirement. Krab has no gRPC transport — `tonic` and `prost` appear
+    /// nowhere in the workspace — so failing configuration validation is the
+    /// honest outcome. See ADR 0007.
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "rest" => Some(Self::Rest),
             "graphql" => Some(Self::Graphql),
-            "rpc" | "grpc" => Some(Self::Rpc),
+            "rpc" => Some(Self::Rpc),
             _ => None,
         }
     }

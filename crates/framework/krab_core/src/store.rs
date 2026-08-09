@@ -8,12 +8,29 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
+/// A key-value store shared by every replica of a service.
+///
+/// `Duration::ZERO` as a `ttl` means **no expiry**, in every implementation.
 #[async_trait]
 pub trait DistributedStore: Send + Sync {
     async fn get(&self, key: &str) -> Result<Option<String>>;
     async fn set(&self, key: &str, value: &str, ttl: Duration) -> Result<()>;
     async fn incr(&self, key: &str, delta: u64) -> Result<u64>;
     async fn expire(&self, key: &str, ttl: Duration) -> Result<()>;
+
+    /// Remove a key. `Ok(true)` if it existed.
+    ///
+    /// Added for [`IsrCache`](crate::isr::IsrCache), which cannot express
+    /// invalidation without it — the reason ISR previously kept its own
+    /// process-local `HashMap` instead of using this trait.
+    async fn delete(&self, key: &str) -> Result<bool>;
+
+    /// Every live key starting with `prefix`.
+    ///
+    /// Required for prefix invalidation. Implementations must not block the
+    /// server while scanning: the Redis implementation uses `SCAN`, never
+    /// `KEYS`, which is O(n) over the whole keyspace and single-threaded.
+    async fn keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>>;
 }
 
 #[derive(Clone, Default)]
@@ -109,6 +126,26 @@ impl DistributedStore for MemoryStore {
         }
         Ok(())
     }
+
+    async fn delete(&self, key: &str) -> Result<bool> {
+        let mut guard = self.inner.write().await;
+        Ok(guard.remove(key).is_some())
+    }
+
+    async fn keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let now = Instant::now();
+        let guard = self.inner.read().await;
+
+        // Expired-but-not-yet-reaped entries are skipped: `get` treats them as
+        // absent, so listing them would report keys that cannot be read.
+        Ok(guard
+            .iter()
+            .filter(|(key, entry)| {
+                key.starts_with(prefix) && !entry.expires_at.map(|ts| now >= ts).unwrap_or(false)
+            })
+            .map(|(key, _)| key.clone())
+            .collect())
+    }
 }
 
 #[cfg(feature = "redis-store")]
@@ -150,8 +187,16 @@ impl DistributedStore for RedisStore {
         use redis::AsyncCommands;
 
         let mut conn = self.conn().await?;
-        let ttl_secs = ttl.as_secs().max(1);
-        conn.set_ex(key, value, ttl_secs)
+
+        // `Duration::ZERO` means no expiry. This previously went through
+        // `set_ex` with `.max(1)`, so a caller asking for a permanent entry got
+        // one that vanished after a second — which is what an ISR `Static`
+        // policy would have asked for.
+        if ttl.is_zero() {
+            return conn.set(key, value).await.context("redis SET failed");
+        }
+
+        conn.set_ex(key, value, ttl.as_secs().max(1))
             .await
             .context("redis SETEX failed")
     }
@@ -168,11 +213,81 @@ impl DistributedStore for RedisStore {
         use redis::AsyncCommands;
 
         let mut conn = self.conn().await?;
-        let ttl_secs = ttl.as_secs().max(1);
+
+        // Consistent with `set`: zero means "no expiry", which in Redis is
+        // PERSIST rather than an EXPIRE of 0 (that would delete the key).
+        if ttl.is_zero() {
+            let _: bool = conn.persist(key).await.context("redis PERSIST failed")?;
+            return Ok(());
+        }
+
         let _: bool = conn
-            .expire(key, ttl_secs as i64)
+            .expire(key, ttl.as_secs().max(1) as i64)
             .await
             .context("redis EXPIRE failed")?;
         Ok(())
     }
+
+    async fn delete(&self, key: &str) -> Result<bool> {
+        use redis::AsyncCommands;
+
+        let mut conn = self.conn().await?;
+        let removed: u64 = conn.del(key).await.context("redis DEL failed")?;
+        Ok(removed > 0)
+    }
+
+    async fn keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut conn = self.conn().await?;
+
+        // SCAN, not KEYS. `KEYS prefix*` is O(keyspace) and blocks the single
+        // Redis thread for its whole duration, so on a large keyspace it stalls
+        // every other client — including the ones serving requests.
+        let pattern = format!("{}*", escape_scan_glob(prefix));
+        let mut cursor: u64 = 0;
+        let mut keys = Vec::new();
+
+        loop {
+            let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(SCAN_BATCH)
+                .query_async(&mut conn)
+                .await
+                .context("redis SCAN failed")?;
+
+            keys.extend(batch);
+            cursor = next;
+            if cursor == 0 {
+                break;
+            }
+        }
+
+        // SCAN can return the same key more than once across iterations.
+        keys.sort_unstable();
+        keys.dedup();
+        Ok(keys)
+    }
+}
+
+/// Keys per `SCAN` round trip. A hint, not a limit.
+#[cfg(feature = "redis-store")]
+const SCAN_BATCH: usize = 512;
+
+/// Escape the glob metacharacters `SCAN MATCH` would otherwise interpret.
+///
+/// An ISR path is user-facing and can legitimately contain `*`, `?`, `[`, or
+/// `]`. Without escaping, invalidating the prefix `/blog/[draft]` would match
+/// paths that merely share one of those characters — silently over-invalidating.
+#[cfg(feature = "redis-store")]
+fn escape_scan_glob(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if matches!(ch, '*' | '?' | '[' | ']' | '\\') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }

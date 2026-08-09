@@ -17,14 +17,23 @@ functions.
 |---|---|
 | `rest` | Axum-based HTTP layer, JWT auth, tower middleware |
 | `graphql` | `async-graphql` integration |
-| `grpc` | gRPC status and metadata semantics (no transport — see note below) |
-| `db` | `sqlx` database access and migration governance |
+| `grpc-semantics` | gRPC status-code and timeout-header semantics for a gateway (no transport — see note below) |
+| `auth` | Argon2id password hashing and the `CredentialStore` trait |
+| `db-postgres` | `sqlx` Postgres access and the full migration governance surface |
+| `db-sqlite` | `sqlx` SQLite driver (migration governance does not apply) |
 | `redis-store` | Redis-backed distributed store |
 | `web` | WASM/browser bindings (`web-sys`, `js-sys`, `wasm-bindgen`) |
 
-> The `grpc` feature provides gRPC **status code and metadata semantics** for
-> protocol negotiation. It does not bundle a gRPC transport; bring your own
-> (`tonic`, etc.) if you need one.
+Deprecated aliases, removable no earlier than `0.3.0`: `grpc` →
+`grpc-semantics`, `db` → `db-postgres`.
+
+> **`grpc-semantics` is not gRPC.** It provides the canonical status codes and
+> `grpc-timeout` header parsing a **gateway** needs to map between HTTP and gRPC
+> — no transport, no codegen, no `.proto` handling, no client. `tonic` and
+> `prost` appear nowhere in this workspace. Bring your own transport if you need
+> one. The feature was called `grpc` until
+> [ADR 0007](https://github.com/krab-framework/krab/blob/main/docs/adr/0007-grpc-feature-disposition.md),
+> which is when the name stopped implying a capability the crate does not have.
 
 ## Usage
 

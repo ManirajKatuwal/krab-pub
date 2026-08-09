@@ -496,21 +496,24 @@ const HOME_REVALIDATE: Duration = Duration::from_secs(30);
 /// entries are returned immediately and re-rendered behind the response, and a
 /// miss renders and populates.
 async fn home_handler(State(state): State<AppState>) -> Html<String> {{
-    if let Some((cached, stale)) = state.isr_cache.serve("/") {{
+    // A cache failure degrades to a render; it never fails the request.
+    if let Ok(Some((cached, stale))) = state.isr_cache.serve("/").await {{
         if !stale {{
             return Html(cached);
         }}
         // Stale-while-revalidate: answer from cache, refresh for the next hit.
-        state
+        let _ = state
             .isr_cache
-            .put("/", render_home(), IsrPolicy::revalidate(HOME_REVALIDATE));
+            .put("/", render_home(), IsrPolicy::revalidate(HOME_REVALIDATE))
+            .await;
         return Html(cached);
     }}
 
     let html = render_home();
-    state
+    let _ = state
         .isr_cache
-        .put("/", html.clone(), IsrPolicy::revalidate(HOME_REVALIDATE));
+        .put("/", html.clone(), IsrPolicy::revalidate(HOME_REVALIDATE))
+        .await;
     Html(html)
 }}
 

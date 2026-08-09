@@ -124,11 +124,25 @@ async fn trigger_isr_revalidation(state: AppState, cache_key: String, path: Stri
 
     if let Some(html) = render_isr_path(&path) {
         if is_finalized_ssr_snapshot(&html) {
-            state.isr_cache.put(
-                &cache_key,
-                html,
-                IsrPolicy::revalidate(isr_revalidate_duration()),
-            );
+            // Background revalidation: nothing is waiting on this, so a store
+            // failure is logged and the stale entry stays until the next attempt.
+            if let Err(error) = state
+                .isr_cache
+                .put(
+                    &cache_key,
+                    html,
+                    IsrPolicy::revalidate(isr_revalidate_duration()),
+                )
+                .await
+            {
+                tracing::warn!(
+                    event = "isr_revalidation_write_failed",
+                    cache_key = %cache_key,
+                    http.route = %path,
+                    %error,
+                    "stale entry retained; will retry on the next request"
+                );
+            }
         } else {
             tracing::warn!(
                 event = "isr_revalidation_snapshot_skipped_non_finalized",
@@ -1144,8 +1158,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         adapter = users_contract_bundle.kind.as_str(),
     );
 
+    // ISR shares the runtime's store rather than keeping its own map, so with
+    // `KRAB_REDIS_URL` set every replica reads and invalidates the same
+    // entries. Without it this is a `MemoryStore` and behaves as before —
+    // correct for one process, not for several.
+    let runtime = RuntimeState::new();
+    let isr_cache = IsrCache::with_store(runtime.store.clone());
+
     let state = AppState {
-        runtime: RuntimeState::new(),
+        runtime,
         http_client: Client::builder().timeout(Duration::from_secs(2)).build()?,
         auth_base_url: auth_base_url.clone(),
         users_base_url: users_base_url.clone(),
@@ -1160,7 +1181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Duration::from_secs(60),
             )?)
         },
-        isr_cache: IsrCache::new(),
+        isr_cache,
         isr_revalidating: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         hmr_rx,
     };
@@ -2128,7 +2149,7 @@ mod tests {
         );
 
         assert!(
-            state.isr_cache.get("/").is_none(),
+            state.isr_cache.get("/").await.unwrap().is_none(),
             "oversized response should not be persisted in ISR cache"
         );
 

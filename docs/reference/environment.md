@@ -79,8 +79,8 @@ variable marked **secret** has them.
 | `KRAB_AUTH_ACCESS_TTL_SECS` | No | service default | Access-token lifetime issued by `service_auth` |
 | `KRAB_AUTH_REFRESH_TTL_SECS` | No | service default | Refresh-token lifetime issued by `service_auth` |
 | `KRAB_AUTH_BOOTSTRAP_USER` | No | — | Bootstrap account username for `service_auth` |
-| `KRAB_AUTH_BOOTSTRAP_PASSWORD` | No | — | **Secret.** Bootstrap account password |
-| `KRAB_AUTH_LOGIN_USERS_JSON` | No | — | **Secret.** JSON array of seeded login users |
+| `KRAB_AUTH_BOOTSTRAP_PASSWORD` | No | — | **Secret.** Bootstrap account password, as an Argon2id PHC hash. Plaintext is accepted in `dev`/`local` only and hashed at startup |
+| `KRAB_AUTH_LOGIN_USERS_JSON` | No | — | **Secret.** JSON object of `username` → Argon2id PHC hash. Generate entries with `krab auth hash-password --username <name>` |
 | `KRAB_SERVICE_AUTH_SCOPE` | No | `service:internal` | Scope required for service-to-service calls |
 | `KRAB_AUTH_BASE_URL` | No | `http://127.0.0.1:3001` | Auth service base URL for inter-service calls. Overridden by runtime topology when set |
 | `KRAB_USERS_BASE_URL` | No | `http://127.0.0.1:3002` | Users service base URL for inter-service calls. Overridden by runtime topology when set |
@@ -183,7 +183,7 @@ which are reachable and where they resolve. See
 | `KRAB_CACHE_NAMESPACE` | No | `default` | Cache key namespace. Change to isolate deployments sharing a Redis instance |
 | `KRAB_CACHE_MAX_BODY_BYTES` | No | `10485760` (10 MiB) | Largest cacheable response body, minimum `1024` |
 | `KRAB_DISTRIBUTED_CACHE_TTL_SECS` | No | `60` | Distributed cache TTL, clamped to `1`–`3600` |
-| `KRAB_REDIS_URL` | Conditional | — | Required by the `redis-store` feature and the distributed cache |
+| `KRAB_REDIS_URL` | Conditional | — | Required by the `redis-store` feature, the distributed cache, **and the ISR cache**. Without it, ISR falls back to a per-process store — see below |
 
 ## Build and tooling
 

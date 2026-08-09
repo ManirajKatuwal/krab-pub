@@ -25,7 +25,17 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "Cargo.toml"
 
-ALLOWED_ROOTS = ("crates/framework/", "crates/tooling/", "services/")
+# `examples/reference_apps/` holds vendored reference applications that are real
+# workspace members, compiled and tested by CI. They are `publish = false` and
+# are not framework surface, but they must be members — an example that is not
+# built is an example that rots, which is the state `examples/` was in before
+# `islands_rpc` (five directories, five READMEs, zero lines of Rust).
+ALLOWED_ROOTS = (
+    "crates/framework/",
+    "crates/tooling/",
+    "services/",
+    "examples/reference_apps/",
+)
 
 # Directories at the repository root that may exist without being crates.
 # Dot-directories (.git, .github, .cargo, .vscode, ...) are skipped generically.

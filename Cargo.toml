@@ -8,13 +8,13 @@ members = [
     "crates/framework/krab_macros",
     "crates/framework/krab_client",
     "crates/tooling/krab_cli",
-    "crates/framework/krab_server",
     "services/service_users_split",
+    "examples/reference_apps/islands_rpc",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "A full-stack rust web framework"
@@ -38,10 +38,9 @@ categories = ["web-programming", "wasm", "development-tools"]
 # NOTE: these entries are for *normal* dependencies only. `krab_core` and
 # `krab_macros` dev-depend on each other; see the comments at those two sites
 # for why those must stay path-only.
-krab_core = { version = "0.1.1", path = "crates/framework/krab_core" }
-krab_macros = { version = "0.1.1", path = "crates/framework/krab_macros" }
-krab_client = { version = "0.1.1", path = "crates/framework/krab_client" }
-krab_server = { version = "0.1.1", path = "crates/framework/krab_server" }
+krab_core = { version = "0.2.0", path = "crates/framework/krab_core" }
+krab_macros = { version = "0.2.0", path = "crates/framework/krab_macros" }
+krab_client = { version = "0.2.0", path = "crates/framework/krab_client" }
 
 axum = "=0.8.8"
 async-graphql = "=7.2.1"

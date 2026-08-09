@@ -1,0 +1,71 @@
+[package]
+name = "reference_app_islands_rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Krab reference application: SSR + islands + server functions, end to end"
+# A reference application, not a distributable crate. It exists to prove the
+# framework's headline features compile and work together, and CI builds it.
+publish = false
+
+[lib]
+# `cdylib` for `wasm-pack build`, `rlib` so the server binary and the
+# integration tests can link the same island and server-function definitions.
+# The point of the example is that both sides share one source of truth.
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "islands_rpc_server"
+path = "src/main.rs"
+
+[dependencies]
+krab_core = { workspace = true }
+krab_macros = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+# Server-side only. `rest` pulls axum, which does not build for wasm32, so the
+# native and browser dependency sets are declared separately rather than
+# feature-gated in one list.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+krab_core = { workspace = true, features = ["rest"] }
+axum = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Browser only.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+krab_core = { workspace = true, features = ["web"] }
+# `web` must be on: the hydration diagnostics the `#[island]` client half calls
+# are gated behind it.
+krab_client = { workspace = true, features = ["web"] }
+inventory = "0.3"
+wasm-bindgen = "0.2"
+# Island event handlers are synchronous closures, but `#[server]` functions are
+# async on the client. `spawn_local` is what bridges the two.
+wasm-bindgen-futures = "0.4"
+
+[dev-dependencies]
+tokio = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+http-body-util = { workspace = true }
+
+[features]
+default = []
+
+# Selects the browser half of `#[island]`: the hydrating implementation plus its
+# `inventory` registration. `#[server]` switches on `target_arch` instead, so it
+# needs no feature. Build the bundle with:
+#
+#     wasm-pack build examples/reference_apps/islands_rpc --target web -- --features web
+#
+# ONLY valid together with `--target wasm32-unknown-unknown`. `#[island]` selects
+# its client half on `feature = "web"` alone, but that half needs `krab_client`
+# and `inventory`, which are wasm32-only dependencies above. Enabling `web` for a
+# native build therefore does not compile — including via a workspace-wide
+# `cargo build --all-features`, which is why the `ops-hardening` gate runs
+# `--all-features` for `krab_core` specifically rather than the whole workspace.
+web = []

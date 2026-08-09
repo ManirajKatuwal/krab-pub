@@ -22,7 +22,6 @@ bytes = "1.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 krab_core = { workspace = true, features = ["rest", "redis-store"] }
 krab_client = { workspace = true }
-krab_server = { workspace = true }
 krab_macros = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

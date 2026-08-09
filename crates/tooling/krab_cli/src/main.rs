@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+mod auth_ops;
 mod dev_workflow;
 mod doctor;
 mod generator;
@@ -11,6 +12,7 @@ mod project_template;
 mod release_ops;
 mod topology;
 
+use crate::auth_ops::dispatch_auth_action;
 use crate::dev_workflow::{
     bootstrap_local_stack, build_project, dev_project, generate_docs, validate_environment,
     watch_project,
@@ -128,6 +130,11 @@ enum Commands {
         #[command(subcommand)]
         action: SecurityAction,
     },
+    /// Authentication operator tooling
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
     /// Release pipeline pre-flight checks
     Release {
         #[command(subcommand)]
@@ -211,6 +218,25 @@ enum SecurityAction {
         /// Emit richer command diagnostics
         #[arg(long)]
         diagnostics: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthAction {
+    /// Hash a password with Argon2id for KRAB_AUTH_LOGIN_USERS_JSON
+    ///
+    /// Prints a PHC string to stdout. Outside `local` environments the auth
+    /// service refuses to start on any credential that is not one of these.
+    HashPassword {
+        /// The password to hash.
+        ///
+        /// Prefer omitting this and piping on stdin — an argument is visible in
+        /// the process list and shell history to every user on the machine.
+        #[arg(long, value_name = "PASSWORD")]
+        password: Option<String>,
+        /// Emit a ready-to-paste JSON credential map entry for this username
+        #[arg(long, value_name = "USERNAME")]
+        username: Option<String>,
     },
 }
 
@@ -387,6 +413,7 @@ fn dispatch_command(command: &Commands) -> Result<()> {
         Commands::Contract { action } => dispatch_contract_action(action)?,
         Commands::Db { action } => dispatch_db_action(action)?,
         Commands::Security { action } => dispatch_security_action(action)?,
+        Commands::Auth { action } => dispatch_auth_action(action)?,
         Commands::Release { action } => dispatch_release_action(action)?,
         Commands::Doctor {
             diagnostics,

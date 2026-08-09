@@ -16,14 +16,196 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ## [Unreleased]
 
-Covers work merged after `0.1.1` (2026-03-11) through commit `bac72c5`
-(2026-06-10). Not yet released or version-tagged.
+Nothing yet.
+
+---
+
+## [0.2.0] — unreleased, prepared
+
+Covers all work merged after `0.1.1` (2026-03-11).
+
+> **Why `0.2.0` and not `0.1.2`.** This release contains breaking changes:
+> `IsrCache` became async, `DistributedStore` gained required methods,
+> `IsrEntry::generated_at` changed type, `ProtocolKind::parse("grpc")` stopped
+> resolving, the credential format changed, and `krab_server` was removed. Under
+> Cargo's semver rules a pre-`1.0` crate uses the **minor** field as its
+> compatibility boundary — `0.1` and `0.2` are incompatible, `0.1.1` and `0.1.2`
+> are not. Shipping this as a patch would break every downstream `^0.1` build
+> without a version bump to signal it.
+>
+> The previous cutoff line pinned a commit (`bac72c5`) and went stale twice as
+> work landed on top of it, silently: the entries below were current while the
+> header claimed they could not exist.
+
+### Security
+
+- **Login passwords are verified as Argon2id hashes, not compared as plaintext.**
+  `service_auth` resolved an expected password from `KRAB_AUTH_LOGIN_USERS_JSON`
+  — a plaintext `username -> password` JSON map — and compared it with `!=`.
+  That stored the secret in the clear and short-circuited on the first differing
+  byte. Verification now runs through the new
+  `krab_core::credentials::CredentialStore` trait against a stored PHC-format
+  Argon2id hash (RFC 9106 defaults: `m=19456, t=2, p=1`), and an unknown
+  username is verified against a fixed dummy hash so it costs the same as a
+  wrong password rather than enumerating valid users by response time.
+
+  **Breaking, operator-facing.** `KRAB_AUTH_LOGIN_USERS_JSON` and
+  `KRAB_AUTH_BOOTSTRAP_PASSWORD` now hold Argon2id PHC hashes. Outside
+  `dev`/`local`, startup rejects any other value — including one sourced
+  correctly through `*_FILE` or `*_VAULT_REF`, because correct sourcing of a
+  plaintext secret is still a plaintext secret. `dev`/`local` accept a plaintext
+  value and hash it once at startup, so local development is unaffected. No
+  deprecation window is offered; see
+  [`docs/guides/migration_guide.md`](docs/guides/migration_guide.md).
+
+- **The ISR cache was process-local, and therefore wrong under replicas.**
+  `IsrCache` stored pages in an `Arc<RwLock<HashMap<..>>>` while
+  `krab_core::store::DistributedStore` — with a working `RedisStore`
+  implementation — sat unused beside it. Running more than one instance meant
+  each kept its own divergent copy, and `invalidate_prefix` cleared exactly one
+  of them, so a client refreshing a page got old or new content depending on
+  which replica answered. `IsrCache` is now generic over `DistributedStore`, and
+  `service_frontend` builds it from the same env-configured store the
+  distributed cache already used, so setting `KRAB_REDIS_URL` is enough.
+
+  **Breaking.** Every `IsrCache` method is now `async` and returns
+  `anyhow::Result`, because a shared store can fail where a `HashMap` could not.
+  `IsrEntry::generated_at` changed from `Instant` to `SystemTime` — an `Instant`
+  is only meaningful in the process that created it and cannot survive a round
+  trip through a store. `IsrCache::new()` still gives per-process behaviour and
+  is documented as single-replica only; use `IsrCache::with_store` otherwise.
+
+- **`DistributedStore` gained `delete` and `keys_with_prefix`.** Invalidation
+  could not be expressed without them, which is why ISR had its own map in the
+  first place. **Breaking** for anyone who implemented the trait. The Redis
+  implementation uses `SCAN`, never `KEYS`, and escapes glob metacharacters in
+  the prefix so a path containing `*` or `[` cannot over-invalidate.
+
+- **`RedisStore` expired entries that asked not to expire.** `set` routed a
+  `Duration::ZERO` TTL through `SETEX` with `.max(1)`, so a caller requesting a
+  permanent entry got one that vanished after a second — which is exactly what
+  an ISR `Static` policy asks for. Zero now means `SET` with no expiry, and
+  `expire(.., ZERO)` issues `PERSIST` rather than an `EXPIRE 0` that would
+  delete the key.
+
+- **Generated split-topology projects shipped a test that could not fail.**
+  `krab topology split` emitted an assertion that a literal array contained a
+  literal it had just been built from. It reported green forever under a name
+  claiming local-vs-remote contract coverage — worse than no test, because it
+  answered the question before anyone asked it. It is now `#[ignore]`d with a
+  reason, panics if run anyway, and carries a worked example of what real
+  coverage looks like. Two tests in `krab_cli` guard against the tautology
+  returning.
+
+### Removed
+
+- **`krab_server` is deleted.** 502 lines that never handled a request: the
+  workspace contained zero `use krab_server` sites, and
+  `service_frontend/build.rs` has always generated `axum::Router` registration.
+  It also had no HTTP method routing — a `GET` and a `POST` to one path were
+  indistinguishable — and a trie that did not backtrack, so a request for `/a/c`
+  returned 404 against a registered `/:x/c`. Axum is now the stated SSR
+  foundation, which is what it had always been in practice. Its static-path
+  traversal defence was ported to `krab_core::static_assets` (behind `rest`)
+  **before** the deletion, with its original tests plus four new cases, and both
+  routing defects are now pinned by regression tests in `service_frontend`. See
+  [ADR 0005](docs/adr/0005-krab-server-disposition.md). The crate was never
+  published, so no consumer is affected.
+
+### Changed
+
+- **The `grpc` feature and `krab_core::grpc` are renamed to `grpc-semantics`
+  and `krab_core::grpc_semantics`.** The feature enabled zero dependencies and
+  the module is 159 lines of status codes and `grpc-timeout` header parsing —
+  gateway vocabulary, not a transport. `tonic` and `prost` appear nowhere in the
+  workspace. The old names are kept as deprecated aliases for one minor version
+  and are removable no earlier than `0.3.0`. See
+  [ADR 0007](docs/adr/0007-grpc-feature-disposition.md).
+- **`ProtocolKind::parse("grpc")` now returns `None` instead of
+  `Some(ProtocolKind::Rpc)`.** A service configured with
+  `KRAB_PROTOCOL_ENABLED=grpc` previously started, exposed Krab's
+  JSON-over-HTTP RPC, and reported itself as satisfying a gRPC requirement it
+  cannot satisfy. Configuration validation now fails instead. **Breaking** for
+  anyone using that spelling; use `rpc`.
+
+### Fixed
+
+- **The client half of `#[server]` had never compiled.**
+  `krab_core::server_fn` was gated behind `rest`, a server-only feature that
+  pulls axum, so `call_server_fn` — which the macro's wasm32 stub calls — did
+  not exist in a browser build. The module's own internals already branched on
+  `not(feature = "rest")` and `target_arch = "wasm32"`, so it was written to work
+  without `rest`; the module declaration made that code unreachable. It is now
+  available under `rest` **or** `web`. Lifting the gate also exposed
+  `ServerFnRegistration` being defined twice with `rest` off, and missing
+  `wasm-bindgen-futures` and `web-sys` features for the fetch path. All fixed;
+  the browser build is now compiled and linted in CI by the new
+  [`reference-app`](.github/workflows/reference-app.yaml) gate.
+- **`service_users` asserted a database default the framework no longer has.**
+  Promoting SQLite into `krab_core` moved the `KRAB_DB_DRIVER` default from
+  SQLite to Postgres — deliberately, since a production service silently
+  falling back to a local SQLite file is worse than one that refuses to start —
+  but two `service_users` tests still asserted the old default, leaving
+  `cargo test --workspace` red on `main`. The tests now assert the framework
+  default and set the driver explicitly where they need SQLite.
 
 ### Added
 
+- **A client-side router** in `krab_client::router`. Krab renders on the server
+  and hydrates islands, but every in-app link was a full document request, which
+  discarded hydrated island state, scroll position, and the warm WASM module.
+  `router::start()` intercepts same-origin anchor clicks, fetches the
+  destination, swaps the contents of the element marked
+  `data-krab-router-outlet`, updates history, and re-hydrates.
+
+  The interception rules are a pure function (`should_intercept`) with 16 tests,
+  because this is where client routers go subtly wrong: ctrl-click, middle-click,
+  `target="_blank"`, `download`, cross-origin, and already-handled events are all
+  left to the browser. Every failure path — no outlet in either document, a
+  non-OK response, an offline network — falls back to a normal navigation rather
+  than a blank page.
+
+  **Deliberately not included:** nested layouts, prefetch, and a client-side
+  route table. The server stays authoritative for routing, so SSR, ISR, and
+  render policy are not duplicated in two places. See the module docs.
+
+- **A browser test harness for the hydration runtime**
+  (`crates/framework/krab_client/tests/hydration_browser.rs`, run by the new
+  `client-browser-tests` CI job via `wasm-pack test --headless --chrome`).
+  `cargo test --workspace` compiles `krab_client` for the host, where there is
+  no `document`, so it could only ever reach the pure planning functions — every
+  DOM-mutating path had no test at all, and a hydration defect surfaces as a
+  subtly wrong DOM in a user's browser rather than a red build. Seven tests
+  cover node reuse, mismatch patching and counting, unregistered islands,
+  malformed props not aborting sibling islands, idempotency, and removal of
+  stale server-rendered children.
+
+- **A vendored reference application** at
+  [`examples/reference_apps/islands_rpc/`](examples/reference_apps/islands_rpc/):
+  one page, built entirely with `view!`, rendering two `#[island]` components
+  with distinct props, one of which calls a `#[server]` function from its click
+  handler. `#[island]` and `#[server]` previously had **zero** usages outside
+  the framework's own tests and documentation, so nothing demonstrated that SSR,
+  hydration, and RPC worked together — and building the first real consumer is
+  what surfaced the `server_fn` gating bug above. It is a workspace member; CI
+  builds, tests, and lints it on both the native and `wasm32` targets and builds
+  its WASM bundle.
+- **[`docs/guides/getting_started.md`](docs/guides/getting_started.md)** —
+  install, scaffold, first page, first island, first server function. The
+  documentation set had 29 files and no file matching `*start*`, `*quick*`, or
+  `*tutorial*`; nothing covered building your own application.
+- **`krab_core` gained an `auth` feature** providing
+  `credentials::CredentialStore`, `EnvHashCredentialStore`, `hash_password`,
+  `verify_password`, and `is_valid_password_hash`. Off by default, so a consumer
+  that issues no passwords compiles no KDF.
+- **`krab auth hash-password`** generates credentials in the format the auth
+  service verifies. Reads the password from stdin by default so it stays out of
+  the process list and shell history; `--username <name>` emits a ready-to-paste
+  single-entry JSON map. Previously the only documented credential format was
+  plaintext, so there was nothing to generate.
 - **The workspace is publishable.** Every inter-crate dependency now carries a
   `version` alongside its `path`, declared once in `[workspace.dependencies]`.
-  Previously all six framework and tooling crates were path-only and
+  Previously every framework and tooling crate was path-only and
   `cargo publish` rejected them outright, so Krab was consumable only by cloning
   this repository. `cargo publish --workspace --dry-run` now exits 0 and is
   enforced by the `publish-dry-run` job in `ops-hardening`. Publication order
@@ -119,8 +301,10 @@ Covers work merged after `0.1.1` (2026-03-11) through commit `bac72c5`
   `.claude/skills/`.
 - **Documentation indexes**: `docs/README.md` (public documentation map) and
   `internal/README.md` (internal boundary and generated-artifact map).
-- **Per-crate `README.md` for all six publishable crates** — `krab_core`,
-  `krab_client`, `krab_macros`, `krab_server`, `krab_cli`, `krab_orchestrator`.
+- **Per-crate `README.md` for every publishable crate** — `krab_core`,
+  `krab_client`, `krab_macros`, `krab_cli`, `krab_orchestrator`. (`krab_server`
+  also got one; it is removed later in this same unreleased cycle, so five
+  crates ship rather than six.)
 - **crates.io publish metadata** on those crates: `description`, `keywords`,
   `categories`, `documentation`, and `readme`. `krab_cli` and
   `krab_orchestrator` previously carried no description at all, which blocks

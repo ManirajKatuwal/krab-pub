@@ -33,6 +33,8 @@ pub use krab_core::signal::*;
 pub mod components;
 pub use components::*;
 
+pub mod router;
+
 // Function type for creating a component from JSON props
 pub type ComponentFactory = fn(props_json: String) -> Node;
 

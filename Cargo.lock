@@ -107,6 +107,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "argon2"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
+dependencies = [
+ "base64ct",
+ "blake2",
+ "cpufeatures 0.2.17",
+ "password-hash",
+]
+
+[[package]]
 name = "arraydeque"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -370,6 +382,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake2"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+dependencies = [
+ "digest",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -398,6 +419,12 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "cast"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 
 [[package]]
 name = "cc"
@@ -1630,7 +1657,7 @@ dependencies = [
 
 [[package]]
 name = "krab_cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1643,7 +1670,7 @@ dependencies = [
 
 [[package]]
 name = "krab_client"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "inventory",
  "js-sys",
@@ -1652,14 +1679,17 @@ dependencies = [
  "serde",
  "serde_json",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
  "web-sys",
 ]
 
 [[package]]
 name = "krab_core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
+ "argon2",
  "async-graphql",
  "async-trait",
  "axum",
@@ -1667,6 +1697,7 @@ dependencies = [
  "js-sys",
  "jsonwebtoken",
  "krab_macros",
+ "mime_guess",
  "redis",
  "reqwest",
  "serde",
@@ -1674,18 +1705,20 @@ dependencies = [
  "serial_test",
  "sqlx",
  "tokio",
+ "tokio-test",
  "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
  "uuid",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 
 [[package]]
 name = "krab_macros"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "axum",
  "krab_core",
@@ -1699,7 +1732,7 @@ dependencies = [
 
 [[package]]
 name = "krab_orchestrator"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "config",
@@ -1711,24 +1744,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "krab_server"
-version = "0.1.1"
-dependencies = [
- "bytes",
- "http-body-util",
- "hyper",
- "hyper-util",
- "krab_core",
- "mime_guess",
- "serde",
- "serde_json",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
 ]
 
 [[package]]
@@ -1859,6 +1874,16 @@ checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
 dependencies = [
  "mime",
  "unicase",
+]
+
+[[package]]
+name = "minicov"
+version = "0.3.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4869b6a491569605d66d3952bcdf03df789e5b536e5f0cf7758a7f08a55ae24d"
+dependencies = [
+ "cc",
+ "walkdir",
 ]
 
 [[package]]
@@ -2057,6 +2082,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "oorandom"
+version = "11.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
+
+[[package]]
 name = "ordered-multimap"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2093,6 +2124,17 @@ dependencies = [
  "redox_syscall 0.5.18",
  "smallvec",
  "windows-link",
+]
+
+[[package]]
+name = "password-hash"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
+dependencies = [
+ "base64ct",
+ "rand_core 0.6.4",
+ "subtle",
 ]
 
 [[package]]
@@ -2485,6 +2527,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "reference_app_islands_rpc"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "http-body-util",
+ "inventory",
+ "krab_client",
+ "krab_core",
+ "krab_macros",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+]
+
+[[package]]
 name = "regex"
 version = "1.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2805,7 +2868,7 @@ dependencies = [
 
 [[package]]
 name = "service_auth"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2824,7 +2887,7 @@ dependencies = [
 
 [[package]]
 name = "service_frontend"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2837,7 +2900,6 @@ dependencies = [
  "krab_client",
  "krab_core",
  "krab_macros",
- "krab_server",
  "reqwest",
  "serde",
  "serde_json",
@@ -2852,7 +2914,7 @@ dependencies = [
 
 [[package]]
 name = "service_users"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-graphql",
@@ -2872,7 +2934,7 @@ dependencies = [
 
 [[package]]
 name = "service_users_split"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-graphql",
@@ -3503,6 +3565,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-test"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6d24790a10a7af737693a3e8f1d03faef7e6ca0cc99aae5066f533766de545"
+dependencies = [
+ "futures-core",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "tokio-tungstenite"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4025,6 +4098,45 @@ checksum = "75a326b8c223ee17883a4251907455a2431acc2791c98c26279376490c378c16"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "wasm-bindgen-test"
+version = "0.3.64"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6311c867385cc7d5602463b31825d454d0837a3aba7cdb5e56d5201792a3f7fe"
+dependencies = [
+ "async-trait",
+ "cast",
+ "js-sys",
+ "libm",
+ "minicov",
+ "nu-ansi-term",
+ "num-traits",
+ "oorandom",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test-macro",
+ "wasm-bindgen-test-shared",
+]
+
+[[package]]
+name = "wasm-bindgen-test-macro"
+version = "0.3.64"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67008cdde4769831958536b0f11b3bdd0380bde882be17fff9c2f34bb4549abd"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "wasm-bindgen-test-shared"
+version = "0.2.114"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfe29135b180b72b04c74aa97b2b4a2ef275161eff9a6c7955ea9eaedc7e1d4e"
 
 [[package]]
 name = "wasm-encoder"

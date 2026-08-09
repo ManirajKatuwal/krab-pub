@@ -29,7 +29,6 @@ crates/framework/
                     signal, protocol, render_policy, isr, i18n, ws, server_fn
   krab_macros/      Proc macros: view!, #[island], #[server]  (+ trybuild tests)
   krab_client/      WASM island hydration runtime (browser)
-  krab_server/      Hyper/Tower server foundations
 crates/tooling/
   krab_cli/         `krab` CLI: dev workflow, generators, governance, release ops
   krab_orchestrator/ Multi-process service runner driven by krab.toml
@@ -49,8 +48,8 @@ Supporting directories:
 | [scripts/](scripts/) | Python NFT/benchmark/evidence tooling, `check_health.ps1` | Yes |
 | [monitoring/](monitoring/) | Prometheus config, alert rules, Grafana dashboard | Yes |
 | [docker/](docker/) | Postgres init scripts, rendered NFT compose | Yes |
-| [examples/](examples/) | Reference application tracks | Yes |
-| [.github/workflows/](.github/workflows/) | 12 CI gate workflows | Yes |
+| [examples/](examples/) | One vendored reference app (`islands_rpc`, a workspace member) plus five generated-track READMEs | Yes |
+| [.github/workflows/](.github/workflows/) | 14 CI gate workflows | Yes |
 | `internal/` | Plans, audits, evidence, wiki, reports | **No — gitignored** |
 
 ### The `internal/` boundary
@@ -77,7 +76,7 @@ Public documentation is organised by purpose:
 
 | Directory | Holds | Examples |
 |---|---|---|
-| [docs/guides/](docs/guides/) | Task-oriented walkthroughs | `ide_setup.md`, `migration_guide.md`, `dev_workflow.md`, `reference_apps.md`, `why_krab.md` |
+| [docs/guides/](docs/guides/) | Task-oriented walkthroughs | `getting_started.md`, `ide_setup.md`, `migration_guide.md`, `dev_workflow.md`, `reference_apps.md`, `why_krab.md` |
 | [docs/reference/](docs/reference/) | Lookup material | `api.md`, `environment.md`, `database.md`, `security.md`, `deployment.md`, `server_functions.md` |
 | [docs/architecture/](docs/architecture/) | How and why it is built | `vision.md`, `design.md`, `hydration.md`, `render_policy.md`, `service_composition.md`, `signal_safety.md`, `protocol_flexibility.md` |
 | [docs/operations/](docs/operations/) | Running it in production | `oncall_playbook.md`, `db_rollback_runbook.md`, `slo_alerts.md`, `api_governance.md`, `production_readiness.md` |
@@ -149,8 +148,14 @@ cargo test -p krab_core --all-features
 cargo test -p krab_macros            # trybuild compile-fail suite
 ```
 
-Features: `rest`, `graphql`, `grpc`, `db-postgres`, `db-sqlite`, `redis-store`,
-`web` (wasm). `db` is a deprecated alias for `db-postgres`.
+Features: `rest`, `graphql`, `grpc-semantics`, `auth`, `db-postgres`,
+`db-sqlite`, `redis-store`, `web` (wasm). Deprecated aliases: `db` →
+`db-postgres`, `grpc` → `grpc-semantics`.
+
+`grpc-semantics` is **not** a gRPC transport — it is status-code and
+`grpc-timeout` header vocabulary for a gateway. `tonic`/`prost` are not
+dependencies and `ProtocolKind::parse("grpc")` returns `None`. See
+[ADR 0007](docs/adr/0007-grpc-feature-disposition.md).
 
 ### WASM client
 
@@ -201,6 +206,7 @@ violations.
 |---|---|
 | [ops-hardening.yaml](.github/workflows/ops-hardening.yaml) | workspace layout, inter-crate version pinning, fmt, clippy `-D warnings`, rustdoc, `cargo-deny`, on-call delivery path, publish dry-run, release certify |
 | [generated-project.yaml](.github/workflows/generated-project.yaml) | `krab new` output builds, tests, clippy `-D warnings`, `fmt --check` — all four templates |
+| [reference-app.yaml](.github/workflows/reference-app.yaml) | `examples/reference_apps/islands_rpc` builds, tests, and lints on native **and** `wasm32`, and its WASM bundle is produced |
 | [dependency-security.yaml](.github/workflows/dependency-security.yaml) | `cargo-audit`, SBOM |
 | [api-contract.yaml](.github/workflows/api-contract.yaml) | contract check, protocol parity, protocol matrix |
 | [db-lifecycle.yaml](.github/workflows/db-lifecycle.yaml) | migration lifecycle, rollback sim, drift, rehearsal evidence |
@@ -223,8 +229,11 @@ violations.
   `internal/plans/memory_notes.md`.
 - **`service_frontend/build.rs` generates route registration** from
   `src/routes/*.rs`. Generated route handlers must be `async fn` returning
-  `String` or `impl IntoResponse`, and their signature must match
-  `Router::add_route`.
+  `String` or `impl IntoResponse`, and their signature must satisfy
+  `axum::routing::get`. (This said `Router::add_route` — a method on the removed
+  `krab_server` crate — from the day it was written. `build.rs` has always
+  emitted `axum::Router` registration. See
+  [ADR 0005](docs/adr/0005-krab-server-disposition.md).)
 - **Feature gating is real.** A `cargo test -p krab_core` with no features
   compiles a much smaller surface than CI runs. Always match the feature set the
   gate uses before claiming a test passes.

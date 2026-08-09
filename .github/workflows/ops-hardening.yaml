@@ -9,7 +9,6 @@ on:
       - 'crates/framework/krab_core/**'
       - 'crates/framework/krab_macros/**'
       - 'crates/tooling/krab_cli/**'
-      - 'crates/framework/krab_server/**'
       - 'crates/tooling/krab_orchestrator/**'
       - 'services/service_auth/**'
       - 'services/service_users/**'
@@ -59,8 +58,9 @@ jobs:
       # Deliberately NOT `--workspace --all-features`: that would enable
       # service_frontend's `nft` feature, whose latency assertions (6ms p95)
       # are only meaningful on the dedicated runners in nft.yaml. krab_core has
-      # no such feature, and this is the only way its `grpc` and `web` code
-      # paths get compiled at all — no workspace member enables them.
+      # no such feature, and this is the only way its `grpc-semantics`, `auth`,
+      # and `web` code paths get compiled at all — no workspace member enables
+      # every one of them.
       - name: krab_core tests (all features)
         run: cargo test -p krab_core --all-features
 
@@ -95,7 +95,7 @@ jobs:
   # `--workspace` rather than six per-crate runs: sibling crates are not on
   # crates.io yet, so a per-crate `--dry-run` fails with "no matching package
   # named `krab_core`". The workspace form resolves siblings against the locally
-  # packaged versions and verifies all six together, in dependency order.
+  # packaged versions and verifies them all together, in dependency order.
   publish-dry-run:
     runs-on: ubuntu-latest
     steps:

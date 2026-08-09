@@ -553,13 +553,19 @@ mod tests {
             .contains("supported values are postgres|sqlite"));
     }
 
+    /// Driver selection moved into `krab_core::db` and the default moved with
+    /// it — from SQLite to Postgres. That is deliberate: a production service
+    /// silently falling back to a local SQLite file because `KRAB_DB_DRIVER`
+    /// was unset is a worse failure than one that refuses to start. This
+    /// service is a consumer of that decision, so it asserts the framework
+    /// default rather than the demo default it used to carry.
     #[tokio::test]
-    async fn contract_resolve_db_driver_defaults_to_sqlite_when_env_is_unset() {
+    async fn contract_resolve_db_driver_defaults_to_postgres_when_env_is_unset() {
         let _env_guard = env_lock().lock().await;
         let _saved_env = TestEnvGuard::capture(BOOTSTRAP_ENV_VARS);
         clear_bootstrap_env();
 
-        assert!(matches!(resolve_db_driver(), Ok(DbDriver::Sqlite)));
+        assert!(matches!(resolve_db_driver(), Ok(DbDriver::Postgres)));
     }
 
     #[tokio::test]
@@ -575,13 +581,18 @@ mod tests {
         assert!(matches!(resolve_db_driver(), Ok(DbDriver::Sqlite)));
     }
 
+    /// Pins the *protocol* defaults, which is what this test is actually for.
+    /// `KRAB_DB_DRIVER` is now set explicitly: since the framework default
+    /// became Postgres, leaving it unset would make this test attempt a real
+    /// Postgres connection and fail on DNS rather than on anything it asserts.
     #[tokio::test]
-    async fn startup_bootstrap_users_service_defaults_to_sqlite_driver_and_legacy_protocols() {
+    async fn startup_bootstrap_users_service_defaults_to_legacy_protocols_on_sqlite() {
         let _env_guard = env_lock().lock().await;
         let _saved_env = TestEnvGuard::capture(BOOTSTRAP_ENV_VARS);
         clear_bootstrap_env();
 
         std::env::set_var("KRAB_ENVIRONMENT", "dev");
+        std::env::set_var("KRAB_DB_DRIVER", "sqlite");
         std::env::set_var("DB_MAX_CONNECTIONS", "1");
         std::env::set_var("DB_MIN_CONNECTIONS", "1");
         let (database_url, sqlite_path) = bootstrap_sqlite_database_url("startup_default");
@@ -589,7 +600,7 @@ mod tests {
 
         let service = bootstrap_users_service()
             .await
-            .expect("default startup should succeed with sqlite");
+            .expect("startup should succeed with an explicit sqlite driver");
 
         assert_eq!(service.config.name, "users");
         assert_eq!(service.config.host, "127.0.0.1");

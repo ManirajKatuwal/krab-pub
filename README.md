@@ -14,14 +14,30 @@ Krab also includes built-in service composition for frontend, authentication, an
 
 ### Why Krab over alternatives?
 
-| Concern                     | Axum / Actix | Leptos / Dioxus | Next.js      | **Krab**                                                     |
-| --------------------------- | ------------ | --------------- | ------------ | ------------------------------------------------------------ |
-| SSR + Islands               | Manual       | Full WASM SPA   | JS-based ISR | Native Rust SSR with selective WASM hydration                |
-| Multi-service orchestration | DIY          | Not included    | Not included | Built-in orchestrator and service composition                |
-| Migration governance        | DIY          | DIY             | DIY          | Checksum validation, drift detection, and rollback rehearsal |
-| Dependency security         | DIY          | DIY             | npm audit    | `cargo-deny` CI gates for advisories, licenses, and bans     |
-| Secret management           | DIY          | DIY             | DIY          | `*_FILE` and vault-reference sourcing in production          |
-| Telemetry and SLOs          | DIY          | DIY             | DIY          | Prometheus metrics, RED/USE taxonomy, and burn-rate alerts   |
+The honest comparison is not against Next.js — a framework that never claimed to
+own your migrations — but against **what you would otherwise assemble yourself**:
+Axum, plus `sqlx`, plus `cargo-deny`, plus a Makefile and some CI YAML. Krab's
+claim is that this stack is worth having pre-wired and gated, not that the
+alternatives forgot to build it.
+
+| Concern | Assembled yourself (Axum + sqlx + cargo-deny + CI) | **Krab** |
+| --- | --- | --- |
+| SSR + islands | Hand-rolled, or adopt Leptos/Dioxus and accept their model | Built in, with selective WASM hydration |
+| Multi-service orchestration | Write a process runner, or use `docker compose` | `krab.toml` and a supervised orchestrator |
+| Migration governance | `sqlx migrate` + your own rollback discipline | Checksum validation, drift detection, rollback rehearsal, promotion policy |
+| Dependency security | `cargo-deny` you configure and wire into CI | Pre-wired gate, no `ignore` list, one documented exception |
+| Secret management | Read env vars; enforce `*_FILE` yourself | `read_env_or_file()`, with inline secrets rejected at startup outside `local` |
+| Telemetry and SLOs | `tracing` + your own metric names | OTel-aligned field keys, RED/USE taxonomy, burn-rate alerts |
+| Release evidence | Whatever you remember to capture | `krab release certify` bundles |
+
+**Where the alternatives are ahead.** Leptos and Dioxus have far richer
+reactivity, and their routers do nested layouts and client-side route tables;
+Krab's router ([`krab_client::router`](crates/framework/krab_client/src/router.rs))
+does same-origin navigation with one outlet and leaves routing authority on the
+server. Krab's signal system is ~330 lines and is scoped to islands, not to
+whole-application reactivity. Next.js has an ecosystem Krab will not match. If
+your application is a rich SPA, those are the better tools today. Krab's case is
+the server-first application that has to be *operated*.
 
 ---
 
@@ -32,14 +48,13 @@ Krab also includes built-in service composition for frontend, authentication, an
 > has not been cut. Until it is, use the path-dependency form below. Publication
 > preconditions and ordering are in [RELEASE_POLICY.md](RELEASE_POLICY.md).
 
-Krab is six crates. Most applications need two:
+Krab is five crates. Most applications need two:
 
 | Crate | Purpose |
 |---|---|
 | [`krab_core`](crates/framework/krab_core/) | Runtime: config, HTTP, database, telemetry, signals, protocol |
 | [`krab_macros`](crates/framework/krab_macros/) | `view!`, `#[island]`, `#[server]` |
 | [`krab_client`](crates/framework/krab_client/) | WASM island hydration, for the browser bundle |
-| [`krab_server`](crates/framework/krab_server/) | Hyper/Tower server foundations |
 | [`krab_cli`](crates/tooling/krab_cli/) | The `krab` binary: scaffolding, dev workflow, governance |
 | [`krab_orchestrator`](crates/tooling/krab_orchestrator/) | Multi-process service runner driven by `krab.toml` |
 
@@ -56,7 +71,11 @@ cargo add krab_macros
 ```
 
 `krab_core` ships **no default features**. Pick what you need: `rest`,
-`graphql`, `grpc`, `db`, `redis-store`, `web`.
+`graphql`, `grpc-semantics`, `auth`, `db-postgres`, `db-sqlite`, `redis-store`,
+`web`.
+
+New to Krab? Start with **[docs/guides/getting_started.md](docs/guides/getting_started.md)**
+— install, scaffold, first page, first island, first server function.
 
 ### Install the CLI
 
@@ -130,10 +149,10 @@ Krab follows a server-first, client-opt-in architecture organized as a Cargo wor
 ├────────────┴─────────────────┴────────────────────────────┤
 │                        krab_core                          │
 │  config · http · db · telemetry · resilience · signal     │
-├──────────────────┬────────────────────────────────────────┤
-│   krab_macros    │  krab_server  │  krab_client (WASM)    │
-│ (view!, #[island])│ (Hyper/Tower) │ (Island hydration)    │
-├──────────────────┴────────────────────────────────────────┤
+├───────────────────────────┬───────────────────────────────┤
+│        krab_macros        │      krab_client (WASM)       │
+│   (view!, #[island])      │      (Island hydration)       │
+├───────────────────────────┴───────────────────────────────┤
 │                      krab_cli                             │
 │            (dev tooling, env-check, bootstrap)            │
 └──────────────────────────────────────────────────────────┘
@@ -146,7 +165,6 @@ Krab follows a server-first, client-opt-in architecture organized as a Cargo wor
 | [`krab_core`](crates/framework/krab_core)               | Shared config, HTTP middleware, resilience, telemetry, DB governance, and signal system |
 | [`krab_macros`](crates/framework/krab_macros)           | Procedural macros (`view!`, `#[island]`)                                                |
 | [`krab_client`](crates/framework/krab_client)           | WASM runtime for island hydration (browser)                                             |
-| [`krab_server`](crates/framework/krab_server)           | Hyper/Tower server foundations                                                          |
 | [`service_auth`](services/service_auth)                 | Authentication service (REST — JWT/OIDC token issuance)                                 |
 | [`service_users`](services/service_users)               | Users service (GraphQL + PostgreSQL/SQLite)                                             |
 | [`service_frontend`](services/service_frontend)         | SSR frontend service with island hydration                                              |

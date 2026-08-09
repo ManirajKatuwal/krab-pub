@@ -2,11 +2,16 @@
 
 ## Status
 
-**Proposed** — awaiting owner acceptance.
+**Accepted** — 2026-08-08, by the repository owner. Implemented in the same
+change.
 
-Renaming a public Cargo feature is a breaking change under
-[`RELEASE_POLICY.md`](../../RELEASE_POLICY.md), so it is staged behind
-acceptance even though no consumer can currently be affected.
+One thing was found during implementation that this ADR did not anticipate:
+`ProtocolKind::parse` accepted `"grpc"` and returned `Rpc`. A service configured
+with `KRAB_PROTOCOL_ENABLED=grpc` therefore started successfully, exposed Krab's
+JSON-over-HTTP RPC, and reported itself as satisfying a gRPC requirement. That
+alias is removed — the value is now rejected — because failing configuration
+validation is the honest outcome when the transport does not exist. Covered by
+`protocol_parse_rejects_grpc_instead_of_aliasing_it_to_rpc`.
 
 ## Context
 
