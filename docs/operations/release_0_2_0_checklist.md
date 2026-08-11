@@ -60,13 +60,31 @@ python3 scripts/check_workspace_layout.py
 cargo publish --workspace --dry-run
 ```
 
-And the two that need a browser, which cannot run on a machine without
-`wasm-pack` and headless Chrome — CI covers both:
+And the two that need a browser:
 
 ```sh
-wasm-pack test --headless --chrome crates/framework/krab_client -- --features web
+# wasm-bindgen-cli must match Cargo.lock, or the module will not load.
+cargo install wasm-bindgen-cli --version 0.2.127 --locked
+CHROMEDRIVER=/path/to/chromedriver \
+  cargo test -p krab_client --target wasm32-unknown-unknown --features web
+
 wasm-pack build examples/reference_apps/islands_rpc --target web -- --features web
 ```
+
+**Verified locally, 2026-08-09:** `7 passed; 0 failed` for `hydration_browser`
+plus `3 passed` for the `smoke_browser` canary, in headless Chrome 151. This is
+the first coverage the hydration runtime has ever had — see the note on
+`krab_client`'s shadow test model in
+[`.claude/skills/krab-verify/SKILL.md`](../../.claude/skills/krab-verify/SKILL.md).
+
+Two things had to be true to get there, and both are now pinned:
+
+- `wasm-bindgen` ≥ `0.2.127`. `0.2.114` cannot open a session against
+  ChromeDriver 151 — it fails parsing the `newSession` response
+  (`invalid type: map, expected a string`) before any test body runs.
+- Tests must not write to `document.body.innerHTML`. The harness renders its
+  own results there; clearing it makes every test report as a timeout with no
+  hint that the tests themselves were fine.
 
 ## Publish
 

@@ -598,7 +598,36 @@ enum Node {
     Text(LitStr),
     Expression(Expr),
     Fragment(Vec<Node>),
+    /// `<Show>` / `<For>` — expands to a `krab_core::control_flow` call rather
+    /// than to markup. See ADR 0008.
+    ///
+    /// Boxed: `ControlFlow` holds several `Expr`s and would otherwise make
+    /// every `Node` — including a bare text node — as large as the biggest
+    /// control-flow form. Trees are mostly ordinary markup, so the indirection
+    /// is paid only where it is used.
+    ControlFlow(Box<ControlFlow>),
 }
+
+enum ControlFlow {
+    Show {
+        when: Expr,
+        fallback: Option<Expr>,
+        children: Vec<Node>,
+    },
+    For {
+        each: Expr,
+        key: Expr,
+        view: Expr,
+    },
+}
+
+/// Tags `view!` expands into control flow instead of markup.
+///
+/// A closed set, deliberately. ADR 0006 rejects capitalised tags because they
+/// would otherwise be emitted as literal markup that no browser renders, and
+/// that rule stays safe only while the macro knows every capitalised name it
+/// accepts. See ADR 0008.
+const CONTROL_FLOW_TAGS: &[&str] = &["Show", "For"];
 
 struct Element {
     name: String,
@@ -678,6 +707,123 @@ fn strip_raw(ident: &Ident) -> String {
     text.strip_prefix("r#").unwrap_or(&text).to_string()
 }
 
+impl Element {
+    /// Reinterpret a parsed `<Show>` / `<For>` element as control flow.
+    ///
+    /// Diagnostics matter more than usual here: these tags look like markup, so
+    /// a missing attribute has to say which one and why, not just fail to
+    /// compile somewhere inside the expansion.
+    fn into_control_flow(self) -> Result<ControlFlow> {
+        let span = Span::call_site();
+
+        if !self.events.is_empty() {
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "<{}> is control flow, not an element, so it has no event listeners.
+                       Put the handler on an element inside it.",
+                    self.name
+                ),
+            ));
+        }
+
+        let take = |attributes: &mut Vec<Attribute>, wanted: &str| -> Option<Expr> {
+            attributes
+                .iter()
+                .position(|attr| attr.name == wanted)
+                .map(|index| attributes.remove(index).value)
+        };
+
+        let mut attributes = self.attributes;
+
+        match self.name.as_str() {
+            "Show" => {
+                let when = take(&mut attributes, "when").ok_or_else(|| {
+                    syn::Error::new(
+                        span,
+                        "<Show> requires `when`, a closure returning bool.\n  \
+                         Example:\n  \
+                           <Show when={move || logged_in.get()}>...</Show>",
+                    )
+                })?;
+                let fallback = take(&mut attributes, "fallback");
+                reject_unknown(&attributes, "Show", &["when", "fallback"], span)?;
+
+                Ok(ControlFlow::Show {
+                    when,
+                    fallback,
+                    children: self.children,
+                })
+            }
+            "For" => {
+                if !self.children.is_empty() {
+                    return Err(syn::Error::new(
+                        span,
+                        "<For> renders each row through `view`, so it takes no children.\n  \
+                         Move the markup into the `view` closure and close the tag with `/>`.",
+                    ));
+                }
+
+                let each = take(&mut attributes, "each").ok_or_else(|| {
+                    syn::Error::new(
+                        span,
+                        "<For> requires `each`, a closure returning the items.\n  \
+                         Example: each={move || todos.get()}",
+                    )
+                })?;
+
+                // Deliberately not optional. Falling back to positional keys
+                // would silently reintroduce the behaviour <For> exists to
+                // prevent: inserting a row shifts every row's identity, losing
+                // focus and selection on all of them. See ADR 0008.
+                let key = take(&mut attributes, "key").ok_or_else(|| {
+                    syn::Error::new(
+                        span,
+                        "<For> requires `key`, a closure returning a stable, unique id per item.\n  \
+                         Without it rows match by position, so inserting one row renumbers every\n  \
+                         row after it and they lose focus and DOM state.\n  \
+                         Example: key={|todo: &Todo| todo.id}",
+                    )
+                })?;
+
+                let view = take(&mut attributes, "view").ok_or_else(|| {
+                    syn::Error::new(
+                        span,
+                        "<For> requires `view`, a closure rendering one item.\n  \
+                         Example: view={|todo: Todo| view! { <li>{todo.title}</li> }}",
+                    )
+                })?;
+
+                reject_unknown(&attributes, "For", &["each", "key", "view"], span)?;
+
+                Ok(ControlFlow::For { each, key, view })
+            }
+            other => Err(syn::Error::new(
+                span,
+                format!("unknown control-flow tag <{other}>"),
+            )),
+        }
+    }
+}
+
+/// Reject attributes a control-flow tag does not understand.
+///
+/// Silently ignoring them would make a typo (`fallbck`) look like a working
+/// fallback that never renders.
+fn reject_unknown(attributes: &[Attribute], tag: &str, known: &[&str], span: Span) -> Result<()> {
+    if let Some(unexpected) = attributes.first() {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "<{tag}> has no attribute `{}`. It accepts: {}.",
+                unexpected.name,
+                known.join(", ")
+            ),
+        ));
+    }
+    Ok(())
+}
+
 impl Parse for Node {
     fn parse(input: ParseStream) -> Result<Self> {
         if input.is_empty() {
@@ -707,6 +853,12 @@ impl Parse for Node {
                 Ok(Node::Fragment(children))
             } else {
                 let element: Element = input.parse()?;
+                if CONTROL_FLOW_TAGS.contains(&element.name.as_str()) {
+                    // Parsed as an ordinary element first, then reinterpreted:
+                    // attribute and child parsing is identical, and only the
+                    // meaning differs.
+                    return Ok(Node::ControlFlow(Box::new(element.into_control_flow()?)));
+                }
                 Ok(Node::Element(element))
             }
         } else if input.peek(token::Brace) {
@@ -734,7 +886,9 @@ impl Parse for Element {
         //
         // Whether to support component composition is open; see
         // docs/adr/0006-view-component-composition.md.
-        if name.starts_with(|c: char| c.is_ascii_uppercase()) {
+        if name.starts_with(|c: char| c.is_ascii_uppercase())
+            && !CONTROL_FLOW_TAGS.contains(&name.as_str())
+        {
             return Err(syn::Error::new(
                 name_span,
                 format!(
@@ -742,8 +896,10 @@ impl Parse for Element {
                      literal HTML tag named '{name}'.\n  \
                      Call the function and interpolate its node instead:\n    \
                      view! {{ <div>{{{}(props)}}</div> }}\n  \
-                     For an interactive component, annotate it with #[island].",
-                    to_snake_case(&name)
+                     For an interactive component, annotate it with #[island].\n  \
+                     The only capitalised tags `view!` knows are: {}.",
+                    to_snake_case(&name),
+                    CONTROL_FLOW_TAGS.join(", ")
                 ),
             ));
         }
@@ -864,6 +1020,36 @@ impl Parse for Element {
 impl ToTokens for Node {
     fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
         match self {
+            // `as_ref()` rather than a box pattern, which is still unstable.
+            Node::ControlFlow(control) => match control.as_ref() {
+                ControlFlow::Show {
+                    when,
+                    fallback,
+                    children,
+                } => {
+                    // Children are wrapped in a fragment so `<Show>` can hold
+                    // more than one node without the user adding a container
+                    // element.
+                    let shown = quote! {
+                        krab_core::Node::Fragment(vec![#(#children),*])
+                    };
+                    let fallback = match fallback {
+                        Some(expr) => quote! { #expr },
+                        // Rendering nothing is the sane default for a
+                        // conditional, and an empty fragment produces no markup.
+                        None => quote! { || krab_core::Node::Fragment(Vec::new()) },
+                    };
+
+                    tokens.extend(quote! {
+                        krab_core::control_flow::show(#when, move || #shown, #fallback)
+                    });
+                }
+                ControlFlow::For { each, key, view } => {
+                    tokens.extend(quote! {
+                        krab_core::control_flow::for_each(#each, #key, #view)
+                    });
+                }
+            },
             Node::Element(el) => {
                 let name = &el.name;
                 let attrs = &el.attributes;

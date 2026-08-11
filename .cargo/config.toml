@@ -1,0 +1,22 @@
+# Run `wasm32-unknown-unknown` test binaries through `wasm-bindgen-test-runner`,
+# which drives them in a real browser over WebDriver.
+#
+# Without this, `cargo test --target wasm32-unknown-unknown` produces a `.wasm`
+# the host cannot execute and the run fails before any test starts.
+#
+# This is the canonical path, and it is used in preference to
+# `wasm-pack test`: wasm-pack bundles its own `wasm-bindgen` and generates the
+# JS shim itself, which drifts from the `wasm-bindgen` version in `Cargo.lock`.
+# At wasm-pack 0.15.0 against wasm-bindgen 0.2.127 that drift produced
+# "using deprecated parameters for the initialization function" followed by
+# "Failed to detect test as having been run" — the module loaded but never
+# signalled completion. Going through the runner directly keeps exactly one
+# wasm-bindgen version in play, the one Cargo resolved.
+#
+# Requires a matching CLI on PATH:
+#
+#     cargo install wasm-bindgen-cli --version <same as Cargo.lock>
+#
+# and a browser driver, located via `CHROMEDRIVER` or `GECKODRIVER`.
+[target.wasm32-unknown-unknown]
+runner = "wasm-bindgen-test-runner"

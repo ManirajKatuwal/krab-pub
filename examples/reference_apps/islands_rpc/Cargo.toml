@@ -69,3 +69,9 @@ default = []
 # `cargo build --all-features`, which is why the `ops-hardening` gate runs
 # `--all-features` for `krab_core` specifically rather than the whole workspace.
 web = []
+
+# rustc 1.97 emits bulk-memory and nontrapping-fptoint by default; the binaryen
+# wasm-pack bundles (version 117) rejects them unless told they exist. Without
+# this, `wasm-pack build` dies at the wasm-opt step — locally and in CI.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]

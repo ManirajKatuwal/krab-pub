@@ -94,3 +94,35 @@ static SERVER_FNS: &[krab_core::server_fn::ServerFnRegistration] =
 
 let app = Router::new().merge(server_fn_router(SERVER_FNS));
 ```
+
+## Calling One From an Island
+
+On a WASM build the call is a `fetch`, so it is `async` — but event handlers are
+synchronous. Wrap it in an action rather than spawning by hand:
+
+```rust
+use krab_core::action::create_action;
+
+let rename = create_action(|name: String| async move { rename_project(name).await });
+
+view! {
+    <button
+        on:click={ move |_| rename.dispatch("new name".to_string()) }
+        disabled={ move || rename.pending().get() }
+    >
+        "Rename"
+    </button>
+}
+```
+
+`Action` exposes `pending`, `value`, and `error` as signals. A failed dispatch
+keeps the previous `value`, and a superseded dispatch cannot overwrite a newer
+one — so two rapid clicks leave the *latest* answer on screen even if the first
+request finishes last.
+
+No `#[cfg(target_arch)]` is required: an `#[island]` body compiles for both
+targets and `create_action` exists on both. Server-side `dispatch` returns
+without touching a signal, so SSR renders the idle state.
+
+`krab_client::spawn` remains available for fire-and-forget calls that need no
+observable state.

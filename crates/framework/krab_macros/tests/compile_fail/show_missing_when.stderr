@@ -1,0 +1,14 @@
+error: <Show> requires `when`, a closure returning bool.
+         Example:
+         <Show when={move || logged_in.get()}>...</Show>
+  --> tests/compile_fail/show_missing_when.rs:6:13
+   |
+ 6 |       let _ = view! {
+   |  _____________^
+ 7 | |         <Show fallback={|| view! { <p>"no"</p> }}>
+ 8 | |             <p>"yes"</p>
+ 9 | |         </Show>
+10 | |     }
+   | |_____^
+   |
+   = note: this error originates in the macro `view` (in Nightly builds, run with -Z macro-backtrace for more info)

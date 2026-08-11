@@ -1,7 +1,9 @@
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub mod action;
 pub mod config;
+pub mod control_flow;
 #[cfg(feature = "auth")]
 pub mod credentials;
 pub mod error_boundary;
@@ -9,6 +11,7 @@ pub mod error_boundary;
 pub mod graphql;
 #[cfg(feature = "grpc-semantics")]
 pub mod grpc_semantics;
+pub mod resource;
 
 /// Deprecated alias for [`grpc_semantics`].
 ///

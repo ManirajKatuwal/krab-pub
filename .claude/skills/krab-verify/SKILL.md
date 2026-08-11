@@ -100,6 +100,51 @@ check_reference_app_wasm  cargo clippy -p reference_app_islands_rpc \
 
 `#[server]`'s client half went years without compiling because nothing built it.
 
+### ⚠️ `krab_client`'s test count is misleading — do not trust it
+
+`cargo test -p krab_client` reports ~29 passing. **None of them execute the
+hydration runtime.**
+
+- `hydration_plan`, `hydration_plan_children`, `HydrationPlan`,
+  `HydrationOutcome`, and `element_hydration_id` are `#[cfg(test)]` — a
+  test-only *reimplementation* of the algorithm. 13 tests exercise that model.
+- The real functions — `hydrate`, `hydrate_recursive`, `hydrate_children`,
+  `create_dom_node`, `patch_dom`, `realign_node_by_hydration_id` — are
+  `#[cfg(feature = "web")]`, which a native `cargo test` never enables. They are
+  not compiled during `cargo test --workspace`, let alone run.
+
+The two have already drifted. The real path compares tags case-insensitively
+(`tag_name().to_lowercase()`, because `Element.tagName` is uppercase in a
+browser); the model compares them case-sensitively. The model also emits
+`expected_element_found_non_element_node` and `dynamic_node_boundary`, which the
+runtime never produces — and one test asserts the latter.
+
+**Consequence for verification:** a green *native* `krab_client` run says
+nothing about hydration. The real coverage is
+`crates/framework/krab_client/tests/hydration_browser.rs`, which runs the actual
+algorithm in a browser:
+
+```
+install_wasm_cli   cargo install wasm-bindgen-cli --version <matches Cargo.lock> --locked
+test_hydration     CHROMEDRIVER=<path> cargo test -p krab_client \
+                     --target wasm32-unknown-unknown --features web
+```
+
+Verified 2026-08-09: `7 passed; 0 failed`, plus a 3-test `smoke_browser` canary.
+Run these whenever you touch `krab_client`, `krab_macros`, or `krab_core`'s
+hydration markers — `cargo test --workspace` cannot reach any of it.
+
+Two traps, both already paid for:
+
+- The `wasm-bindgen-cli` on PATH must match `Cargo.lock`. A mismatch loads a
+  module that never signals completion.
+- A test that writes `document.body.innerHTML` destroys the harness's own
+  output element. Every test then reports as a timeout with no indication the
+  tests were fine. Mount into a container instead; see `mount` in that file.
+
+Do not refactor `hydrate_recursive` on the strength of the 13 shadow tests —
+they stay green through an arbitrarily broken rewrite. Use the browser suite.
+
 `krab_macros` uses trybuild. A changed diagnostic means the `.stderr` fixtures in
 `crates/framework/krab_macros/tests/compile_fail/` need regenerating —
 regenerate deliberately, never blindly.

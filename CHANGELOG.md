@@ -130,6 +130,124 @@ Covers all work merged after `0.1.1` (2026-03-11).
 
 ### Fixed
 
+- **`wasm-pack build` died at the `wasm-opt` step on current Rust.** rustc 1.97
+  emits bulk-memory and nontrapping-fptoint operations by default; the binaryen
+  build that wasm-pack 0.13 bundles (version 117) rejects them as invalid input
+  unless the features are explicitly enabled. Both wasm bundles — the
+  `krab_client` runtime and the reference app — now pass
+  `--enable-bulk-memory --enable-nontrapping-float-to-int` to `wasm-opt` via
+  `[package.metadata.wasm-pack.profile.release]`. Found by the first
+  containerised execution of the `reference-app` workflow's command set: the
+  failure was latent in `reference-app.yaml` and `wasm-size.yaml` both, and
+  would have failed CI's first-ever real run.
+
+- **`<Show>` and `<For>` in `view!`.** The macro had no conditionals and no
+  iteration: a list was an interpolated closure returning a `Fragment`, and the
+  keys that make reconciliation work had to be stamped by hand, so a user who
+  did not know `data-krab-node-id` existed got positional matching and a full
+  rebuild on every change.
+
+  `<For each={…} key={…} view={…}/>` stamps the key for you, which is the whole
+  point of it over a hand-written `map`. Omitting `key` is a compile error
+  rather than a silent fallback. `<Show when={…} fallback={…}>` renders nothing
+  when no fallback is given.
+
+  These are the only capitalised tags `view!` accepts; every other one remains
+  the compile error [ADR 0006](docs/adr/0006-view-component-composition.md)
+  introduced, and the message now lists the built-ins.
+  [ADR 0008](docs/adr/0008-view-control-flow-tags.md) records why a closed set
+  refines that rule rather than reversing it.
+
+- **A `Dynamic` tracked one DOM node, but a `Fragment` renders several.** This
+  broke `<Show>` and `<For>` in two different ways. When built on the client,
+  the retained node was the `DocumentFragment` — which empties itself into the
+  parent on append — so `parent_node()` was `None` and updates were silently
+  skipped. When hydrated, the retained node was the *first* row, so an update
+  replaced it with a fragment of the whole new list and left the remaining old
+  rows behind: a server-rendered list **duplicated** rather than froze.
+
+  Both paths now track the run of nodes a `Dynamic` owns and reconcile it
+  through the same keyed reconciler, bounded by a trailing comment anchor so a
+  `<For>` beside other children touches only its own rows. The anchor is created
+  on first update, not during hydration — inserting it mid-traversal shifts the
+  live `NodeList` and reports every following sibling as a mismatch.
+
+- **A changed child count rebuilt the whole subtree.** `patch_dom` reconciled
+  children only while `old.children.len() == new.children.len()`, and returned
+  `None` otherwise — which made the caller destroy and recreate the entire
+  element. Adding one row to a list therefore rebuilt every row, discarding DOM
+  identity, focus, selection, and scroll position. `(Fragment, Fragment)` was
+  not handled at all and took the same path.
+
+  Children are now reconciled by key: fragments are flattened first, so keys
+  match across a fragment boundary — the shape a list-rendering `Dynamic`
+  produces — keyed nodes are moved rather than rebuilt, and unkeyed ones fall
+  back to positional matching. Keys reuse `data-krab-node-id`, the marker
+  `annotate_hydration_tree` already stamps, rather than adding a second notion
+  of identity. Seven browser tests assert DOM node *identity* across updates,
+  including that a focused input keeps its focus and its typed value when a row
+  is inserted above it.
+
+- **A successful patch panicked with `RefCell already borrowed`.** Both
+  `Dynamic` sites held `current_node.borrow()` across the
+  `*current_node.borrow_mut() = patched_node` that a successful patch performs.
+  It was nearly unreachable while patching required an exact child-count match;
+  keyed reconciliation made success the normal path and it fired immediately.
+
+- **Effects leaked, and the leaked ones kept running.** `create_effect` pushed
+  every effect into a thread-local `ROOT_EFFECTS` that was only ever appended
+  to, holding a strong `Rc` forever. `create_dom_node` calls `create_effect` for
+  every nested `Dynamic` it builds, so each re-render of a parent `Dynamic` left
+  the previous run's effects alive, still subscribed, and still patching DOM
+  nodes that had already been detached — ten updates meant ten zombie effects
+  doing work on invisible nodes. This was wrong behaviour, not just growth.
+
+  Effects now have owners: one created while another is running becomes that
+  effect's child and is disposed when the parent re-runs. Only a genuinely
+  top-level effect is retained for the life of the thread. A disposed effect
+  never runs again even if a stale subscription still points at it.
+
+- **`on_cleanup` added**, running when the owning effect re-runs or is disposed.
+  Disposal needed the primitive internally, and without it there was no way to
+  release anything an effect had acquired.
+
+- **A signal read twice ran its effect twice, natively.** `get()` and `with()`
+  subscribe on every read, and while the wasm path collapsed duplicates in
+  `PENDING_EFFECTS`, the native path ran the effect once per subscription — so
+  an effect reading a signal three times ran three times per write, forever.
+  Deduplication moved to `notify()`, which both platforms share.
+
+- **`krab_client`'s hydration tests were testing a mock of the algorithm, not
+  the algorithm.** `hydration_plan`, `hydration_plan_children`, `HydrationPlan`,
+  `HydrationOutcome`, and `element_hydration_id` were all `#[cfg(test)]` — a
+  second, hand-maintained implementation of hydration that 13 tests exercised.
+  The real functions are `#[cfg(feature = "web")]`, which a native `cargo test`
+  never enables, so the shipping algorithm was never compiled during a test run,
+  let alone executed.
+
+  The two had already drifted. The runtime compares tags case-insensitively
+  (`Element::tagName` is uppercase in a browser); the model compared them
+  case-sensitively. The model also produced `expected_element_found_non_element_node`
+  and `dynamic_node_boundary`, neither of which the runtime emits — and a test
+  asserted the latter. The model is deleted; its two worthwhile cases (reordered
+  marker-matched children, attribute-only differences not forcing a replacement)
+  are now browser tests asserting DOM node identity against the real runtime.
+
+- **`hydrate_recursive` is 101 lines rather than 324**, with the element and
+  text paths, node replacement, and node appending extracted. `create_dom_node`
+  drops from 182 to about 55. The two paths also carried a **verbatim duplicate**
+  of the event-listener bookkeeping — closure creation, the `__krab_id` stamp,
+  the `EVENT_CLOSURES` insert — which is now one `attach_element_events`; a fix
+  applied to one copy would previously have missed the other. Behaviour is
+  unchanged and verified by the browser suite before and after.
+
+- **The `wasm-bindgen` family is updated** (`0.2.114` → `0.2.127`,
+  `wasm-bindgen-test` `0.3.64` → `0.3.77`, plus `js-sys`, `web-sys`, and
+  `wasm-bindgen-futures`). The older runner could not open a WebDriver session
+  against ChromeDriver 151 — it failed parsing the `newSession` response
+  (`invalid type: map, expected a string`) before any test body ran, which made
+  the hydration browser tests impossible to execute on a current Chrome.
+
 - **The client half of `#[server]` had never compiled.**
   `krab_core::server_fn` was gated behind `rest`, a server-only feature that
   pulls axum, so `call_server_fn` — which the macro's wasm32 stub calls — did
@@ -151,6 +269,68 @@ Covers all work merged after `0.1.1` (2026-03-11).
 
 ### Added
 
+- **`create_memo`, `untrack`, `batch`, and `on_cleanup`.** The reactive system
+  had only signals and effects: no derived-value caching, no way to read without
+  subscribing, and no way to group writes. A derived closure read three times
+  computed three times, and three writes ran a dependent effect three times.
+
+  Memos are lazy and cached — a write marks dependents dirty without
+  recomputing, and the value is recomputed on read. That ordering is what makes
+  a diamond (`source → a`, `source → b`, `effect(a, b)`) settle **once** per
+  write with both branches fresh; recomputing eagerly on notification would run
+  the effect once per branch, the first time seeing one updated and one stale
+  value. A memo nothing reads costs nothing to keep current.
+
+  `batch(f)` groups writes so dependent effects run once at the end; nesting is
+  safe and only the outermost scope flushes. It guarantees the run *count*, not
+  the moment — on wasm the flush uses the same microtask queue an unbatched
+  write already used.
+
+  Memos created inside an effect are owned by it and disposed when it re-runs,
+  matching nested effects.
+
+- **`krab_core::action::Action` and `create_action`**, re-exported as
+  `krab_client::Action`. Calling a `#[server]` function from an island worked,
+  but everything around the call had to be hand-rolled: a signal for "is it
+  running", another for the result, another for the error, and the discipline to
+  clear them in the right order. `create_action` wraps an async operation and
+  exposes `pending`, `value`, and `error` as signals, so a button can disable
+  itself and an error can render without any bookkeeping in the handler.
+
+  Two behaviours are chosen deliberately, because the obvious implementation
+  gets them wrong. A **failed dispatch keeps the previous value** rather than
+  clearing it — blanking rendered data because a retry failed is worse than
+  showing the last good value beside the error. And **only the newest dispatch
+  can write state**: a generation counter discards the response of a superseded
+  call, so two clicks where the first request finishes second leave the newer
+  answer on screen rather than the older one with `pending` reading false, which
+  looks settled and is wrong.
+
+  It lives in `krab_core`, not `krab_client`, because an `#[island]` body is
+  compiled for **both** targets — natively to render the markup, on wasm to
+  hydrate it — so an API available only on wasm forces a `#[cfg(target_arch)]`
+  back into application code. Natively `dispatch` returns without touching a
+  signal, so server-side rendering produces the idle markup the browser
+  hydrates against.
+
+- **`krab_core::resource::Resource` and `create_resource`** — the read-side
+  counterpart to `Action`, per [ADR 0009](docs/adr/0009-resource-ssr-semantics.md).
+  A resource tracks a source closure, runs an async fetcher when it changes,
+  and exposes `state()` (`Pending` / `Ready` / `Error`) and `value()` as
+  signals. `value` deliberately survives both a refetch (`state` shows
+  `Pending`, the data stays on screen) and a failed refetch (`state` shows the
+  error, the last good value stays), and a generation counter discards
+  superseded responses.
+
+  **SSR semantics, decided by ADR 0009:** a resource never polls its future on
+  the server. `create_resource_with_initial` takes a server-fetched value —
+  typically through island props from the async route handler — renders
+  `Ready`, and does **not** refetch on mount, so no load is doubled. Without an
+  initial value the server renders `Pending` and the client fetches after
+  hydration. Blocking the render was rejected (`Node` is `!Send`; the tree is
+  built synchronously); streaming is deferred with the initial-value path
+  reserved as its integration point.
+
 - **A client-side router** in `krab_client::router`. Krab renders on the server
   and hydrates islands, but every in-app link was a full document request, which
   discarded hydrated island state, scroll position, and the warm WASM module.
@@ -169,16 +349,23 @@ Covers all work merged after `0.1.1` (2026-03-11).
   route table. The server stays authoritative for routing, so SSR, ISR, and
   render policy are not duplicated in two places. See the module docs.
 
-- **A browser test harness for the hydration runtime**
-  (`crates/framework/krab_client/tests/hydration_browser.rs`, run by the new
-  `client-browser-tests` CI job via `wasm-pack test --headless --chrome`).
+- **The hydration runtime has test coverage for the first time.**
+  `crates/framework/krab_client/tests/hydration_browser.rs` runs the real
+  algorithm in headless Chrome (7 tests), with a `smoke_browser.rs` canary (3)
+  that distinguishes a broken harness from a broken runtime. Both run in the new
+  `client-browser-tests` CI job.
+
   `cargo test --workspace` compiles `krab_client` for the host, where there is
-  no `document`, so it could only ever reach the pure planning functions — every
-  DOM-mutating path had no test at all, and a hydration defect surfaces as a
-  subtly wrong DOM in a user's browser rather than a red build. Seven tests
-  cover node reuse, mismatch patching and counting, unregistered islands,
-  malformed props not aborting sibling islands, idempotency, and removal of
-  stale server-rendered children.
+  no `document`, so it could only ever reach pure functions — every DOM-mutating
+  path (`hydrate`, `hydrate_recursive`, `create_dom_node`, `patch_dom`) had no
+  test at all, and a hydration defect surfaces as a subtly wrong DOM in a user's
+  browser rather than a red build. The tests cover node reuse, mismatch patching
+  and counting, unregistered islands, malformed props not aborting sibling
+  islands, idempotency, and removal of stale server-rendered children.
+
+  `.cargo/config.toml` now routes the `wasm32-unknown-unknown` target through
+  `wasm-bindgen-test-runner`, so exactly one `wasm-bindgen` version is in play —
+  the one Cargo resolved — rather than the separate copy `wasm-pack` bundles.
 
 - **A vendored reference application** at
   [`examples/reference_apps/islands_rpc/`](examples/reference_apps/islands_rpc/):

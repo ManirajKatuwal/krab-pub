@@ -2,6 +2,7 @@ error: `view!` has no component composition, so <MyComponent> would be emitted a
          Call the function and interpolate its node instead:
            view! { <div>{my_component(props)}</div> }
          For an interactive component, annotate it with #[island].
+         The only capitalised tags `view!` knows are: Show, For.
  --> tests/compile_fail/component_tag_unsupported.rs:7:22
   |
 7 |     let _ = view! { <MyComponent/> }.render();

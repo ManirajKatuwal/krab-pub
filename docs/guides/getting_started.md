@@ -228,19 +228,76 @@ let app = Router::new().route("/api/rpc/add_task", post(add_task_handler));
 ```
 
 On `wasm32` the same `add_task(...)` call becomes a `fetch` to that URL, so an
-island calls it as a plain async fn. Event handlers are synchronous, so bridge
-with `spawn_local`:
+island calls it as a plain async fn. Event handlers are synchronous, so wrap the
+call in an **action** — `create_action` turns an async operation into three
+signals you can render directly:
 
 ```rust
-on:click={
-    move |_| {
-        #[cfg(target_arch = "wasm32")]
-        wasm_bindgen_futures::spawn_local(async move {
-            let _ = add_task("from the island".to_string()).await;
-        });
-    }
+use krab_core::action::create_action;
+
+let add = create_action(|title: String| async move { add_task(title).await });
+
+view! {
+    <button
+        on:click={ move |_| add.dispatch("from the island".to_string()) }
+        disabled={ move || add.pending().get() }
+    >
+        "Add task"
+    </button>
+    <Show when={ move || add.error().get().is_some() }>
+        <p class="error">{ move || add.error().get().unwrap_or_default() }</p>
+    </Show>
 }
 ```
+
+`pending` is true from `dispatch` until the request settles, `value` holds the
+last success, and `error` holds the last failure. Two guarantees are worth
+knowing because hand-rolled versions usually get them wrong:
+
+- **A failed retry keeps the previous value.** Replacing rendered data with
+  nothing because a refresh failed is worse than showing the last good value
+  beside the error.
+- **Only the newest dispatch can write.** Click twice and have the first request
+  finish second, and the stale response is discarded rather than overwriting the
+  newer one.
+
+No `#[cfg(target_arch)]` is needed: an island body compiles for both targets and
+`create_action` exists on both. On the server `dispatch` is inert — it returns
+without touching a signal, so the SSR markup renders the idle state the browser
+hydrates against.
+
+`krab_client::spawn` is still there as the raw primitive for fire-and-forget work
+that needs none of this state.
+
+For the **read** side — data a component loads rather than writes — use
+`create_resource`. It tracks a source and refetches when it changes:
+
+```rust
+use krab_core::resource::create_resource_with_initial;
+
+// `props.user` was fetched by the async route handler and arrived through
+// island props, so the server renders Ready and the client does NOT refetch
+// on mount. Pass `None` (or use `create_resource`) to fetch on hydration.
+let user = create_resource_with_initial(
+    props.user,
+    move || user_id.get(),
+    |id| async move { fetch_user(id).await },
+);
+
+view! {
+    <Show when={ move || user.state().get().is_pending() }>
+        <p class="loading">"Loading…"</p>
+    </Show>
+    <p>{ move || user.value().get().map(|u| u.name).unwrap_or_default() }</p>
+}
+```
+
+`state()` reports `Pending` / `Ready` / `Error`, and `value()` keeps the last
+good data even through a failed refetch — a spinner beside stale data, never a
+blank page. On the server a resource never polls its future: with an initial
+value it renders `Ready`, without one `Pending`. See
+[ADR 0009](../adr/0009-resource-ssr-semantics.md) for why data needed at first
+paint belongs in the route handler, not a blocking render.
 
 > **Server functions are public HTTP endpoints.** They are not privileged
 > because they look like function calls. Validate input and check authorisation

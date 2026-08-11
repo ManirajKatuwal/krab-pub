@@ -21,6 +21,7 @@
 
 #![allow(non_snake_case)]
 
+use krab_core::action::create_action;
 use krab_core::server_fn::ServerFnError;
 use krab_core::signal::*;
 use krab_core::{IntoNode, Node};
@@ -99,6 +100,16 @@ pub fn TaskCounter(props: TaskCounterProps) -> Node {
     let (count, _set_count) = create_signal(props.initial);
     let label = props.label.clone();
 
+    // `Action` wraps the `#[server]` call with pending / value / error signals,
+    // so the handler stays a one-liner and the markup can react to the request
+    // without any of that state being hand-rolled.
+    //
+    // Note the absence of a `#[cfg]`: an island body compiles for *both* targets,
+    // and `Action` lives in `krab_core`, so it exists on both. Underscored for
+    // the same reason as `_set_count` — it is read only inside the `on:click`
+    // closure, which `view!` compiles under `feature = "web"`.
+    let _add = create_action(|title: String| async move { add_task(title).await });
+
     view! {
         <div class="island task-counter" data-testid="task-counter">
             <span class="island-label" aria-label="counter label">{ label }</span>
@@ -109,13 +120,9 @@ pub fn TaskCounter(props: TaskCounterProps) -> Node {
                 on:click={
                     move |_| {
                         _set_count.update(|c| *c += 1);
-
-                        // Only compiled for the browser build. `add_task` is a
-                        // fetch to /api/rpc/add_task on wasm32.
-                        #[cfg(target_arch = "wasm32")]
-                        wasm_bindgen_futures::spawn_local(async move {
-                            let _ = add_task("task from island".to_string()).await;
-                        });
+                        // Fire-and-observe: `add` carries the pending state and
+                        // any error, so the handler stays a one-liner.
+                        _add.dispatch("task from island".to_string());
                     }
                 }
             >

@@ -97,7 +97,7 @@ wasm-pack build krab_client --release --target web
 | Dependency governance | `ops-hardening` (`cargo-deny`) | Yes |
 | Crates publishable + CLI installs as `krab` | `ops-hardening` (`publish-dry-run`) | Yes |
 | `krab new` output builds, tests, lints, formats | `generated-project` (all four templates) | Yes |
-| Reference app builds on native + `wasm32`, WASM bundle produced | `reference-app` (`examples/reference_apps/islands_rpc`) | Yes |
+| Reference app builds on native + `wasm32`, WASM bundle produced; browser test suites run in headless Chrome | `reference-app` (`examples/reference_apps/islands_rpc`, `krab_client` browser tests) | Yes |
 | API contract checks | `api-contract` | Yes |
 | Protocol parity & protocol matrix | `api-contract` (`krab contract protocol-check`) | Yes |
 | DB lifecycle checks | `db-lifecycle` | Yes |

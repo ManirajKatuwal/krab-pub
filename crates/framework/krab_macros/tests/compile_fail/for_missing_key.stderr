@@ -1,0 +1,16 @@
+error: <For> requires `key`, a closure returning a stable, unique id per item.
+         Without it rows match by position, so inserting one row renumbers every
+         row after it and they lose focus and DOM state.
+         Example: key={|todo: &Todo| todo.id}
+  --> tests/compile_fail/for_missing_key.rs:9:13
+   |
+ 9 |       let _ = view! {
+   |  _____________^
+10 | |         <For
+11 | |             each={|| vec![1u32, 2]}
+12 | |             view={|item: u32| view! { <li>{item.to_string()}</li> }}
+13 | |         />
+14 | |     }
+   | |_____^
+   |
+   = note: this error originates in the macro `view` (in Nightly builds, run with -Z macro-backtrace for more info)

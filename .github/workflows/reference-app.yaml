@@ -118,9 +118,41 @@ jobs:
             target
           key: ${{ runner.os }}-client-browser-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      # Deliberately NOT `wasm-pack test`. wasm-pack bundles its own
+      # `wasm-bindgen` and generates the JS shim itself, so two versions end up
+      # in play; `.cargo/config.toml` routes the wasm32 target straight through
+      # `wasm-bindgen-test-runner` instead, keeping exactly the version Cargo
+      # resolved. The CLI must match `Cargo.lock` or the module fails to load.
+      #
+      # `--locked` so this tracks Cargo.lock rather than silently drifting to a
+      # newer CLI than the crate.
+      - name: Install wasm-bindgen-cli matching Cargo.lock
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --format-version 1 --locked \
+            | python3 -c "import json,sys; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='wasm-bindgen'))")
+          echo "wasm-bindgen $version"
+          cargo install wasm-bindgen-cli --version "$version" --locked
 
+      # Requires wasm-bindgen >= 0.2.127 against a current Chrome: 0.2.114
+      # cannot open a session against ChromeDriver 151 and fails parsing the
+      # newSession response before any test body runs.
+      #
+      # The runner locates the driver via CHROMEDRIVER. GitHub's Ubuntu image
+      # exports CHROMEWEBDRIVER (the containing directory), so map one to the
+      # other and fail loudly if neither is present — a missing driver
+      # otherwise surfaces as an inscrutable session error.
       - name: Hydration browser tests
         run: |
-          wasm-pack test --headless --chrome crates/framework/krab_client -- --features web
+          set -euo pipefail
+          if [ -n "${CHROMEWEBDRIVER:-}" ] && [ -x "$CHROMEWEBDRIVER/chromedriver" ]; then
+            export CHROMEDRIVER="$CHROMEWEBDRIVER/chromedriver"
+          elif command -v chromedriver >/dev/null; then
+            export CHROMEDRIVER="$(command -v chromedriver)"
+          else
+            echo "::error::no chromedriver found; browser tests cannot run"
+            exit 1
+          fi
+          echo "using $CHROMEDRIVER ($("$CHROMEDRIVER" --version))"
+          cargo test -p krab_client \
+            --target wasm32-unknown-unknown --features web

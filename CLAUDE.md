@@ -206,7 +206,7 @@ violations.
 |---|---|
 | [ops-hardening.yaml](.github/workflows/ops-hardening.yaml) | workspace layout, inter-crate version pinning, fmt, clippy `-D warnings`, rustdoc, `cargo-deny`, on-call delivery path, publish dry-run, release certify |
 | [generated-project.yaml](.github/workflows/generated-project.yaml) | `krab new` output builds, tests, clippy `-D warnings`, `fmt --check` — all four templates |
-| [reference-app.yaml](.github/workflows/reference-app.yaml) | `examples/reference_apps/islands_rpc` builds, tests, and lints on native **and** `wasm32`, and its WASM bundle is produced |
+| [reference-app.yaml](.github/workflows/reference-app.yaml) | `examples/reference_apps/islands_rpc` builds, tests, and lints on native **and** `wasm32`, its WASM bundle is produced, and the `krab_client` browser suites run in headless Chrome |
 | [dependency-security.yaml](.github/workflows/dependency-security.yaml) | `cargo-audit`, SBOM |
 | [api-contract.yaml](.github/workflows/api-contract.yaml) | contract check, protocol parity, protocol matrix |
 | [db-lifecycle.yaml](.github/workflows/db-lifecycle.yaml) | migration lifecycle, rollback sim, drift, rehearsal evidence |

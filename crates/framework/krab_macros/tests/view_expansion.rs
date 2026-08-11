@@ -210,3 +210,107 @@ fn view_can_emit_a_complete_island_wrapper() {
     // Serialized props are HTML-escaped, as any attribute value is.
     assert!(html.contains("data-props="), "missing props in {html}");
 }
+
+// ── Control flow (ADR 0008) ─────────────────────────────────────────────────
+
+#[test]
+fn show_renders_children_when_the_condition_holds() {
+    let node = view! {
+        <Show when={|| true} fallback={|| view! { <p>"absent"</p> }}>
+            <p>"present"</p>
+        </Show>
+    };
+
+    let html = node.render();
+    assert!(html.contains("present"), "got: {html}");
+    assert!(!html.contains("absent"), "got: {html}");
+}
+
+#[test]
+fn show_renders_the_fallback_otherwise() {
+    let node = view! {
+        <Show when={|| false} fallback={|| view! { <p>"absent"</p> }}>
+            <p>"present"</p>
+        </Show>
+    };
+
+    let html = node.render();
+    assert!(html.contains("absent"), "got: {html}");
+    assert!(!html.contains("present"), "got: {html}");
+}
+
+/// Omitting `fallback` renders nothing rather than requiring an empty closure.
+#[test]
+fn show_without_a_fallback_renders_nothing_when_false() {
+    let node = view! {
+        <Show when={|| false}>
+            <p>"present"</p>
+        </Show>
+    };
+
+    assert_eq!(node.render(), "");
+}
+
+#[test]
+fn show_accepts_several_children() {
+    let node = view! {
+        <Show when={|| true}>
+            <p>"one"</p>
+            <p>"two"</p>
+        </Show>
+    };
+
+    let html = node.render();
+    assert!(html.contains("one") && html.contains("two"), "got: {html}");
+}
+
+#[test]
+fn for_renders_one_row_per_item_and_stamps_the_key() {
+    let node = view! {
+        <ul>
+            <For
+                each={|| vec![10u32, 20, 30]}
+                key={|item: &u32| *item}
+                view={|item: u32| view! { <li>{item.to_string()}</li> }}
+            />
+        </ul>
+    };
+
+    let html = node.render();
+    for value in [10, 20, 30] {
+        assert!(html.contains(&value.to_string()), "missing {value}: {html}");
+        assert!(
+            html.contains(&format!(r#"data-krab-node-id="{value}""#)),
+            "key {value} not stamped: {html}"
+        );
+    }
+}
+
+#[test]
+fn for_over_an_empty_list_renders_nothing() {
+    let node = view! {
+        <For
+            each={Vec::<u32>::new}
+            key={|item: &u32| *item}
+            view={|item: u32| view! { <li>{item.to_string()}</li> }}
+        />
+    };
+
+    assert_eq!(node.render(), "");
+}
+
+/// Control flow composes with ordinary markup around it.
+#[test]
+fn control_flow_nests_inside_elements() {
+    let node = view! {
+        <div class="wrapper">
+            <Show when={|| true}>
+                <span>"inner"</span>
+            </Show>
+        </div>
+    };
+
+    let html = node.render();
+    assert!(html.starts_with(r#"<div class="wrapper">"#), "got: {html}");
+    assert!(html.contains("inner"), "got: {html}");
+}
