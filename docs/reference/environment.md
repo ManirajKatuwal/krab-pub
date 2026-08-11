@@ -201,6 +201,7 @@ for the streaming SSR profile suite and have no effect on a running service.
 
 | Variable | Default |
 |---|---|
+| `KRAB_REQUIRE_DB_TESTS` | unset. The `krab_core` DB test suite (migration lifecycle, drift, rollback, governance) needs a reachable Postgres (`DATABASE_URL`, default `postgres://postgres@localhost:5432/krab_test`). When the database is unreachable the tests print a loud `SKIPPED` line on stderr and return. Set `1`/`true` (CI mode) to make an unreachable database **panic** the suite instead of skipping — use this wherever those tests are a gate |
 | `KRAB_SSR_STREAM_SLO_P95_MS` | `200` |
 | `KRAB_SSR_STREAM_SLO_P99_MS` | `400` |
 | `KRAB_SSR_STREAM_FAST_P95_MS` | `200` |

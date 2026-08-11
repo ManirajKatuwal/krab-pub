@@ -8,18 +8,44 @@ mod tests {
     use anyhow::Result;
     use sqlx::postgres::PgPoolOptions;
 
-    // Helper to get a clean DB connection for testing
-    // Requires a running Postgres instance.
-    // For CI/local dev without DB, these tests will fail if not skipped or mocked.
-    // We assume a 'krab_test' database exists for these tests as per CI config.
-    async fn get_test_pool() -> Option<DbPool> {
+    fn require_db_tests() -> bool {
+        std::env::var("KRAB_REQUIRE_DB_TESTS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    /// Connect to the test database (`DATABASE_URL`, defaulting to a local
+    /// `krab_test`), or skip the calling test.
+    ///
+    /// The skip is deliberately LOUD and controllable: these tests used to
+    /// early-return silently on connection failure, so a CI runner with no
+    /// Postgres reported the whole migration-governance suite as passing
+    /// without executing a single statement. Now:
+    ///
+    /// - `KRAB_REQUIRE_DB_TESTS=1` (CI mode): a connection failure PANICS —
+    ///   an unreachable database fails the suite instead of greenwashing it.
+    /// - otherwise: an unmistakable `SKIPPED` line goes to stderr before the
+    ///   test returns early.
+    async fn test_pool_or_skip(test_name: &str) -> Option<DbPool> {
         let url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://postgres@localhost:5432/krab_test".to_string());
-        PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&url)
-            .await
-            .ok()
+        match PgPoolOptions::new().max_connections(1).connect(&url).await {
+            Ok(pool) => Some(pool),
+            Err(err) => {
+                if require_db_tests() {
+                    panic!(
+                        "KRAB_REQUIRE_DB_TESTS is set but the test database at '{url}' is \
+                         unreachable for {test_name}: {err}"
+                    );
+                }
+                eprintln!(
+                    "SKIPPED {test_name}: test database at '{url}' not available ({err}). \
+                     This test executed NOTHING. Set KRAB_REQUIRE_DB_TESTS=1 to make an \
+                     unreachable database a hard failure (CI mode)."
+                );
+                None
+            }
+        }
     }
 
     async fn clean_test_db(pool: &DbPool) -> Result<()> {
@@ -92,12 +118,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_migration_lifecycle() {
-        let pool = match get_test_pool().await {
-            Some(p) => p,
-            None => {
-                println!("Skipping test_migration_lifecycle: database not available");
-                return;
-            }
+        let Some(pool) = test_pool_or_skip("test_migration_lifecycle").await else {
+            return;
         };
         clean_test_db(&pool).await.expect("failed to clean db");
 
@@ -123,12 +145,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_migration_rollback() {
-        let pool = match get_test_pool().await {
-            Some(p) => p,
-            None => {
-                println!("Skipping test_migration_rollback: database not available");
-                return;
-            }
+        let Some(pool) = test_pool_or_skip("test_migration_rollback").await else {
+            return;
         };
         clean_test_db(&pool).await.expect("failed to clean db");
 
@@ -158,12 +176,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_drift_detection() {
-        let pool = match get_test_pool().await {
-            Some(p) => p,
-            None => {
-                println!("Skipping test_drift_detection: database not available");
-                return;
-            }
+        let Some(pool) = test_pool_or_skip("test_drift_detection").await else {
+            return;
         };
         clean_test_db(&pool).await.expect("failed to clean db");
 
@@ -193,14 +207,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_governance_release_requires_rehearsal_artifact() {
-        let pool = match get_test_pool().await {
-            Some(p) => p,
-            None => {
-                println!(
-                    "Skipping test_governance_release_requires_rehearsal_artifact: database not available"
-                );
-                return;
-            }
+        let Some(pool) =
+            test_pool_or_skip("test_governance_release_requires_rehearsal_artifact").await
+        else {
+            return;
         };
         clean_test_db(&pool).await.expect("failed to clean db");
 
@@ -219,14 +229,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_governance_release_passes_with_rehearsal_artifact() {
-        let pool = match get_test_pool().await {
-            Some(p) => p,
-            None => {
-                println!(
-                    "Skipping test_governance_release_passes_with_rehearsal_artifact: database not available"
-                );
-                return;
-            }
+        let Some(pool) =
+            test_pool_or_skip("test_governance_release_passes_with_rehearsal_artifact").await
+        else {
+            return;
         };
         clean_test_db(&pool).await.expect("failed to clean db");
 
@@ -257,14 +263,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_legacy_checksum_rows_are_rewritten_not_flagged() {
-        let pool = match get_test_pool().await {
-            Some(p) => p,
-            None => {
-                println!(
-                    "Skipping test_legacy_checksum_rows_are_rewritten_not_flagged: database not available"
-                );
-                return;
-            }
+        let Some(pool) =
+            test_pool_or_skip("test_legacy_checksum_rows_are_rewritten_not_flagged").await
+        else {
+            return;
         };
         clean_test_db(&pool).await.expect("failed to clean db");
 
@@ -329,14 +331,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_true_checksum_mismatch_is_still_flagged() {
-        let pool = match get_test_pool().await {
-            Some(p) => p,
-            None => {
-                println!(
-                    "Skipping test_true_checksum_mismatch_is_still_flagged: database not available"
-                );
-                return;
-            }
+        let Some(pool) = test_pool_or_skip("test_true_checksum_mismatch_is_still_flagged").await
+        else {
+            return;
         };
         clean_test_db(&pool).await.expect("failed to clean db");
 

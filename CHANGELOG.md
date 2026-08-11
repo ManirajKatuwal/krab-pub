@@ -77,6 +77,16 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
   module-by-module map of `krab_core` with its cross-cutting invariants,
   migrated from the maintainer wiki so the public docs carry them.
 
+- **DB-backed tests no longer pass silently when Postgres is unreachable.**
+  The `krab_core` migration-governance suite early-returned on connection
+  failure, so a runner with no database reported the whole suite green while
+  executing nothing. A shared helper now prints an unmistakable
+  `SKIPPED <test>: ... This test executed NOTHING.` line to stderr before
+  returning, and setting `KRAB_REQUIRE_DB_TESTS=1` (CI mode) turns an
+  unreachable database into a panic — the suite fails instead of
+  greenwashing. Documented in `.env.example` and
+  `docs/reference/environment.md`.
+
 - **Generated project README and Dockerfile were dishonest about what
   works.** The `krab new` README told consumers to run `krab release certify
   --out release-evidence` — a governance command hardcoded to the framework's
