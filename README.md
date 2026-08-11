@@ -1,5 +1,9 @@
 # Krab
 
+![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
+![Rust: 1.75+](https://img.shields.io/badge/rust-1.75%2B-orange.svg)
+![Version: 0.2.0](https://img.shields.io/badge/version-0.2.0-informational.svg)
+
 Krab is a full-stack Rust framework for server-side rendering, island hydration, service composition, and production-oriented operational controls.
 
 ---
@@ -43,8 +47,8 @@ the server-first application that has to be *operated*.
 
 ## Installation
 
-> **Not yet on crates.io.** The workspace is publishable — `cargo publish
-> --workspace --dry-run` passes and is enforced in CI — but the first release
+> **Not yet on crates.io.** The workspace is prepared for publication — the
+> publish dry-run is part of the ops-hardening CI gate — but the first release
 > has not been cut. Until it is, use the path-dependency form below. Publication
 > preconditions and ordering are in [RELEASE_POLICY.md](RELEASE_POLICY.md).
 
@@ -80,7 +84,11 @@ New to Krab? Start with **[docs/guides/getting_started.md](docs/guides/getting_s
 ### Install the CLI
 
 ```sh
+# Once published:
 cargo install krab_cli          # installs a binary named `krab`
+
+# Until then, from a local checkout:
+cargo install --path crates/tooling/krab_cli
 krab --version
 ```
 
@@ -105,7 +113,7 @@ application, see the Installation section above.
 
 ```sh
 # Clone and configure
-git clone https://github.com/krab-framework/krab.git
+git clone https://github.com/ManirajKatuwal/krab.git
 cd krab
 cp .env.example .env
 # Edit .env with your local settings (DATABASE_URL, KRAB_AUTH_MODE, etc.)
@@ -348,11 +356,13 @@ Full index: [`docs/README.md`](docs/README.md).
 
 | Document | Purpose |
 | --- | --- |
+| [`docs/guides/getting_started.md`](docs/guides/getting_started.md) | Install, scaffold, first page, first island, first server function |
 | [`docs/guides/why_krab.md`](docs/guides/why_krab.md) | Krab's product position and differentiators |
 | [`docs/guides/ide_setup.md`](docs/guides/ide_setup.md) | Editor and toolchain setup |
 | [`docs/guides/dev_workflow.md`](docs/guides/dev_workflow.md) | Local dev loop, watch mode, and build outputs |
 | [`docs/guides/migration_guide.md`](docs/guides/migration_guide.md) | Migration notes from Axum, Leptos, and JS full-stack frameworks |
 | [`docs/guides/reference_apps.md`](docs/guides/reference_apps.md) | Official reference app tracks and starter mapping |
+| [`docs/guides/troubleshooting.md`](docs/guides/troubleshooting.md) | Developer troubleshooting: hydration, service startup, CI gates |
 
 ### Reference
 
@@ -364,6 +374,7 @@ Full index: [`docs/README.md`](docs/README.md).
 | [`docs/reference/database.md`](docs/reference/database.md) | Database architecture, migrations, and multi-driver support |
 | [`docs/reference/deployment.md`](docs/reference/deployment.md) | Deployment guide for containerized and self-hosted environments |
 | [`docs/reference/server_functions.md`](docs/reference/server_functions.md) | Server-function endpoint contract and safety patterns |
+| [`docs/reference/benchmarks.md`](docs/reference/benchmarks.md) | Benchmark methodology, thresholds, and committed results |
 
 ### Architecture
 
@@ -371,6 +382,7 @@ Full index: [`docs/README.md`](docs/README.md).
 | --- | --- |
 | [`docs/architecture/vision.md`](docs/architecture/vision.md) | Core mission, pillars, and differentiators |
 | [`docs/architecture/design.md`](docs/architecture/design.md) | Subsystems, routing, islands, and data loading |
+| [`docs/architecture/core_runtime.md`](docs/architecture/core_runtime.md) | Module-by-module map of `krab_core` and its invariants |
 | [`docs/architecture/hydration.md`](docs/architecture/hydration.md) | Island hydration model and markers |
 | [`docs/architecture/render_policy.md`](docs/architecture/render_policy.md) | SSR / SSG / ISR render policy resolution |
 | [`docs/architecture/service_composition.md`](docs/architecture/service_composition.md) | Service graph, topology, orchestrator, and boundary rules |
@@ -422,4 +434,4 @@ For the full security architecture, see [`docs/reference/security.md`](docs/refe
 
 ## License
 
-MIT — see individual crate `Cargo.toml` files for per-crate license declarations.
+MIT — see [`LICENSE`](LICENSE). Every workspace crate inherits the same license.

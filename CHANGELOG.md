@@ -36,7 +36,27 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
   progressive rendering) and that the NFT gate measures serial, unloaded
   latency.
 
+### Added
+
+- **`SECURITY.md`** — vulnerability reporting policy (private GitHub Security
+  Advisories), supported-version table, and scope for the five published
+  crates.
+- **`docs/guides/troubleshooting.md`** and
+  **`docs/architecture/core_runtime.md`** — developer troubleshooting
+  (hydration, service startup, CI-gate feature mismatches) and a
+  module-by-module map of `krab_core` with its cross-cutting invariants,
+  migrated from the maintainer wiki so the public docs carry them.
+
 ### Changed
+
+- **First-public-release normalization.** Repository, homepage, clone, and
+  rustdoc URLs unified on `github.com/ManirajKatuwal/krab`; README gained
+  badges, a completed documentation map, and a consistent
+  not-yet-on-crates.io installation story; generated artifacts
+  (`docker/composed.nft.rendered.yaml`, `service_frontend/public/__ssg/`)
+  and maintainer-local agent tooling (`.claude/`) are no longer tracked;
+  references to the untracked `internal/` planning tree were removed or
+  annotated as not distributed throughout docs, comments, and CI workflows.
 
 - **Dev profile no longer emits debuginfo for dependency crates**
   (`[profile.dev.package."*"] debug = false`), cutting dev target size and

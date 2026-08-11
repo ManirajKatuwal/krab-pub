@@ -47,7 +47,7 @@ Supporting directories:
 | [benchmarks/](benchmarks/) | NFT thresholds, benchmark config, trend history | Inputs yes, results no |
 | [scripts/](scripts/) | Python NFT/benchmark/evidence tooling, `check_health.ps1` | Yes |
 | [monitoring/](monitoring/) | Prometheus config, alert rules, Grafana dashboard | Yes |
-| [docker/](docker/) | Postgres init scripts, rendered NFT compose | Yes |
+| [docker/](docker/) | Postgres init scripts (rendered NFT compose is generated, ignored) | Yes |
 | [examples/](examples/) | One vendored reference app (`islands_rpc`, a workspace member) plus five generated-track READMEs | Yes |
 | [.github/workflows/](.github/workflows/) | 14 CI gate workflows | Yes |
 | `internal/` | Plans, audits, evidence, wiki, reports | **No — gitignored** |
@@ -64,9 +64,11 @@ internal/wiki/      engineering wiki
 internal/reports/   strategy, framework, and pre-release reports
 ```
 
-Links from tracked files into `internal/` resolve locally but not in a public
-clone. **Never make `internal/` the only home for something a user needs** —
-public behaviour belongs in `docs/`.
+`internal/` exists only in the maintainer's working copy — it is untracked, so
+a fresh clone does not have it. **If `internal/` is absent in your checkout,
+skip every workflow below that depends on it** (plan governance, evidence
+ledger) and rely on the public gates instead. **Never make `internal/` the
+only home for something a user needs** — public behaviour belongs in `docs/`.
 
 ---
 
@@ -262,16 +264,16 @@ violations.
 ## Working agreements for agents
 
 1. **Verify before claiming.** No change is "done" until the relevant gates have
-   been run and their output captured. Record it per
-   `internal/audit/VERIFICATION_EVIDENCE_LOG.md`. The
-   [`krab-verify`](.claude/skills/krab-verify/SKILL.md) skill automates this.
+   been run and their output captured. Maintainer checkouts record it per
+   `internal/audit/VERIFICATION_EVIDENCE_LOG.md` (skip if `internal/` is absent);
+   the maintainer-local `krab-verify` skill automates this.
 2. **Report failures honestly.** If a gate fails or was skipped, say so with the
    output. Never summarize an unrun command as passing.
-3. **Plans are governed.** Creating a plan follows
-   `internal/plans/PLAN_CREATION_RULES.md`; closing one follows
-   `internal/plans/PLAN_CLOSING_RULES.md`. Do not mark a plan complete without
-   linked evidence. The [`krab-plan`](.claude/skills/krab-plan/SKILL.md) skill
-   routes both.
+3. **Plans are governed** (maintainer checkouts only — skip if `internal/` is
+   absent). Creating a plan follows `internal/plans/PLAN_CREATION_RULES.md`;
+   closing one follows `internal/plans/PLAN_CLOSING_RULES.md`. Do not mark a
+   plan complete without linked evidence. The maintainer-local `krab-plan`
+   skill routes both.
 4. **Changelog discipline.** Any user-visible change lands an entry under
    `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) in the same change.
 5. **Docs are part of the change.** Config knob → `.env.example` +
@@ -287,10 +289,14 @@ violations.
 
 ## Project skills
 
+Maintainer-local, under untracked `.claude/skills/` — present only in the
+maintainer's working copy. If your checkout does not have them, run the
+verification commands above directly.
+
 | Skill | Use when |
 |---|---|
-| [`krab-verify`](.claude/skills/krab-verify/SKILL.md) | Running gates, capturing evidence, proving a change works, release sign-off |
-| [`krab-plan`](.claude/skills/krab-plan/SKILL.md) | Writing, closing, superseding, or auditing a plan under `internal/plans/` |
+| `krab-verify` | Running gates, capturing evidence, proving a change works, release sign-off |
+| `krab-plan` | Writing, closing, superseding, or auditing a plan under `internal/plans/` |
 
 ---
 
