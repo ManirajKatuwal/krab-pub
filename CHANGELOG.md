@@ -16,6 +16,19 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Docs no longer teach non-compiling `view!` code.** The `create_action`
+  examples in the getting-started guide, the server-functions reference, and
+  the `krab_core::action` module docs used a reactive `disabled={ move || … }`
+  attribute closure, which does not compile — `view!` evaluates attribute
+  values once at build time. The examples now reflect pending state through
+  `<Show>`, and both docs state the attribute-reactivity limitation
+  explicitly. The render-policy and benchmarks docs also now state precisely
+  what `streaming` delivers today (chunked delivery of a complete render, not
+  progressive rendering) and that the NFT gate measures serial, unloaded
+  latency.
+
 ### Changed
 
 - **Dev profile no longer emits debuginfo for dependency crates**

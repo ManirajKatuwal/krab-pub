@@ -106,14 +106,18 @@ use krab_core::action::create_action;
 let rename = create_action(|name: String| async move { rename_project(name).await });
 
 view! {
-    <button
-        on:click={ move |_| rename.dispatch("new name".to_string()) }
-        disabled={ move || rename.pending().get() }
-    >
+    <button on:click={ move |_| rename.dispatch("new name".to_string()) }>
         "Rename"
     </button>
+    <Show when={ move || rename.pending().get() }>
+        <span class="pending">"Renaming…"</span>
+    </Show>
 }
 ```
+
+Attribute values in `view!` are evaluated once at build time — they are not
+reactive, so state like `pending` is reflected through `<Show>` or text
+interpolation, not through a `disabled={ … }` closure (which does not compile).
 
 `Action` exposes `pending`, `value`, and `error` as signals. A failed dispatch
 keeps the previous `value`, and a superseded dispatch cannot overwrite a newer

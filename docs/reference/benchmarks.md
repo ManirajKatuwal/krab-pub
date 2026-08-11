@@ -38,7 +38,11 @@ Supporting automation:
   consolidates run artifacts into a release-evidence manifest.
 
 All latency figures are wall-clock milliseconds measured client-side by the
-harness. **Latency percentiles are computed over successful requests only** —
+harness. **The release-blocking gate issues requests serially** — one in
+flight at a time (`nft_multi_service_gate.py` loops over `urllib` calls) — so
+its thresholds bound sequential, unloaded latency, not latency under concurrent
+load; gate-level concurrency is open work in the benchmark plan.
+**Latency percentiles are computed over successful requests only** —
 failed requests are counted in the error rate and excluded from the latency
 samples. A run with a high error rate therefore has percentiles that describe
 only the requests that got through; always read the error-rate column first.

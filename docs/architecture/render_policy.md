@@ -19,7 +19,13 @@ Krab route behavior is expressed with `RouteRenderPolicy`:
 
 - `CacheMode`: `None`, `Static`, `Isr`, or `Swr`
 - `EdgeCapability`: `OriginOnly`, `Eligible`, `Preferred`, or `Required`
-- `streaming`: whether the route may emit streamed SSR output
+- `streaming`: whether the route may emit streamed SSR output. **What
+  "streamed" means today:** the render is synchronous; `ChunkedStreamWriter`
+  splits the finished output into chunks and stamps suspense markers
+  (`<!--krab:suspense:…-->`) that no client code yet consumes. This is chunked
+  delivery of a complete render — not progressive or out-of-order rendering,
+  which was explicitly deferred by
+  [ADR 0009](../adr/0009-resource-ssr-semantics.md)
 
 ## Current frontend examples
 

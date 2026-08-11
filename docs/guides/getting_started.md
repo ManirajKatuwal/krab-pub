@@ -238,17 +238,23 @@ use krab_core::action::create_action;
 let add = create_action(|title: String| async move { add_task(title).await });
 
 view! {
-    <button
-        on:click={ move |_| add.dispatch("from the island".to_string()) }
-        disabled={ move || add.pending().get() }
-    >
+    <button on:click={ move |_| add.dispatch("from the island".to_string()) }>
         "Add task"
     </button>
+    <Show when={ move || add.pending().get() }>
+        <span class="pending">"Saving…"</span>
+    </Show>
     <Show when={ move || add.error().get().is_some() }>
         <p class="error">{ move || add.error().get().unwrap_or_default() }</p>
     </Show>
 }
 ```
+
+> **Attribute values are not reactive.** `view!` evaluates an attribute value
+> once, when the element is built, and stringifies it — `disabled={ move || … }`
+> does not compile (a closure has no `Display`). Reflect reactive state through
+> `<Show>`, text interpolation, or by re-rendering the element inside a dynamic
+> block. Reactive attributes are an acknowledged gap, not a hidden feature.
 
 `pending` is true from `dispatch` until the request settles, `value` holds the
 last success, and `error` holds the last failure. Two guarantees are worth

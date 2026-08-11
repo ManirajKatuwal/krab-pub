@@ -9,12 +9,14 @@
 //! let add = create_action(|title: String| async move { add_task(title).await });
 //!
 //! view! {
-//!     <button
-//!         on:click={ move |_| add.dispatch("write docs".to_string()) }
-//!         disabled={ move || add.pending().get() }
-//!     >
+//!     <button on:click={ move |_| add.dispatch("write docs".to_string()) }>
 //!         "Add"
 //!     </button>
+//!     // Attribute values are evaluated once at build and are not reactive, so
+//!     // pending state renders through `<Show>`, not `disabled={ … }`.
+//!     <Show when={move || add.pending().get()}>
+//!         <span class="pending">"Saving…"</span>
+//!     </Show>
 //!     <Show when={move || add.error().get().is_some()}>
 //!         <p class="error">{ move || add.error().get().unwrap_or_default() }</p>
 //!     </Show>
