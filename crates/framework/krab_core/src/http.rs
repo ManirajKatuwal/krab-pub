@@ -387,6 +387,72 @@ mod tests {
         assert_eq!(csrf_header_token(&headers).as_deref(), Some("abc123"));
     }
 
+    /// The middleware extraction functions and the shared wire-contract
+    /// constants in `crate::csrf` must agree. The wasm client half of
+    /// `#[server]` only ever uses the constants, so this pins the server half
+    /// to the same names — they cannot drift apart again.
+    #[test]
+    fn csrf_middleware_names_match_shared_constants() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(&format!(
+                "{}=tok-from-cookie",
+                crate::csrf::CSRF_COOKIE_NAME
+            ))
+            .expect("cookie header should build"),
+        );
+        headers.insert(
+            axum::http::HeaderName::from_bytes(crate::csrf::CSRF_HEADER_NAME.as_bytes())
+                .expect("header name should build"),
+            axum::http::HeaderValue::from_static("tok-from-header"),
+        );
+
+        assert_eq!(
+            csrf_cookie_token(&headers).as_deref(),
+            Some("tok-from-cookie")
+        );
+        assert_eq!(
+            csrf_header_token(&headers).as_deref(),
+            Some("tok-from-header")
+        );
+    }
+
+    /// The token endpoint must expose the token in its JSON body under the
+    /// shared field name and set the shared cookie name — with `HttpOnly`, the
+    /// body is the only channel through which a browser client can learn the
+    /// token.
+    #[tokio::test]
+    async fn csrf_token_endpoint_body_and_cookie_use_shared_names() {
+        let response = csrf_token_endpoint().await;
+
+        let set_cookie = response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("endpoint must set the CSRF cookie")
+            .to_str()
+            .expect("cookie should be ascii")
+            .to_string();
+        assert!(
+            set_cookie.starts_with(&format!("{}=", crate::csrf::CSRF_COOKIE_NAME)),
+            "cookie {set_cookie:?} does not use the shared cookie name"
+        );
+        assert!(set_cookie.contains("HttpOnly"));
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body should read");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("body should be JSON");
+        let token = parsed
+            .get(crate::csrf::CSRF_TOKEN_JSON_FIELD)
+            .and_then(|v| v.as_str())
+            .expect("body must carry the token under the shared field name");
+        assert!(
+            set_cookie.contains(token),
+            "cookie and body must carry the same token"
+        );
+    }
+
     #[test]
     fn extract_client_ip_falls_back_to_connect_info_when_proxy_headers_untrusted() {
         let mut req = Request::builder()

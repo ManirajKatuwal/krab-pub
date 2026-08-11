@@ -54,26 +54,37 @@ pub fn is_unsafe_http_method(method: &Method) -> bool {
 pub fn csrf_cookie_token(headers: &axum::http::HeaderMap) -> Option<String> {
     let raw = headers.get("cookie")?.to_str().ok()?;
     raw.split(';').map(str::trim).find_map(|pair| {
-        pair.strip_prefix("krab_csrf_token=")
+        pair.strip_prefix(crate::csrf::CSRF_COOKIE_NAME)
+            .and_then(|rest| rest.strip_prefix('='))
             .map(ToString::to_string)
     })
 }
 
 pub fn csrf_header_token(headers: &axum::http::HeaderMap) -> Option<String> {
     headers
-        .get("x-csrf-token")
+        .get(crate::csrf::CSRF_HEADER_NAME)
         .and_then(|h| h.to_str().ok())
         .map(ToString::to_string)
 }
 
+/// Issue a CSRF token: the same value is set as an `HttpOnly` cookie and
+/// returned in the JSON body under [`crate::csrf::CSRF_TOKEN_JSON_FIELD`],
+/// because an `HttpOnly` cookie is unreadable from script by design — the
+/// body is the only way a browser client can learn the token. Mount at
+/// [`crate::csrf::CSRF_TOKEN_ENDPOINT_PATH`] for the wasm client to find it.
 pub async fn csrf_token_endpoint() -> Response {
     let token = uuid::Uuid::new_v4().to_string();
     let cookie_value = format!(
-        "krab_csrf_token={}; SameSite=Strict; HttpOnly; Secure; Path=/",
+        "{}={}; SameSite=Strict; HttpOnly; Secure; Path=/",
+        crate::csrf::CSRF_COOKIE_NAME,
         token
     );
-    let body = serde_json::json!({ "csrf_token": token });
-    let mut response = Json(body).into_response();
+    let mut body = serde_json::Map::new();
+    body.insert(
+        crate::csrf::CSRF_TOKEN_JSON_FIELD.to_string(),
+        serde_json::Value::String(token),
+    );
+    let mut response = Json(serde_json::Value::Object(body)).into_response();
     if let Ok(val) = HeaderValue::from_str(&cookie_value) {
         response
             .headers_mut()

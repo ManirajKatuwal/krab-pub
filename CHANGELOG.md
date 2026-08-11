@@ -47,6 +47,20 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
   module-by-module map of `krab_core` with its cross-cutting invariants,
   migrated from the maintainer wiki so the public docs carry them.
 
+- **The shipped wasm client could never satisfy CSRF protection.** The client
+  half of `#[server]` read a cookie named `csrf_token` from `document.cookie`,
+  while the server middleware set `krab_csrf_token` — and set it `HttpOnly`,
+  so script could not read it under any name. Every state-changing server-fn
+  call from a browser was doomed to 403 the moment CSRF protection was
+  enabled. The client now fetches the token from the CSRF token endpoint's
+  JSON body (mount `csrf_token_endpoint` at `krab_core::csrf::
+  CSRF_TOKEN_ENDPOINT_PATH`, `/api/csrf-token`); the cookie stays `HttpOnly`.
+  Cookie name, header name, endpoint path, and JSON field are now shared
+  constants in `krab_core::csrf` referenced by both halves, with a native test
+  pinning the endpoint's output to them, so the names cannot drift again.
+  Deployments that do not enable CSRF protection are unaffected: when the
+  endpoint is not mounted the client sends no CSRF header, as before.
+
 - **`krab release check --json` exited 0 on failure.** The `--json` branch
   printed the report and returned success, so any pipeline gating on the exit
   code shipped through failed checks. Both output modes now share one exit

@@ -97,8 +97,9 @@ db = ["db-postgres"]
 version = "0.3"
 # `Event` covers island event listeners. The rest are what
 # `server_fn::call_server_fn` needs to issue a `fetch` from the browser: the
-# request/response pair, its headers, and the window and document it reads the
-# CSRF cookie from.
+# request/response pair, its headers, and the window it fetches through —
+# including the CSRF token endpoint (the CSRF cookie is HttpOnly, so the token
+# comes from that endpoint's JSON body, never from `document.cookie`).
 features = [
     "Event",
     "Document",

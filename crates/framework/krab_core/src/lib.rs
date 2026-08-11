@@ -6,6 +6,10 @@ pub mod config;
 pub mod control_flow;
 #[cfg(feature = "auth")]
 pub mod credentials;
+// Compiled unconditionally: the CSRF wire-contract names are shared between
+// the `rest` server half and the `web` wasm client half, which never build
+// together, so the constants cannot live behind either feature gate.
+pub mod csrf;
 pub mod error_boundary;
 #[cfg(feature = "graphql")]
 pub mod graphql;

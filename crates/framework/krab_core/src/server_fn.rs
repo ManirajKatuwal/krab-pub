@@ -410,19 +410,14 @@ pub async fn call_server_fn<A: Serialize, T: serde::de::DeserializeOwned>(
         .set("Content-Type", "application/json")
         .map_err(|_| ServerFnError::new("failed to set content-type"))?;
 
-    // Propagate CSRF token if present
-    if let Some(document) = window.document() {
-        if let Ok(cookie) =
-            js_sys::Reflect::get(&document, &wasm_bindgen::JsValue::from_str("cookie"))
-        {
-            let cookie_str = cookie.as_string().unwrap_or_default();
-            for part in cookie_str.split(';') {
-                let trimmed = part.trim();
-                if let Some(token) = trimmed.strip_prefix("csrf_token=") {
-                    let _ = request.headers().set("x-csrf-token", token);
-                }
-            }
-        }
+    // Propagate a CSRF token if the server issues them. The CSRF cookie is
+    // `HttpOnly` by design, so it can never be read from `document.cookie` —
+    // the token endpoint returns the token in its JSON body and sets the
+    // matching cookie on that same response, which the browser attaches to
+    // this request automatically. Header and cookie names are the shared
+    // constants in [`crate::csrf`], so client and middleware cannot drift.
+    if let Some(token) = fetch_csrf_token(&window).await {
+        let _ = request.headers().set(crate::csrf::CSRF_HEADER_NAME, &token);
     }
 
     let resp_value = JsFuture::from(window.fetch_with_request(&request))
@@ -450,6 +445,41 @@ pub async fn call_server_fn<A: Serialize, T: serde::de::DeserializeOwned>(
         // Try to parse server error
         Err(decode_server_fn_error_body(&text_str, resp.status()))
     }
+}
+
+/// Fetch a CSRF token from [`crate::csrf::CSRF_TOKEN_ENDPOINT_PATH`].
+///
+/// Returns `None` when the endpoint is not mounted (404), unreachable, or the
+/// body does not carry [`crate::csrf::CSRF_TOKEN_JSON_FIELD`] — in which case
+/// the call proceeds without a CSRF header, exactly as before for deployments
+/// that do not enable CSRF protection.
+#[cfg(target_arch = "wasm32")]
+async fn fetch_csrf_token(window: &web_sys::Window) -> Option<String> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+
+    let opts = web_sys::RequestInit::new();
+    opts.set_method("GET");
+
+    let request =
+        web_sys::Request::new_with_str_and_init(crate::csrf::CSRF_TOKEN_ENDPOINT_PATH, &opts)
+            .ok()?;
+
+    let resp_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .ok()?;
+    let resp: web_sys::Response = resp_value.dyn_into().ok()?;
+    if !resp.ok() {
+        return None;
+    }
+
+    let text = JsFuture::from(resp.text().ok()?).await.ok()?;
+    let text = text.as_string()?;
+    let parsed: serde_json::Value = serde_json::from_str(&text).ok()?;
+    parsed
+        .get(crate::csrf::CSRF_TOKEN_JSON_FIELD)?
+        .as_str()
+        .map(ToString::to_string)
 }
 
 /// Native client-side call path for non-WASM targets.
