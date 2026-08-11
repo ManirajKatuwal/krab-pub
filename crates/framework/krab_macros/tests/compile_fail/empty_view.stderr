@@ -1,0 +1,10 @@
+error: unexpected end of input, view! macro body is empty. Provide at least one element, text, or expression:
+         view! { <div>"Hello"</div> }
+         view! { "Static text" }
+         view! { {my_variable} }
+ --> tests/compile_fail/empty_view.rs:6:13
+  |
+6 |     let _ = view! { }.render();
+  |             ^^^^^^^^^
+  |
+  = note: this error originates in the macro `view` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -1,0 +1,12 @@
+error: <Show> has no attribute `fallbck`. It accepts: when, fallback.
+  --> tests/compile_fail/control_flow_unknown_attribute.rs:7:13
+   |
+ 7 |       let _ = view! {
+   |  _____________^
+ 8 | |         <Show when={|| false} fallbck={|| view! { <p>"no"</p> }}>
+ 9 | |             <p>"yes"</p>
+10 | |         </Show>
+11 | |     }
+   | |_____^
+   |
+   = note: this error originates in the macro `view` (in Nightly builds, run with -Z macro-backtrace for more info)

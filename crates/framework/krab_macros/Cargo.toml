@@ -1,0 +1,34 @@
+[package]
+name = "krab_macros"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/krab_macros"
+description = "Procedural macros for the Krab framework: view!, #[island], and #[server]"
+keywords = ["krab", "macros", "proc-macro", "view", "islands"]
+categories = ["web-programming", "development-tools"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+quote = "1.0"
+syn = { version = "2.0", features = ["full"] }
+proc-macro2 = "1.0"
+
+[dev-dependencies]
+# Path-only and version-less on purpose — see the matching note on
+# `krab_core`'s dev-dependency on this crate. Cargo strips version-less path
+# dev-dependencies on publish; adding a version here deadlocks publication.
+krab_core = { path = "../krab_core", features = ["rest"] }
+trybuild = { version = "1.0", features = ["diff"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+# `#[server]` expands to code referencing `axum` directly, so any crate using it
+# needs axum in scope. Present here so the doc examples are actually compiled.
+axum = { workspace = true }

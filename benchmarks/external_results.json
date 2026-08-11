@@ -1,0 +1,63 @@
+{
+  "timestamp_utc": "2026-03-08T11:26:36Z",
+  "profile": "load",
+  "results": {
+    "krab": {
+      "home": {
+        "samples": 1000,
+        "errors": 0,
+        "error_rate": 0.0,
+        "p50": 3.9,
+        "p95": 6.16,
+        "p99": 9.85,
+        "mean": 4.13,
+        "stddev": 1.69,
+        "max": 25.2
+      },
+      "blog_post": {
+        "samples": 1000,
+        "errors": 0,
+        "error_rate": 0.0,
+        "p50": 3.7,
+        "p95": 5.78,
+        "p99": 8.53,
+        "mean": 3.91,
+        "stddev": 1.4,
+        "max": 19.45
+      },
+      "api_status": {
+        "samples": 1000,
+        "errors": 0,
+        "error_rate": 0.0,
+        "p50": 306.85,
+        "p95": 372.69,
+        "p99": 439.12,
+        "mean": 311.15,
+        "stddev": 34.97,
+        "max": 516.73
+      },
+      "api_mutation": {
+        "samples": 1000,
+        "errors": 0,
+        "error_rate": 0.0,
+        "p50": 6.53,
+        "p95": 10.82,
+        "p99": 20.08,
+        "mean": 6.98,
+        "stddev": 2.57,
+        "max": 26.3
+      },
+      "health": {
+        "samples": 1000,
+        "errors": 0,
+        "error_rate": 0.0,
+        "p50": 5.46,
+        "p95": 8.62,
+        "p99": 11.52,
+        "mean": 5.68,
+        "stddev": 1.79,
+        "max": 17.5
+      }
+    }
+  }
+}

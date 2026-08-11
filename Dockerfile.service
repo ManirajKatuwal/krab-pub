@@ -1,0 +1,55 @@
+# Multi-stage build for any Krab service binary.
+# Build argument BIN selects the binary name (service_auth | service_users | service_frontend).
+
+ARG BIN=service_auth
+
+# ── Build stage ───────────────────────────────────────────────────────────────
+# Use stable Rust so Cargo understands modern lockfile formats (v4+).
+FROM rust:slim-bookworm AS builder
+ARG BIN
+WORKDIR /build
+
+# Cache dependency compilation separately from source
+COPY Cargo.toml Cargo.lock ./
+COPY crates/framework/krab_core/Cargo.toml crates/framework/krab_core/Cargo.toml
+COPY crates/framework/krab_macros/Cargo.toml crates/framework/krab_macros/Cargo.toml
+COPY crates/framework/krab_client/Cargo.toml crates/framework/krab_client/Cargo.toml
+COPY services/service_auth/Cargo.toml services/service_auth/Cargo.toml
+COPY services/service_users/Cargo.toml services/service_users/Cargo.toml
+COPY services/service_frontend/Cargo.toml services/service_frontend/Cargo.toml
+COPY services/service_users_split/Cargo.toml services/service_users_split/Cargo.toml
+COPY crates/tooling/krab_orchestrator/Cargo.toml crates/tooling/krab_orchestrator/Cargo.toml
+COPY crates/tooling/krab_cli/Cargo.toml crates/tooling/krab_cli/Cargo.toml
+COPY examples/reference_apps/islands_rpc/Cargo.toml examples/reference_apps/islands_rpc/Cargo.toml
+
+# Stub source files so Cargo can resolve the dependency graph
+RUN find . -name 'Cargo.toml' -not -path './Cargo.toml' | while read f; do \
+      dir=$(dirname "$f"); \
+      mkdir -p "$dir/src"; \
+      echo 'fn main() {}' > "$dir/src/main.rs"; \
+      echo '' > "$dir/src/lib.rs"; \
+    done
+
+RUN cargo build --release --bin "$BIN" 2>/dev/null || true
+
+# Now copy real source
+COPY . .
+# Touch main files so Cargo rebuilds them
+RUN find . -name "*.rs" -exec touch {} +
+RUN cargo build --release --bin "$BIN"
+
+# ── Runtime stage ─────────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+ARG BIN
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --gid 10001 krab && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin krab
+
+COPY --from=builder /build/target/release/$BIN /usr/local/bin/service
+RUN chown krab:krab /usr/local/bin/service && chmod 0755 /usr/local/bin/service
+ENV BIN=$BIN
+EXPOSE 3000 3001 3002
+USER 10001:10001
+ENTRYPOINT ["/usr/local/bin/service"]

@@ -1,0 +1,89 @@
+[project]
+frontend_bin = "service_frontend"
+client_package = "krab_client"
+client_crate_dir = "crates/framework/krab_client"
+client_artifact_stem = "krab_client"
+public_dir = "services/service_frontend/public"
+dist_dir = "dist"
+server_paths = ["services/service_frontend/src"]
+client_paths = ["crates/framework/krab_client/src"]
+shared_paths = ["crates/framework/krab_core/src", "crates/framework/krab_macros/src"]
+public_paths = ["services/service_frontend/public"]
+bootstrap_bin = "krab_orchestrator"
+hmr_signal_path = "dist/.hmr_signal"
+
+[services.auth]
+command = "cargo"
+args = ["run", "--bin", "service_auth"]
+env = { RUST_LOG = "info" }
+healthcheck_url = "http://127.0.0.1:3001/health"
+healthcheck_timeout_ms = 1500
+
+[services.auth.restart_policy]
+on_exit = true
+backoff_ms = 700
+max_attempts = 8
+
+[services.auth.healthcheck]
+url = "http://127.0.0.1:3001/ready"
+timeout_ms = 1500
+retries = 12
+interval_ms = 300
+
+[services.users]
+command = "cargo"
+args = ["run", "--bin", "service_users"]
+env = { RUST_LOG = "info" }
+depends_on = ["auth"]
+startup_dependencies = ["auth"]
+healthcheck_url = "http://127.0.0.1:3002/health"
+healthcheck_timeout_ms = 1500
+
+[services.users.restart_policy]
+on_exit = true
+backoff_ms = 700
+max_attempts = 8
+
+[services.users.healthcheck]
+url = "http://127.0.0.1:3002/ready"
+timeout_ms = 1500
+retries = 12
+interval_ms = 300
+
+[services.frontend]
+command = "cargo"
+args = ["run", "--bin", "service_frontend"]
+env = { RUST_LOG = "info" }
+depends_on = ["auth", "users"]
+startup_dependencies = ["auth", "users"]
+healthcheck_url = "http://127.0.0.1:3000/health"
+healthcheck_timeout_ms = 1500
+
+[services.frontend.restart_policy]
+on_exit = true
+backoff_ms = 700
+max_attempts = 8
+
+[services.frontend.healthcheck]
+url = "http://127.0.0.1:3000/ready"
+timeout_ms = 1500
+retries = 12
+interval_ms = 300
+
+[services.users_split]
+command = "cargo"
+args = ["run", "--bin", "service_users_split"]
+env = { RUST_LOG = "info" }
+healthcheck_url = "http://127.0.0.1:3207/health"
+healthcheck_timeout_ms = 1500
+
+[services.users_split.restart_policy]
+on_exit = true
+backoff_ms = 700
+max_attempts = 8
+
+[services.users_split.healthcheck]
+url = "http://127.0.0.1:3207/ready"
+timeout_ms = 1500
+retries = 12
+interval_ms = 300

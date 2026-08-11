@@ -1,0 +1,13 @@
+error: #[server] methods with `self` are not supported. Use a free async function instead
+ --> tests/compile_fail/server_method_self.rs:8:27
+  |
+8 |     pub async fn get_user(&self, id: String) -> Result<String, ServerFnError> {
+  |                           ^^^^^
+
+warning: unused import: `krab_core::server_fn::ServerFnError`
+ --> tests/compile_fail/server_method_self.rs:1:5
+  |
+1 | use krab_core::server_fn::ServerFnError;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

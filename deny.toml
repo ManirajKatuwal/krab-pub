@@ -1,0 +1,69 @@
+[graph]
+all-features = true
+targets = [
+  "x86_64-pc-windows-msvc",
+  "wasm32-unknown-unknown",
+]
+
+[advisories]
+unsound = "all"
+yanked = "deny"
+unmaintained = "all"
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "CC0-1.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "CDLA-Permissive-2.0",
+  "Unicode-DFS-2016",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+deny = []
+# sha1 v0.10.x is a transitive dependency of axum (via tungstenite) and cannot
+# be removed. It is not used directly for any security operation in this codebase.
+# Skipped here to prevent false-positive cargo-deny failures.
+skip = [
+  { name = "sha1", reason = "transitive dep of axum/tungstenite; not used for security operations" },
+  { name = "base64", reason = "split transitive ecosystems (config/ron vs modern HTTP/auth stack) currently require parallel major lines" },
+  { name = "darling", reason = "proc-macro derive stacks pin different major lines and cannot be unified without upstream upgrades" },
+  { name = "darling_core", reason = "paired with darling duplicate lines across proc-macro ecosystems" },
+  { name = "darling_macro", reason = "paired with darling duplicate lines across proc-macro ecosystems" },
+  { name = "getrandom", reason = "simultaneous rand 0.8 and 0.9 ecosystems pull separate getrandom generations" },
+  { name = "hashbrown", reason = "indexmap/sqlx/config transitive chains currently require multiple generations" },
+  { name = "hashlink", reason = "config and sqlx dependency trees currently pin different hashlink lines" },
+  { name = "mio", reason = "tokio and older transitive stacks still resolve more than one compatible line" },
+  { name = "r-efi", reason = "target/runtime support crates introduce unavoidable duplicate entries" },
+  { name = "rand", reason = "legacy and next-generation random ecosystems are both required by current transitive set" },
+  { name = "rand_chacha", reason = "paired with rand duplicate lines (0.8/0.9 ecosystems)" },
+  { name = "rand_core", reason = "paired with rand duplicate lines (0.8/0.9 ecosystems)" },
+  { name = "socket2", reason = "networking transitive stacks currently require both 0.5 and 0.6 lines" },
+  { name = "toml_datetime", reason = "tooling/proc-macro stacks depend on both toml 0.8 and toml 1.x families" },
+  { name = "toml_edit", reason = "tooling/proc-macro stacks depend on both toml_edit 0.22 and 0.25 families" },
+  { name = "webpki-roots", reason = "TLS dependency chains include both 0.26 and 1.x compatibility layers" },
+  { name = "windows-sys", reason = "transitive crates pin multiple windows-sys generations during ecosystem migration" },
+  { name = "windows-targets", reason = "paired with windows-sys multi-generation compatibility crates" },
+  { name = "windows_aarch64_gnullvm", reason = "target support package duplicates from upstream windows-targets matrix" },
+  { name = "windows_aarch64_msvc", reason = "target support package duplicates from upstream windows-targets matrix" },
+  { name = "windows_i686_gnu", reason = "target support package duplicates from upstream windows-targets matrix" },
+  { name = "windows_i686_msvc", reason = "target support package duplicates from upstream windows-targets matrix" },
+  { name = "windows_x86_64_gnu", reason = "target support package duplicates from upstream windows-targets matrix" },
+  { name = "windows_x86_64_gnullvm", reason = "target support package duplicates from upstream windows-targets matrix" },
+  { name = "windows_x86_64_msvc", reason = "target support package duplicates from upstream windows-targets matrix" },
+]
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

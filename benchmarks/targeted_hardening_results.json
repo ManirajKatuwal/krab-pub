@@ -1,0 +1,22 @@
+{
+  "status": "ok",
+  "timestamp_utc": "2026-04-05T10:30:22Z",
+  "load": {
+    "target": "http://127.0.0.1:3001/health",
+    "samples": 120,
+    "success": 119,
+    "errors": 1,
+    "p50_ms": 6.69,
+    "p95_ms": 11.37,
+    "p99_ms": 16.19,
+    "mean_ms": 7.07
+  },
+  "fuzz": {
+    "target": "http://127.0.0.1:3001/api/v1/auth/login",
+    "samples": 120,
+    "ok": 0,
+    "client4xx": 120,
+    "server5xx": 0,
+    "transport_other": 0
+  }
+}

@@ -1,0 +1,45 @@
+name: topology-matrix
+
+on:
+  pull_request:
+    paths:
+      - "services/service_frontend/**"
+      - "crates/framework/krab_core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/topology-matrix.yaml"
+  push:
+    branches: [main]
+
+jobs:
+  frontend-topology-matrix:
+    name: frontend tests (${{ matrix.topology }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        topology: [monolith, distributed]
+
+    env:
+      KRAB_RUNTIME_TOPOLOGY: ${{ matrix.topology }}
+      KRAB_RUNTIME_ENDPOINTS_JSON: >-
+        {"auth":{"base_url":"http://127.0.0.1:3001","timeout_ms":1200,"max_retries":1},"users":{"base_url":"http://127.0.0.1:3002","timeout_ms":1200,"max_retries":1}}
+      RUST_TEST_THREADS: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Topology diagnostics
+        run: |
+          echo "KRAB_RUNTIME_TOPOLOGY=${KRAB_RUNTIME_TOPOLOGY}"
+          echo "KRAB_RUNTIME_ENDPOINTS_JSON=${KRAB_RUNTIME_ENDPOINTS_JSON}"
+
+      - name: Run frontend tests in topology mode
+        run: cargo test -p service_frontend
+

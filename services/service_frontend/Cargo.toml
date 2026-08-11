@@ -1,0 +1,38 @@
+[package]
+name = "service_frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SSR + islands frontend — Krab reference service"
+publish = false
+
+[features]
+# Enable non-functional / performance tests.  Run via `cargo test --features nft`
+# or by setting KRAB_NFT=1 in CI (see .github/workflows/nft.yaml).
+nft = []
+
+[dependencies]
+axum = { workspace = true, features = ["ws"] }
+hyper = { version = "1.0", features = ["full"] }
+tokio = { workspace = true, features = ["full"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["full"] }
+bytes = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+krab_core = { workspace = true, features = ["rest", "redis-store"] }
+krab_client = { workspace = true }
+krab_macros = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tower = { workspace = true, features = ["full"] }
+tower-http = { workspace = true, features = ["trace", "cors", "fs"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio-stream = { version = "0.1.18", features = ["sync"] }
+futures-util = "0.3.32"
+anyhow.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+serial_test = "3"

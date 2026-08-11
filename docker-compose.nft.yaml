@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  service_frontend:
+    ports: !reset []
+    environment:
+      KRAB_TRUST_PROXY_HEADERS: "true"
+
+  service_auth:
+    ports: !reset []
+    environment:
+      KRAB_TRUST_PROXY_HEADERS: "true"
+
+  service_users:
+    ports: !reset []
+    environment:
+      KRAB_TRUST_PROXY_HEADERS: "true"
+
+  nft_runner:
+    image: python:3.12-slim
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    environment:
+      KRAB_FRONTEND_BASE_URL: http://service_frontend:3000
+      KRAB_AUTH_BASE_URL: http://service_auth:3001
+      KRAB_USERS_BASE_URL: http://service_users:3002
+      KRAB_BEARER_TOKEN: ${KRAB_BEARER_TOKEN:-test-token}
+    entrypoint: ["python3", "scripts/nft_multi_service_gate.py"]

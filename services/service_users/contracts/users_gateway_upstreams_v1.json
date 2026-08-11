@@ -1,0 +1,19 @@
+{
+  "service": "users",
+  "version": 1,
+  "routes": [
+    {
+      "path_prefix": "/api/v1/users/",
+      "upstream": "users-rest"
+    },
+    {
+      "path_exact": "/api/v1/graphql",
+      "upstream": "users-graphql"
+    },
+    {
+      "path_exact": "/api/v1/rpc",
+      "upstream": "users-rpc"
+    }
+  ]
+}
+

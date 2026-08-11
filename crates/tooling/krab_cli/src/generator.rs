@@ -1,0 +1,556 @@
+use anyhow::{Context, Result};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::topology::protocol_label;
+use crate::{ExposureMode, GenResource, ServiceType, Topology};
+
+pub(crate) fn dispatch_gen_resource(resource: &GenResource) -> Result<()> {
+    match resource {
+        GenResource::Service {
+            name,
+            r#type,
+            exposure_mode,
+            protocols,
+            topology,
+        } => generate_service(name, r#type, exposure_mode, protocols, topology),
+        GenResource::Component { name } => generate_component(name),
+        GenResource::Route { name } => generate_route(name),
+        GenResource::ServerFunction { name } => generate_server_function(name),
+    }
+}
+
+fn generate_service(
+    name: &str,
+    service_type: &ServiceType,
+    exposure_mode: &ExposureMode,
+    protocols: &Option<Vec<ServiceType>>,
+    topology: &Topology,
+) -> Result<()> {
+    println!(
+        "🦀 Generating service '{}' of type {:?} (mode={:?}, topology={:?})...",
+        name, service_type, exposure_mode, topology
+    );
+
+    let selected_protocols = resolve_protocols(service_type, exposure_mode, protocols)?;
+
+    if *topology == Topology::SplitServices {
+        return generate_split_service_topology(name, &selected_protocols);
+    }
+
+    let path = PathBuf::from(name);
+    if path.exists() {
+        anyhow::bail!("Directory '{}' already exists", name);
+    }
+
+    fs::create_dir(&path).context("Failed to create service directory")?;
+
+    let mut feature_names: Vec<&str> = Vec::new();
+    for proto in &selected_protocols {
+        let feature = match proto {
+            ServiceType::Rest => Some("rest"),
+            ServiceType::Graphql => Some("graphql"),
+            ServiceType::Rpc => Some("rest"),
+            ServiceType::Grpc => Some("grpc"),
+        };
+        if let Some(feature) = feature {
+            if !feature_names.contains(&feature) {
+                feature_names.push(feature);
+            }
+        }
+    }
+    if feature_names.is_empty() {
+        feature_names.push("rest");
+    }
+
+    let cargo_toml = render_service_manifest(name, &feature_names);
+
+    fs::write(path.join("Cargo.toml"), cargo_toml)?;
+    fs::create_dir(path.join("src"))?;
+
+    let mut main_rs = r#"use anyhow::Result;
+use async_trait::async_trait;
+use krab_core::service::ApiService;
+
+struct Service;
+
+#[async_trait]
+impl ApiService for Service {
+    async fn start(&self) -> Result<()> {
+        println!("Service started!");
+        Ok(())
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+    println!("exposure_mode=__EXPOSURE_MODE__");
+    println!("protocols=__PROTOCOLS__");
+    let service = Service;
+    service.start().await
+}
+"#
+    .to_string();
+    let exposure_mode_value = match exposure_mode {
+        ExposureMode::Single => "single",
+        ExposureMode::Multi => "multi",
+    };
+    let protocols_value = selected_protocols
+        .iter()
+        .map(protocol_label)
+        .collect::<Vec<&str>>()
+        .join(",");
+    main_rs = main_rs
+        .replace("__EXPOSURE_MODE__", exposure_mode_value)
+        .replace("__PROTOCOLS__", &protocols_value);
+    fs::write(path.join("src/main.rs"), main_rs)?;
+
+    if *exposure_mode == ExposureMode::Multi {
+        generate_multi_mode_layout(&path, &selected_protocols)?;
+    }
+
+    println!("✅ Service '{}' created successfully!", name);
+    println!(
+        "👉 Add '{}' to your workspace Cargo.toml members list.",
+        name
+    );
+
+    Ok(())
+}
+
+/// Render the manifest for a `krab gen service` single-crate service.
+///
+/// `krab_core` resolves from crates.io at the CLI's own (workspace) version.
+/// The old output emitted `path = "../krab_core"`, a directory that has not
+/// existed since the crates/ reorganisation (`crates/framework/krab_core`), so
+/// no generated service could ever resolve its dependencies. `async-trait` is
+/// declared because the generated `main.rs` implements
+/// `krab_core::service::ApiService` with `#[async_trait]`.
+fn render_service_manifest(name: &str, feature_names: &[&str]) -> String {
+    format!(
+        r#"[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = {{ version = "1.0", features = ["full"] }}
+krab_core = {{ version = "{version}", features = [{features}] }}
+async-trait = "0.1"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+serde = {{ version = "1.0", features = ["derive"] }}
+"#,
+        version = crate::project_template::FRAMEWORK_VERSION,
+        features = feature_names
+            .iter()
+            .map(|f| format!("\"{}\"", f))
+            .collect::<Vec<String>>()
+            .join(", ")
+    )
+}
+
+/// Render the manifest for one protocol-adapter crate of a split topology.
+/// Same registry-resolution rationale as [`render_service_manifest`].
+fn render_split_adapter_manifest(crate_name: &str, domain_name: &str) -> String {
+    format!(
+        "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{domain_name} = {{ path = \"../{domain_name}\" }}\nkrab_core = {{ version = \"{version}\", features = [\"rest\"] }}\n",
+        version = crate::project_template::FRAMEWORK_VERSION
+    )
+}
+
+fn resolve_protocols(
+    service_type: &ServiceType,
+    exposure_mode: &ExposureMode,
+    protocols: &Option<Vec<ServiceType>>,
+) -> Result<Vec<ServiceType>> {
+    let mut selected = if *exposure_mode == ExposureMode::Single {
+        vec![service_type.clone()]
+    } else {
+        protocols
+            .clone()
+            .unwrap_or_else(|| vec![service_type.clone()])
+    };
+
+    if selected.is_empty() {
+        selected.push(service_type.clone());
+    }
+
+    let mut deduped = Vec::new();
+    for p in selected {
+        if !deduped.contains(&p) {
+            deduped.push(p);
+        }
+    }
+    Ok(deduped)
+}
+
+fn generate_multi_mode_layout(path: &Path, selected_protocols: &[ServiceType]) -> Result<()> {
+    let domain_dir = path.join("src/domain");
+    let adapters_dir = path.join("src/adapters");
+    fs::create_dir_all(&domain_dir)?;
+    fs::create_dir_all(&adapters_dir)?;
+
+    fs::write(
+        path.join("src/capabilities.rs"),
+        "pub fn build_capabilities() {}\n",
+    )?;
+    fs::write(
+        path.join("src/domain/mod.rs"),
+        "pub mod models;\npub mod service;\n",
+    )?;
+    fs::write(
+        path.join("src/domain/models.rs"),
+        "#[derive(Debug, Clone)]\npub struct DomainModel;\n",
+    )?;
+    fs::write(
+        path.join("src/domain/service.rs"),
+        "pub trait DomainService: Send + Sync {}\n",
+    )?;
+
+    let mut mod_rs = String::new();
+    for protocol in selected_protocols {
+        let label = protocol_label(protocol);
+        let module_name = label.replace('-', "_");
+        mod_rs.push_str(&format!("pub mod {};\n", module_name));
+        fs::write(
+            adapters_dir.join(format!("{}.rs", module_name)),
+            format!("pub fn mount_{}() {{}}\n", module_name),
+        )?;
+    }
+    if mod_rs.is_empty() {
+        mod_rs.push_str("pub mod rest;\n");
+        fs::write(adapters_dir.join("rest.rs"), "pub fn mount_rest() {}\n")?;
+    }
+    fs::write(adapters_dir.join("mod.rs"), mod_rs)?;
+    Ok(())
+}
+
+fn generate_split_service_topology(name: &str, selected_protocols: &[ServiceType]) -> Result<()> {
+    let domain_name = format!("{}-domain", name);
+    let domain_path = PathBuf::from(&domain_name);
+    if domain_path.exists() {
+        anyhow::bail!("Directory '{}' already exists", domain_name);
+    }
+
+    fs::create_dir(&domain_path)?;
+    fs::create_dir(domain_path.join("src"))?;
+    fs::write(
+        domain_path.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            domain_name
+        ),
+    )?;
+    fs::write(
+        domain_path.join("src/lib.rs"),
+        "pub fn shared_domain_marker() -> &'static str { \"shared\" }\n",
+    )?;
+
+    let mut created = Vec::new();
+    for protocol in selected_protocols {
+        let label = protocol_label(protocol);
+        let crate_name = format!("{}-{}", name, label);
+        let crate_path = PathBuf::from(&crate_name);
+        if crate_path.exists() {
+            anyhow::bail!("Directory '{}' already exists", crate_name);
+        }
+        fs::create_dir(&crate_path)?;
+        fs::create_dir_all(crate_path.join(format!("src/adapters/{}", label)))?;
+        fs::create_dir_all(crate_path.join("src/domain"))?;
+        fs::write(
+            crate_path.join("Cargo.toml"),
+            render_split_adapter_manifest(&crate_name, &domain_name),
+        )?;
+        fs::write(
+            crate_path.join("src/main.rs"),
+            format!("fn main() {{ println!(\"{} adapter service\"); }}\n", label),
+        )?;
+        fs::write(crate_path.join("src/domain/mod.rs"), "pub use crate::*;\n")?;
+        fs::write(
+            crate_path.join(format!("src/adapters/{}/mod.rs", label)),
+            format!("pub fn mount_{}() {{}}\n", label.replace('-', "_")),
+        )?;
+        fs::write(
+            crate_path.join("src/adapters/mod.rs"),
+            format!("pub mod {};\n", label.replace('-', "_")),
+        )?;
+        created.push(crate_name);
+    }
+
+    println!(
+        "✅ Split topology generated with shared domain crate: {}",
+        domain_name
+    );
+    println!("👉 Generated protocol crates: {}", created.join(", "));
+    Ok(())
+}
+
+fn generate_component(name: &str) -> Result<()> {
+    println!("🦀 Generating component '{}'...", name);
+    let path = PathBuf::from(format!("src/components/{}.rs", name.to_lowercase()));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let content = render_component(name);
+    fs::write(&path, content)?;
+    println!("✅ Component '{}' created at {:?}", name, path);
+    Ok(())
+}
+
+/// Render a plain (non-island) component.
+///
+/// Components are ordinary functions returning [`krab_core::Node`]; `view!`
+/// builds the node tree. Interactive components additionally carry `#[island]`
+/// and take a single serialisable props struct.
+fn render_component(name: &str) -> String {
+    format!(
+        r#"use krab_core::Node;
+use krab_macros::view;
+
+/// Renders the `{name}` component.
+#[allow(non_snake_case)]
+pub fn {name}() -> Node {{
+    view! {{
+        <div class="{class}">
+            "We are crabs"
+        </div>
+    }}
+}}
+"#,
+        name = name,
+        class = name.to_lowercase()
+    )
+}
+
+fn generate_route(name: &str) -> Result<()> {
+    println!("🦀 Generating route '{}'...", name);
+    let path = PathBuf::from(format!("src/routes/{}.rs", name.to_lowercase()));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let content = render_route(name);
+    fs::write(&path, content)?;
+    println!("✅ Route '{}' created at {:?}", name, path);
+    Ok(())
+}
+
+/// Render a route module.
+///
+/// `service_frontend/build.rs` discovers `src/routes/<stem>.rs` and registers
+/// `<module>::handler` at `/<stem>` (or `/` for `index.rs`), so the exported
+/// item must be `pub async fn handler()` returning an Axum response. Declare
+/// per-route middleware with a `//# middleware: name` comment.
+fn render_route(name: &str) -> String {
+    format!(
+        r#"use axum::response::Html;
+use krab_core::Render;
+use krab_macros::view;
+
+/// Handles `GET /{path}`.
+pub async fn handler() -> Html<String> {{
+    Html(
+        view! {{
+            <div>
+                "Route: {name}"
+            </div>
+        }}
+        .render(),
+    )
+}}
+"#,
+        path = name.to_lowercase(),
+        name = name
+    )
+}
+
+fn generate_server_function(name: &str) -> Result<()> {
+    println!("🦀 Generating server function '{}'...", name);
+    let path = PathBuf::from(format!("src/server_functions/{}.rs", name.to_lowercase()));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let content = render_server_function(name);
+    fs::write(&path, content)?;
+    println!("Server function '{}' created at {:?}", name, path);
+    Ok(())
+}
+
+fn render_server_function(name: &str) -> String {
+    format!(
+        r#"use krab_core::server_fn::{{validate_server_fn, ServerFnError}};
+use krab_macros::server;
+
+#[server]
+pub async fn {}(input: String) -> Result<String, ServerFnError> {{
+    validate_server_fn(!input.trim().is_empty(), "input is required")?;
+    Ok(format!("Hello from server: {{}}", input))
+}}
+"#,
+        name
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        render_component, render_route, render_server_function, render_service_manifest,
+        render_split_adapter_manifest,
+    };
+
+    fn dependencies_of(manifest: &str) -> toml::value::Table {
+        let parsed: toml::Value = toml::from_str(manifest)
+            .unwrap_or_else(|e| panic!("generated manifest is not valid TOML: {e}\n{manifest}"));
+        parsed
+            .get("dependencies")
+            .and_then(|d| d.as_table())
+            .expect("generated manifest has no [dependencies]")
+            .clone()
+    }
+
+    /// The generated `main.rs` uses `#[async_trait]`, but the manifest never
+    /// declared the crate, and `krab_core` pointed at `../krab_core` — a path
+    /// that has not existed since the crates/ reorganisation. Neither output
+    /// could compile.
+    #[test]
+    fn service_manifest_parses_declares_async_trait_and_registry_krab_core() {
+        let manifest = render_service_manifest("demo_service", &["rest", "graphql"]);
+        let deps = dependencies_of(&manifest);
+
+        assert!(
+            deps.contains_key("async-trait"),
+            "generated main.rs uses #[async_trait]; the manifest must declare async-trait"
+        );
+
+        let core = deps.get("krab_core").expect("krab_core is a dependency");
+        assert!(
+            core.get("path").is_none(),
+            "krab_core must not be a path dependency: '../krab_core' does not exist \
+             relative to a generated service"
+        );
+        assert_eq!(
+            core.get("version").and_then(|v| v.as_str()),
+            Some(crate::project_template::FRAMEWORK_VERSION),
+            "krab_core must resolve from the registry at the workspace version"
+        );
+        let features: Vec<&str> = core
+            .get("features")
+            .and_then(|f| f.as_array())
+            .expect("krab_core carries a feature list")
+            .iter()
+            .filter_map(|f| f.as_str())
+            .collect();
+        assert_eq!(features, vec!["rest", "graphql"]);
+    }
+
+    /// Every feature the service generator can request must exist in
+    /// `krab_core`'s manifest, read rather than hard-coded so a feature
+    /// rename fails this test instead of shipping a broken generator.
+    #[test]
+    fn service_manifest_features_exist_in_krab_core() {
+        let krab_core_manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../framework/krab_core/Cargo.toml")
+            .canonicalize()
+            .expect("krab_core manifest not found");
+        let parsed: toml::Value = toml::from_str(
+            &std::fs::read_to_string(krab_core_manifest).expect("krab_core manifest unreadable"),
+        )
+        .expect("krab_core manifest is not valid TOML");
+        let declared: Vec<String> = parsed
+            .get("features")
+            .and_then(|f| f.as_table())
+            .expect("krab_core declares no [features]")
+            .keys()
+            .cloned()
+            .collect();
+
+        // The full set of features generate_service can map a protocol to.
+        for feature in ["rest", "graphql", "grpc"] {
+            assert!(
+                declared.iter().any(|d| d == feature),
+                "generator can request krab_core feature {feature:?}, which krab_core does \
+                 not declare. Declared: {declared:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_adapter_manifest_parses_and_uses_registry_krab_core() {
+        let manifest = render_split_adapter_manifest("users-rest", "users-domain");
+        let deps = dependencies_of(&manifest);
+
+        let core = deps.get("krab_core").expect("krab_core is a dependency");
+        assert!(core.get("path").is_none());
+        assert_eq!(
+            core.get("version").and_then(|v| v.as_str()),
+            Some(crate::project_template::FRAMEWORK_VERSION)
+        );
+
+        // The shared domain crate is generated alongside, so a sibling path
+        // dependency is correct there.
+        let domain = deps.get("users-domain").expect("domain dep present");
+        assert_eq!(
+            domain.get("path").and_then(|p| p.as_str()),
+            Some("../users-domain")
+        );
+    }
+
+    /// Items that do not exist in Krab. Earlier templates were written against
+    /// another framework's API and generated code that could not compile.
+    const PHANTOM_API: &[&str] = &[
+        "krab_core::prelude",
+        "IntoView",
+        "impl View",
+        "#[component]",
+        "#[route(",
+    ];
+
+    fn assert_no_phantom_api(rendered: &str) {
+        for item in PHANTOM_API {
+            assert!(
+                !rendered.contains(item),
+                "generated code references `{item}`, which does not exist in Krab:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_function_generator_uses_supported_macro_contract() {
+        let rendered = render_server_function("load_user");
+
+        assert!(rendered.contains("#[server]"));
+        assert!(!rendered.contains("endpoint ="));
+        assert!(rendered.contains("validate_server_fn"));
+        assert!(rendered.contains("Result<String, ServerFnError>"));
+        assert_no_phantom_api(&rendered);
+    }
+
+    #[test]
+    fn component_generator_uses_supported_node_contract() {
+        let rendered = render_component("Counter");
+
+        assert!(rendered.contains("use krab_core::Node;"));
+        assert!(rendered.contains("use krab_macros::view;"));
+        assert!(rendered.contains("pub fn Counter() -> Node {"));
+        assert!(rendered.contains("view! {"));
+        assert!(rendered.contains(r#"class="counter""#));
+        assert_no_phantom_api(&rendered);
+    }
+
+    #[test]
+    fn route_generator_matches_build_script_discovery_contract() {
+        let rendered = render_route("About");
+
+        // build.rs registers `<module>::handler` for every src/routes/*.rs.
+        assert!(rendered.contains("pub async fn handler() -> Html<String> {"));
+        assert!(rendered.contains("use krab_core::Render;"));
+        assert!(rendered.contains(".render(),"));
+        assert!(rendered.contains("GET /about"));
+        assert_no_phantom_api(&rendered);
+    }
+}

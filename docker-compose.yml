@@ -1,0 +1,157 @@
+version: "3.9"
+
+# ---------------------------------------------------------------------------
+# Krab local / CI topology
+#
+# Usage:
+#   docker compose up -d          # start everything
+#   docker compose up -d postgres  # start only the database
+#   docker compose logs -f         # follow all logs
+# ---------------------------------------------------------------------------
+
+services:
+
+  # ── Infrastructure ─────────────────────────────────────────────────────────
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      POSTGRES_DB_USERS: ${POSTGRES_DB_USERS:?set POSTGRES_DB_USERS in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Application services ───────────────────────────────────────────────────
+
+  service_auth:
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args:
+        BIN: service_auth
+    restart: unless-stopped
+    environment:
+      KRAB_ENVIRONMENT: dev
+      KRAB_AUTH_MODE: static
+      KRAB_BEARER_TOKEN: ${KRAB_BEARER_TOKEN:?set KRAB_BEARER_TOKEN in .env}
+      KRAB_REDIS_URL: ${KRAB_REDIS_URL:-redis://redis:6379}
+      KRAB_HOST: 0.0.0.0
+      KRAB_PORT: "3001"
+      RUST_LOG: info
+    ports:
+      - "3001:3001"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run
+    pids_limit: 256
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  service_users:
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args:
+        BIN: service_users
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      KRAB_ENVIRONMENT: dev
+      KRAB_AUTH_MODE: static
+      KRAB_DB_DRIVER: postgres
+      KRAB_BEARER_TOKEN: ${KRAB_BEARER_TOKEN:?set KRAB_BEARER_TOKEN in .env}
+      KRAB_REDIS_URL: ${KRAB_REDIS_URL:-redis://redis:6379}
+      KRAB_HOST: 0.0.0.0
+      KRAB_PORT: "3002"
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB_USERS:?set POSTGRES_DB_USERS in .env}
+      DB_MAX_CONNECTIONS: "10"
+      DB_MIN_CONNECTIONS: "1"
+      RUST_LOG: info
+    ports:
+      - "3002:3002"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run
+    pids_limit: 256
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3002/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  service_frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args:
+        BIN: service_frontend
+    restart: unless-stopped
+    depends_on:
+      service_auth:
+        condition: service_healthy
+      service_users:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      KRAB_ENVIRONMENT: dev
+      RUST_LOG: info
+      KRAB_HOST: 0.0.0.0
+      KRAB_PORT: "3000"
+      KRAB_REDIS_URL: ${KRAB_REDIS_URL:-redis://redis:6379}
+      KRAB_AUTH_PUBLIC_PATHS: "/about,/greet,/blog/*,/rpc/*,/data/*,/asset-manifest.json,/pkg/*"
+    ports:
+      - "3000:3000"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run
+    pids_limit: 256
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:

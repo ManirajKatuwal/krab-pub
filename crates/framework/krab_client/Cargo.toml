@@ -1,0 +1,78 @@
+[package]
+name = "krab_client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/krab_client"
+description = "WASM island hydration runtime for the Krab framework"
+keywords = ["krab", "wasm", "hydration", "islands", "frontend"]
+categories = ["wasm", "web-programming"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+# The router awaits a `fetch` promise from a synchronous click handler.
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+krab_core = { workspace = true, features = ["web"] }
+krab_macros = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+inventory = "0.3"
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+    "Document",
+    "Element",
+    "HtmlElement",
+    "Node",
+    "NodeList",
+    "Window",
+    "console",
+    "Event",
+    "EventTarget",
+    "Text",
+    "Comment",
+    "DocumentFragment",
+    # Client-side routing: anchor inspection, click details, history, and the
+    # fetch of the destination document.
+    "HtmlAnchorElement",
+    # Used by the reconciliation browser tests to prove that a focused input
+    # with typed text survives an insertion above it.
+    "HtmlInputElement",
+    "MouseEvent",
+    "History",
+    "Location",
+    "Headers",
+    "Request",
+    "RequestInit",
+    "Response",
+]
+
+[dev-dependencies]
+# The hydration path mutates real DOM, so it cannot be covered by
+# `cargo test --workspace` — that compiles for the host, where there is no
+# document. These tests run under `wasm-pack test --headless`, which is the only
+# way this crate's actual behaviour gets exercised.
+wasm-bindgen-test = "0.3"
+
+[features]
+web = []
+
+# rustc 1.97 emits bulk-memory and nontrapping-fptoint by default; the binaryen
+# wasm-pack bundles (version 117) rejects them unless told they exist. Without
+# this, `wasm-pack build` dies at the wasm-opt step — locally and in CI.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]

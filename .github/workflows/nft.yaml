@@ -1,0 +1,179 @@
+name: Non-Functional Tests (NFT)
+
+# NFT suite is expensive (load/spike/soak). Run only when explicitly requested
+# via the `KRAB_NFT=1` label on a PR, or on pushes to main.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [labeled]
+
+jobs:
+  nft-gate:
+    # On PRs, only run when the `nft` label is present.
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'nft'))
+    runs-on: ubuntu-latest
+    env:
+      KRAB_NFT: "1"
+      RUST_LOG: warn
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-nft-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run NFT suite (load / spike / soak)
+        run: |
+          cargo test \
+            --package service_frontend \
+            --features nft \
+            --release \
+            -- non_functional_ \
+            --nocapture
+
+      - name: Prepare NFT environment
+        run: |
+          cat > .env << 'EOF'
+          POSTGRES_USER=postgres
+          POSTGRES_PASSWORD=postgres
+          POSTGRES_DB=krab
+          POSTGRES_DB_USERS=krab_users
+          KRAB_BEARER_TOKEN=test-token
+          KRAB_REDIS_URL=redis://127.0.0.1:6379
+          EOF
+
+      - name: Diagnostics — NFT compose preflight
+        run: |
+          echo ".env present?"
+          if [ -f .env ]; then echo "yes"; else echo "no"; fi
+
+          for key in POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB POSTGRES_DB_USERS KRAB_BEARER_TOKEN KRAB_REDIS_URL; do
+            if [ -n "${!key:-}" ]; then
+              echo "$key=present"
+            else
+              echo "$key=missing"
+            fi
+          done
+
+          docker compose -f docker-compose.yml -f docker-compose.nft.yaml config > /tmp/nft-compose-rendered.yaml 2> /tmp/nft-compose-config.err || true
+          echo "--- docker compose config stderr (if any) ---"
+          cat /tmp/nft-compose-config.err || true
+          echo "--- docker compose config preview ---"
+          head -n 120 /tmp/nft-compose-rendered.yaml || true
+
+      - name: Start single-replica stack (in-network)
+        run: |
+          docker compose \
+            -f docker-compose.yml \
+            -f docker-compose.nft.yaml \
+            up -d --build redis postgres service_auth service_users service_frontend
+
+      - name: Run multi-service load gate (N=1)
+        run: |
+          docker compose \
+            -f docker-compose.yml \
+            -f docker-compose.nft.yaml \
+            run --rm nft_runner \
+            --mode single \
+            --json-out benchmarks/single_replica_results.json \
+            --markdown-out benchmarks/latest_summary_single.md
+
+      - name: Stop single-replica stack
+        if: always()
+        run: |
+          docker compose \
+            -f docker-compose.yml \
+            -f docker-compose.nft.yaml \
+            down -v
+
+      - name: Start scaled stack (N=3, in-network)
+        run: |
+          docker compose \
+            -f docker-compose.yml \
+            -f docker-compose.nft.yaml \
+            up -d --build \
+            --scale service_frontend=3 \
+            --scale service_auth=3 \
+            --scale service_users=3 \
+            redis postgres service_auth service_users service_frontend
+
+      - name: Run multi-service load gate (N=3)
+        run: |
+          docker compose \
+            -f docker-compose.yml \
+            -f docker-compose.nft.yaml \
+            run --rm nft_runner \
+            --mode scaled \
+            --json-out benchmarks/scaled_replica_results.json \
+            --markdown-out benchmarks/latest_summary_scaled.md
+
+      - name: Validate shared-state rate-limit behavior (scaled)
+        env:
+          KRAB_AUTH_BASE_URL: http://service_auth:3001
+          KRAB_BEARER_TOKEN: ${KRAB_BEARER_TOKEN}
+          KRAB_SHARED_STATE_SAMPLES: "240"
+          KRAB_SHARED_STATE_EXPECT_STATUS: "429"
+        run: |
+          docker compose \
+            -f docker-compose.yml \
+            -f docker-compose.nft.yaml \
+            run --rm --entrypoint python3 nft_runner \
+            scripts/shared_state_validation.py
+
+      - name: Generate release evidence bundle
+        if: always()
+        run: |
+          python3 scripts/release_evidence_bundle.py
+
+      - name: Evaluate horizontal scaling regression gate
+        run: |
+          python3 scripts/nft_scaling_compare.py \
+            benchmarks/single_replica_results.json \
+            benchmarks/scaled_replica_results.json
+
+      - name: Append trend history rows
+        if: always()
+        env:
+          KRAB_SHARED_STATE_MODE: redis
+        run: |
+          python3 scripts/nft_append_trends.py \
+            benchmarks/single_replica_results.json \
+            benchmarks/scaled_replica_results.json
+
+      - name: Stop multi-service stack
+        if: always()
+        run: |
+          docker compose \
+            -f docker-compose.yml \
+            -f docker-compose.nft.yaml \
+            down -v
+
+      - name: Upload NFT results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nft-results-${{ github.run_id }}
+          path: |
+            target/criterion/
+            benchmarks/latest_summary.md
+            benchmarks/latest_summary_single.md
+            benchmarks/latest_summary_scaled.md
+            benchmarks/single_replica_results.json
+            benchmarks/scaled_replica_results.json
+            benchmarks/shared_state_validation.json
+            benchmarks/release_evidence_bundle.json
+            benchmarks/release_evidence_bundle.md
+            benchmarks/trend_history.csv

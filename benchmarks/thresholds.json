@@ -1,0 +1,164 @@
+{
+  "version": 1,
+  "description": "Multi-service non-functional thresholds, SLOs, and horizontal scaling gates",
+  "generated_by": "manual baseline",
+  "services": {
+    "service_frontend": {
+      "profiles": {
+        "load": {
+          "samples": 1000,
+          "hard_threshold_ms": {
+            "p95": 120,
+            "p99": 250
+          },
+          "regression": {
+            "baseline_window_days": 14,
+            "max_percent_increase": {
+              "p95": 20,
+              "p99": 20
+            }
+          }
+        },
+        "spike": {
+          "samples": 3000,
+          "hard_threshold_ms": {
+            "p95": 120,
+            "p99": 250
+          },
+          "regression": {
+            "baseline_window_days": 14,
+            "max_percent_increase": {
+              "p95": 20,
+              "p99": 20
+            }
+          }
+        },
+        "soak": {
+          "samples": 10000,
+          "hard_threshold_ms": {
+            "p95": 120,
+            "p99": 250
+          },
+          "regression": {
+            "baseline_window_days": 14,
+            "max_percent_increase": {
+              "p95": 20,
+              "p99": 20
+            }
+          }
+        }
+      }
+    },
+    "service_auth": {
+      "profiles": {
+        "load": {
+          "samples": 1000,
+          "hard_threshold_ms": {
+            "p95": 80,
+            "p99": 160
+          },
+          "regression": {
+            "baseline_window_days": 14,
+            "max_percent_increase": {
+              "p95": 20,
+              "p99": 20
+            }
+          }
+        },
+        "spike": {
+          "samples": 3000,
+          "hard_threshold_ms": {
+            "p95": 80,
+            "p99": 160
+          },
+          "regression": {
+            "baseline_window_days": 14,
+            "max_percent_increase": {
+              "p95": 20,
+              "p99": 20
+            }
+          }
+        },
+        "soak": {
+          "samples": 10000,
+          "hard_threshold_ms": {
+            "p95": 80,
+            "p99": 160
+          },
+          "regression": {
+            "baseline_window_days": 14,
+            "max_percent_increase": {
+              "p95": 20,
+              "p99": 20
+            }
+          }
+        }
+      }
+    },
+    "service_users": {
+      "profiles": {
+        "load": {
+          "samples": 1000,
+          "hard_threshold_ms": {
+            "p95": 150,
+            "p99": 300
+          },
+          "regression": {
+            "baseline_window_days": 14,
+            "max_percent_increase": {
+              "p95": 20,
+              "p99": 20
+            }
+          }
+        },
+        "spike": {
+          "samples": 3000,
+          "hard_threshold_ms": {
+            "p95": 150,
+            "p99": 300
+          },
+          "regression": {
+            "baseline_window_days": 14,
+            "max_percent_increase": {
+              "p95": 20,
+              "p99": 20
+            }
+          }
+        },
+        "soak": {
+          "samples": 10000,
+          "hard_threshold_ms": {
+            "p95": 150,
+            "p99": 300
+          },
+          "regression": {
+            "baseline_window_days": 14,
+            "max_percent_increase": {
+              "p95": 20,
+              "p99": 20
+            }
+          }
+        }
+      }
+    }
+  },
+  "horizontal_scaling": {
+    "replicas": [1, 3],
+    "shared_state_required": true,
+    "shared_state_mode": "redis",
+    "max_percent_increase_from_single_replica": {
+      "p95": 15,
+      "p99": 20
+    },
+    "max_error_rate_percent": 0.5
+  },
+  "auto_fail_criteria": [
+    "fail_if_any_service_profile_p95_exceeds_hard_threshold",
+    "fail_if_any_service_profile_p99_exceeds_hard_threshold",
+    "fail_if_any_service_profile_p95_regression_percent_exceeds_allowed",
+    "fail_if_any_service_profile_p99_regression_percent_exceeds_allowed",
+    "fail_if_horizontal_scaling_p95_regression_percent_exceeds_allowed",
+    "fail_if_horizontal_scaling_p99_regression_percent_exceeds_allowed",
+    "fail_if_horizontal_scaling_requires_shared_state_and_not_enabled"
+  ]
+}

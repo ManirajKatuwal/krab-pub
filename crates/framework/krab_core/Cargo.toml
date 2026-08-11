@@ -1,0 +1,150 @@
+[package]
+name = "krab_core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/krab_core"
+description = "Shared runtime for the Krab framework: config, HTTP, database, telemetry, resilience, signals, and protocol governance"
+keywords = ["krab", "web", "ssr", "runtime", "framework"]
+categories = ["web-programming", "web-programming::http-server", "development-tools"]
+
+# The crate has no default features, so a plain docs.rs build would publish a
+# nearly empty API page. Build documentation with every feature enabled.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+redis = { version = "0.27", features = ["tokio-comp"], optional = true }
+config = "0.14"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+tower-http = { workspace = true, optional = true, features = ["compression-gzip", "cors", "request-id", "trace", "limit"] }
+tower = { workspace = true, optional = true, features = ["util"] }
+jsonwebtoken = { version = "9", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+# Content types for static assets. Came in with `krab_core::static_assets`, which
+# was ported here when `krab_server` was removed (ADR 0005).
+mime_guess = { version = "2.0", optional = true }
+
+# Password hashing (Optional)
+#
+# Argon2id, RFC 9106. Pulled in only by the `auth` feature so a consumer that
+# issues no passwords does not compile a KDF. Licence is MIT OR Apache-2.0,
+# inside the deny.toml allowlist.
+#
+# `std` is required, not cosmetic: it enables `rand_core/std`, which is what
+# provides `OsRng` for salt generation.
+argon2 = { version = "0.5", optional = true, features = ["std"] }
+
+# API Frameworks (Optional)
+axum = { workspace = true, optional = true }
+async-graphql = { workspace = true, optional = true }
+
+# Database (Optional)
+#
+# Driver features are NOT listed here — they come from `db-postgres` /
+# `db-sqlite` below, so enabling one driver does not compile the other in.
+# `postgres` was unconditional, which is why SQLite support could only ever
+# live in an application crate.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "macros", "uuid", "time"], optional = true }
+
+# Migration checksums. SHA-256 rather than std's DefaultHasher, whose output is
+# documented as unstable across Rust releases — a persisted checksum must
+# survive a toolchain bump. Already in the dependency tree via sqlx/argon2.
+sha2 = { version = "0.10", optional = true }
+
+[features]
+default = []
+rest = ["dep:axum", "dep:tower-http", "dep:jsonwebtoken", "dep:tower", "dep:uuid", "dep:mime_guess"]
+redis-store = ["dep:redis"]
+
+# Password credential verification: Argon2id hashing and the `CredentialStore`
+# trait. Transport-independent on purpose — verifying a password does not
+# require an HTTP surface, so this does not imply `rest`.
+auth = ["dep:argon2"]
+
+graphql = ["dep:async-graphql"]
+
+# gRPC status-code and timeout-header semantics for a gateway. NOT a transport:
+# `tonic` and `prost` appear nowhere in the workspace. Named `grpc` until ADR
+# 0007, which is the point at which the name stopped implying a capability the
+# crate does not have.
+grpc-semantics = []
+
+# Deprecated alias for `grpc-semantics`, kept for one minor version per the
+# breaking-change policy in RELEASE_POLICY.md. Remove no earlier than 0.3.0.
+grpc = ["grpc-semantics"]
+web = ["dep:web-sys", "dep:js-sys", "dep:wasm-bindgen"]
+
+# Postgres: connection pooling plus the full migration governance surface —
+# checksum validation, drift detection, rollback, promotion policy.
+db-postgres = ["dep:sqlx", "sqlx/postgres", "dep:sha2"]
+
+# SQLite: the driver only. Migration governance is Postgres-specific and does
+# not apply; see docs/reference/database.md.
+db-sqlite = ["dep:sqlx", "sqlx/sqlite"]
+
+# Deprecated alias for `db-postgres`, kept for one minor version per the
+# breaking-change policy in RELEASE_POLICY.md. Remove no earlier than 0.3.0.
+db = ["db-postgres"]
+
+[dependencies.web-sys]
+version = "0.3"
+# `Event` covers island event listeners. The rest are what
+# `server_fn::call_server_fn` needs to issue a `fetch` from the browser: the
+# request/response pair, its headers, and the window it fetches through —
+# including the CSRF token endpoint (the CSRF cookie is HttpOnly, so the token
+# comes from that endpoint's JSON body, never from `document.cookie`).
+features = [
+    "Event",
+    "Document",
+    "Headers",
+    "Request",
+    "RequestInit",
+    "Response",
+    "Window",
+]
+optional = true
+
+[dependencies.js-sys]
+version = "0.3"
+optional = true
+
+[dependencies.wasm-bindgen]
+version = "0.2"
+optional = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Browser transport for `server_fn::call_server_fn`, which awaits a `fetch`
+# promise. Only reachable on wasm32, so it is declared here rather than as an
+# optional dependency of the `web` feature.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"
+
+[dev-dependencies]
+serial_test = "3"
+# Lets the `isr` doc examples await an async API without pulling a full runtime
+# attribute macro into a doctest.
+tokio-test = "0.4"
+# Dev-only, so the krab_macros <-> krab_core cycle is permitted by Cargo.
+# Needed so doc examples that use `#[server]` are compiled rather than skipped.
+#
+# DO NOT give this a version, and do not switch it to `workspace = true`.
+# Cargo strips version-less path dev-dependencies from the published manifest,
+# which is the only reason this cycle can be published at all. Adding a version
+# here makes `krab_core` require a published `krab_macros` and `krab_macros`
+# require a published `krab_core` — a deadlock with no first crate to publish.
+krab_macros = { path = "../krab_macros" }

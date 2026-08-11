@@ -1,0 +1,88 @@
+name: Rustdoc Publish
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: rustdoc-pages
+  cancel-in-progress: false
+
+jobs:
+  build-docs:
+    runs-on: ubuntu-latest
+    outputs:
+      pages_writable: ${{ steps.pages-preflight.outputs.pages_writable }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
+
+      - name: Detect Pages API capability
+        id: pages-preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${REPOSITORY}/pages"
+          status="$(curl -sS -o /tmp/pages.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${api}")"
+
+          if [ "${status}" = "200" ]; then
+            echo "pages_writable=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [ "${status}" = "404" ]; then
+            echo "Pages site is not configured for this repository. Skipping docs deployment."
+            echo "pages_writable=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [ "${status}" = "403" ]; then
+            echo "Pages API is not writable in this token context. Skipping docs deployment."
+            echo "pages_writable=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "Unexpected Pages API status ${status}. Skipping docs deployment."
+          echo "pages_writable=false" >> "${GITHUB_OUTPUT}"
+
+      - name: Configure Pages
+        if: steps.pages-preflight.outputs.pages_writable == 'true'
+        uses: actions/configure-pages@v5
+
+      - name: Upload pages artifact
+        if: steps.pages-preflight.outputs.pages_writable == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/doc
+
+  deploy-docs:
+    needs: build-docs
+    if: needs.build-docs.outputs.pages_writable == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

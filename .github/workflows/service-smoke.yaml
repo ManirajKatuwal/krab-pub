@@ -1,0 +1,119 @@
+name: service-smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "services/service_auth/**"
+      - "services/service_users/**"
+      - "services/service_frontend/**"
+      - "crates/framework/krab_core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/service-smoke.yaml"
+
+jobs:
+  service-smoke:
+    name: Smoke test service health endpoints
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build service binaries (auth + users + frontend)
+        run: cargo build --bin service_auth --bin service_users --bin service_frontend
+
+      - name: Diagnostics — auth startup env preflight
+        run: |
+          echo "KRAB_ENVIRONMENT=${KRAB_ENVIRONMENT:-<unset>}"
+          echo "KRAB_AUTH_MODE=${KRAB_AUTH_MODE:-<unset>}"
+          if [ -n "${KRAB_OIDC_ISSUER:-}" ]; then
+            echo "KRAB_OIDC_ISSUER=present"
+          else
+            echo "KRAB_OIDC_ISSUER=missing"
+          fi
+          if [ -n "${KRAB_OIDC_AUDIENCE:-}" ]; then
+            echo "KRAB_OIDC_AUDIENCE=present"
+          else
+            echo "KRAB_OIDC_AUDIENCE=missing"
+          fi
+
+      - name: Smoke — service_auth /health
+        run: |
+          set -euo pipefail
+          KRAB_ENVIRONMENT=dev \
+          KRAB_AUTH_MODE=static \
+          KRAB_HOST=127.0.0.1 \
+          KRAB_PORT=13001 \
+          KRAB_BEARER_TOKEN=smoke-test \
+          ./target/debug/service_auth > service_auth_smoke.log 2>&1 &
+          AUTH_PID=$!
+          echo "service_auth started (PID $AUTH_PID)"
+
+          for i in $(seq 1 15); do
+            curl -sf http://127.0.0.1:13001/health && break
+            echo "Waiting for service_auth ($i/15)…"
+            sleep 1
+          done
+
+          if ! curl -sf http://127.0.0.1:13001/health | jq -e '.status == "ok"'; then
+            echo "service_auth smoke failed; dumping service log"
+            cat service_auth_smoke.log || true
+            exit 1
+          fi
+          kill $AUTH_PID
+
+      - name: Smoke — service_frontend /health
+        run: |
+          KRAB_HOST=127.0.0.1 \
+          KRAB_PORT=13000 \
+          KRAB_BEARER_TOKEN=smoke-test \
+          ./target/debug/service_frontend &
+          FRONTEND_PID=$!
+          echo "service_frontend started (PID $FRONTEND_PID)"
+
+          for i in $(seq 1 15); do
+            curl -sf http://127.0.0.1:13000/health && break
+            echo "Waiting for service_frontend ($i/15)…"
+            sleep 1
+          done
+
+          curl -sf http://127.0.0.1:13000/health | jq -e '.status == "ok"'
+          kill $FRONTEND_PID
+
+      - name: Smoke — service_users /health and /ready (ephemeral sqlite)
+        run: |
+          KRAB_HOST=127.0.0.1 \
+          KRAB_PORT=13002 \
+          KRAB_DB_DRIVER=sqlite \
+          DATABASE_URL='sqlite://service_users_smoke.sqlite?mode=rwc' \
+          KRAB_BEARER_TOKEN=smoke-test \
+          ./target/debug/service_users &
+          USERS_PID=$!
+          echo "service_users started (PID $USERS_PID)"
+
+          for i in $(seq 1 20); do
+            curl -sf http://127.0.0.1:13002/health && break
+            echo "Waiting for service_users /health ($i/20)…"
+            sleep 1
+          done
+
+          curl -sf http://127.0.0.1:13002/health | jq -e '.status == "ok"'
+
+          for i in $(seq 1 20); do
+            if curl -sf http://127.0.0.1:13002/ready | jq -e '.status == "ready"' >/dev/null; then
+              break
+            fi
+            echo "Waiting for service_users /ready ($i/20)…"
+            sleep 1
+          done
+
+          curl -sf http://127.0.0.1:13002/ready | jq -e '.status == "ready"'
+
+          kill $USERS_PID
+          rm -f service_users_smoke.sqlite

@@ -1,0 +1,23 @@
+[package]
+name = "service_auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "REST authentication service (JWT/OIDC) — Krab reference service"
+publish = false
+
+[dependencies]
+tokio.workspace = true
+axum.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+jsonwebtoken = "9"
+uuid = { version = "1", features = ["v4"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tower.workspace = true
+tower-http = { workspace = true, features = ["cors", "compression-gzip", "request-id", "trace"] }
+krab_core = { workspace = true, features = ["rest", "redis-store", "auth"] }
+anyhow.workspace = true
+async-trait.workspace = true

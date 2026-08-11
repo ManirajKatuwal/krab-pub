@@ -1,0 +1,5 @@
+error: Mismatched closing tag: expected </div>, found </span>
+ --> tests/compile_fail/mismatched_closing_tag.rs:6:35
+  |
+6 |     let _ = view! { <div>"hello"</span> }.render();
+  |                                   ^^^^

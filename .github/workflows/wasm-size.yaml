@@ -1,0 +1,87 @@
+name: WASM Bundle Size Gate
+
+on:
+  pull_request:
+    paths:
+      - 'crates/framework/krab_client/**'
+      - 'crates/framework/krab_core/**'
+      - 'crates/framework/krab_macros/**'
+  push:
+    branches:
+      - main
+
+jobs:
+  wasm-size-gate:
+    runs-on: ubuntu-latest
+
+    # Thresholds (bytes).  Fail the build if either is exceeded.
+    env:
+      # Raw .wasm before wasm-opt  (500 KB)
+      WASM_SIZE_LIMIT_BYTES: "512000"
+      # gzip-compressed .wasm     (150 KB)
+      WASM_GZIP_SIZE_LIMIT_BYTES: "153600"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Cache Cargo
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build WASM bundle
+        working-directory: crates/framework/krab_client
+        run: wasm-pack build --release --target web --out-dir ../../../dist/pkg
+
+      - name: Measure bundle size
+        id: size
+        run: |
+          WASM_FILE=$(ls dist/pkg/*.wasm | head -n1)
+          RAW_BYTES=$(stat -c%s "$WASM_FILE")
+          GZIP_BYTES=$(gzip -c "$WASM_FILE" | wc -c)
+          echo "wasm_file=$WASM_FILE" >> "$GITHUB_OUTPUT"
+          echo "raw_bytes=$RAW_BYTES" >> "$GITHUB_OUTPUT"
+          echo "gzip_bytes=$GZIP_BYTES" >> "$GITHUB_OUTPUT"
+          echo "## WASM Bundle Size" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Metric | Value | Limit |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Raw size | ${RAW_BYTES} B | ${WASM_SIZE_LIMIT_BYTES} B |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Gzip size | ${GZIP_BYTES} B | ${WASM_GZIP_SIZE_LIMIT_BYTES} B |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce raw size limit
+        run: |
+          RAW=${{ steps.size.outputs.raw_bytes }}
+          LIMIT=${{ env.WASM_SIZE_LIMIT_BYTES }}
+          if [ "$RAW" -gt "$LIMIT" ]; then
+            echo "❌ WASM bundle ($RAW B) exceeds raw size limit ($LIMIT B)"
+            exit 1
+          fi
+          echo "✅ WASM raw size OK: $RAW B ≤ $LIMIT B"
+
+      - name: Enforce gzip size limit
+        run: |
+          GZIP=${{ steps.size.outputs.gzip_bytes }}
+          LIMIT=${{ env.WASM_GZIP_SIZE_LIMIT_BYTES }}
+          if [ "$GZIP" -gt "$LIMIT" ]; then
+            echo "❌ WASM bundle gzip ($GZIP B) exceeds compressed size limit ($LIMIT B)"
+            exit 1
+          fi
+          echo "✅ WASM gzip size OK: $GZIP B ≤ $LIMIT B"
+
+      - name: Upload WASM artifact + provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-bundle-${{ github.run_id }}
+          path: dist/pkg/

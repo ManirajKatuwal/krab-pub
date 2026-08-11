@@ -1,0 +1,113 @@
+{
+  "version": 1,
+  "description": "Benchmark target configuration for Krab and external framework comparisons",
+  "frameworks": {
+    "krab": {
+      "display_name": "Krab (Rust)",
+      "base_url_env": "KRAB_FRONTEND_BASE_URL",
+      "default_base_url": "http://127.0.0.1:3000",
+      "routes": {
+        "home": "/",
+        "blog_post": "/blog/benchmark-test",
+        "api_status": "/api/status",
+        "api_mutation": "/api/contact",
+        "health": "/health"
+      }
+    },
+    "nextjs": {
+      "display_name": "Next.js (React)",
+      "base_url_env": "BENCH_NEXTJS_URL",
+      "default_base_url": "http://127.0.0.1:4001",
+      "routes": {
+        "home": "/",
+        "blog_post": "/blog/benchmark-test",
+        "api_status": "/api/status",
+        "api_mutation": "/api/contact",
+        "health": "/health"
+      }
+    },
+    "nuxt": {
+      "display_name": "Nuxt (Vue)",
+      "base_url_env": "BENCH_NUXT_URL",
+      "default_base_url": "http://127.0.0.1:4002",
+      "routes": {
+        "home": "/",
+        "blog_post": "/blog/benchmark-test",
+        "api_status": "/api/status",
+        "api_mutation": "/api/contact",
+        "health": "/health"
+      }
+    },
+    "sveltekit": {
+      "display_name": "SvelteKit",
+      "base_url_env": "BENCH_SVELTEKIT_URL",
+      "default_base_url": "http://127.0.0.1:4003",
+      "routes": {
+        "home": "/",
+        "blog_post": "/blog/benchmark-test",
+        "api_status": "/api/status",
+        "api_mutation": "/api/contact",
+        "health": "/health"
+      }
+    },
+    "remix": {
+      "display_name": "Remix (React)",
+      "base_url_env": "BENCH_REMIX_URL",
+      "default_base_url": "http://127.0.0.1:4004",
+      "routes": {
+        "home": "/",
+        "blog_post": "/blog/benchmark-test",
+        "api_status": "/api/status",
+        "api_mutation": "/api/contact",
+        "health": "/health"
+      }
+    },
+    "leptos": {
+      "display_name": "Leptos (Rust)",
+      "base_url_env": "BENCH_LEPTOS_URL",
+      "default_base_url": "http://127.0.0.1:4005",
+      "routes": {
+        "home": "/",
+        "blog_post": "/blog/benchmark-test",
+        "api_status": "/api/status",
+        "api_mutation": "/api/contact",
+        "health": "/health"
+      }
+    },
+    "dioxus": {
+      "display_name": "Dioxus (Rust)",
+      "base_url_env": "BENCH_DIOXUS_URL",
+      "default_base_url": "http://127.0.0.1:4006",
+      "routes": {
+        "home": "/",
+        "blog_post": "/blog/benchmark-test",
+        "api_status": "/api/status",
+        "api_mutation": "/api/contact",
+        "health": "/health"
+      }
+    }
+  },
+  "profiles": {
+    "load": {
+      "samples": 1000,
+      "concurrency": 10,
+      "warmup_seconds": 5,
+      "krab_rate_limit_rps": 2000,
+      "krab_rate_limit_capacity": 4000
+    },
+    "spike": {
+      "samples": 3000,
+      "concurrency": 50,
+      "warmup_seconds": 5,
+      "krab_rate_limit_rps": 10000,
+      "krab_rate_limit_capacity": 20000
+    },
+    "soak": {
+      "samples": 10000,
+      "concurrency": 20,
+      "warmup_seconds": 10,
+      "krab_rate_limit_rps": 5000,
+      "krab_rate_limit_capacity": 10000
+    }
+  }
+}

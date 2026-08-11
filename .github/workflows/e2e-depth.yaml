@@ -1,0 +1,216 @@
+name: Cross-Service and E2E Depth
+
+on:
+  pull_request:
+    paths:
+      - 'services/service_auth/**'
+      - 'services/service_users/**'
+      - 'services/service_frontend/**'
+      - 'crates/framework/krab_core/src/http.rs'
+      - 'docker-compose.yml'
+      - 'Dockerfile.service'
+      - '.github/workflows/e2e-depth.yaml'
+  push:
+    branches:
+      - main
+
+jobs:
+
+  # ── Per-service unit + integration tests (no Docker required) ───────────────
+
+  cross-service-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cross-service suite (auth / users / frontend)
+        run: |
+          cargo test -p service_auth
+          cargo test -p service_users
+          cargo test -p service_frontend
+
+  # ── Fault-injection tests ───────────────────────────────────────────────────
+
+  fault-injection:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Auth failure burst limiter
+        run: cargo test -p service_auth fault_injection_auth_failure_burst_is_rate_limited
+
+      - name: Readiness degraded behavior (non-critical dependency failure)
+        run: cargo test -p krab_core --features rest readiness_non_critical_failure_is_degraded_but_available
+
+      - name: Users DB outage readiness behavior
+        run: cargo test -p service_users fault_injection_db_outage_drives_readiness_not_ready
+
+  # ── Multiprocess Docker Compose E2E ────────────────────────────────────────
+
+  multiprocess-e2e:
+    runs-on: ubuntu-latest
+    env:
+      KRAB_BEARER_TOKEN: ci-test-token
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare .env
+        run: |
+          cat > .env << 'EOF'
+          POSTGRES_USER=postgres
+          POSTGRES_PASSWORD=postgres
+          POSTGRES_DB=krab
+          POSTGRES_DB_USERS=krab_users
+          KRAB_BEARER_TOKEN=ci-test-token
+          KRAB_REDIS_URL=redis://redis:6379
+          EOF
+
+      - name: Diagnostics — docker compose env and config preflight
+        run: |
+          echo ".env present?"
+          if [ -f .env ]; then echo "yes"; else echo "no"; fi
+
+          echo "Diagnostics — .env.example present?"
+          if [ -f .env.example ]; then echo "yes"; else echo "no"; fi
+
+          echo "Diagnostics — required keys in .env.example (if present):"
+          if [ -f .env.example ]; then
+            sed -n 's/^\(POSTGRES_USER\|POSTGRES_PASSWORD\|POSTGRES_DB\|POSTGRES_DB_USERS\|KRAB_BEARER_TOKEN\|KRAB_REDIS_URL\)=.*/\1/p' .env.example
+          else
+            echo ".env.example missing"
+          fi
+
+          if [ -f .env ]; then
+            echo "Diagnostics — required keys in .env (if present):"
+            sed -n 's/^\([A-Z0-9_]*\)=.*/\1/p' .env | grep -E '^(POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB|POSTGRES_DB_USERS|KRAB_BEARER_TOKEN|KRAB_REDIS_URL)$' || true
+          fi
+
+          for key in KRAB_BEARER_TOKEN POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB POSTGRES_DB_USERS KRAB_REDIS_URL; do
+            if [ -n "${!key:-}" ]; then
+              echo "$key=present"
+            else
+              echo "$key=missing"
+            fi
+          done
+
+          docker compose config > /tmp/compose-rendered.yaml 2> /tmp/compose-config.err || true
+          echo "--- docker compose config stderr (if any) ---"
+          cat /tmp/compose-config.err || true
+          echo "--- docker compose config preview ---"
+          head -n 120 /tmp/compose-rendered.yaml || true
+
+      - name: Build and start all services
+        run: docker compose up -d --build --wait
+        timeout-minutes: 20
+
+      - name: Wait for services to become healthy
+        run: |
+          for svc in service_auth service_users service_frontend; do
+            echo "Waiting for $svc..."
+            for i in $(seq 1 30); do
+              STATUS=$(docker compose ps --format json "$svc" 2>/dev/null \
+                       | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Health',''))" 2>/dev/null || echo "")
+              if [ "$STATUS" = "healthy" ]; then
+                echo "$svc is healthy"
+                break
+              fi
+              sleep 2
+            done
+          done
+
+      - name: E2E — auth service health
+        run: curl -sf http://localhost:3001/health | grep '"status":"ok"'
+
+      - name: E2E — auth service readiness
+        run: curl -sf http://localhost:3001/ready | grep '"status"'
+
+      - name: E2E — users service health
+        run: curl -sf http://localhost:3002/health | grep '"status":"ok"'
+
+      - name: E2E — users service readiness
+        run: curl -sf http://localhost:3002/ready | grep '"status"'
+
+      - name: E2E — frontend service health
+        run: curl -sf http://localhost:3000/health | grep '"status":"ok"'
+
+      - name: E2E — frontend service SSR
+        run: curl -sf http://localhost:3000/ | grep 'data-island'
+
+      - name: E2E — frontend /api/status contract
+        run: curl -sf http://localhost:3000/api/status | grep '"service":"frontend"'
+
+      - name: E2E — auth protected route (no token → 401)
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3001/api/v1/private)
+          [ "$STATUS" = "401" ] || (echo "Expected 401, got $STATUS"; exit 1)
+
+      - name: E2E — auth protected route (valid token → 200)
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${KRAB_BEARER_TOKEN}" http://localhost:3001/api/v1/private)
+          [ "$STATUS" = "200" ] || (echo "Expected 200, got $STATUS"; exit 1)
+
+      - name: Collect service logs on failure
+        if: failure()
+        run: |
+          docker compose logs --no-color > /tmp/compose-logs.txt 2> /tmp/compose-logs.err || true
+          echo "--- docker compose logs stderr (if any) ---"
+          cat /tmp/compose-logs.err || true
+
+      - name: Upload compose logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-logs-${{ github.run_id }}
+          path: /tmp/compose-logs.txt
+
+      - name: Tear down
+        if: always()
+        run: |
+          echo "Teardown diagnostics — .env present?"
+          if [ -f .env ]; then
+            echo "yes"
+            echo "Teardown diagnostics — .env keys present:"
+            sed -n 's/^\([A-Z0-9_]*\)=.*/\1/p' .env
+          else
+            echo "no"
+          fi
+
+          echo "Teardown diagnostics — shell env key presence:"
+          for key in KRAB_BEARER_TOKEN POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB POSTGRES_DB_USERS KRAB_REDIS_URL; do
+            if [ -n "${!key:-}" ]; then
+              echo "$key=present"
+            else
+              echo "$key=missing"
+            fi
+          done
+
+          docker compose config > /tmp/compose-rendered-pre-down.yaml 2> /tmp/compose-config-pre-down.err || true
+          echo "--- docker compose config stderr before down (if any) ---"
+          cat /tmp/compose-config-pre-down.err || true
+
+          docker compose down -v || true

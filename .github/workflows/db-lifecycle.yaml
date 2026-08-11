@@ -1,0 +1,76 @@
+name: Database Lifecycle
+
+on:
+  pull_request:
+    paths:
+      - 'crates/framework/krab_core/src/db.rs'
+      - 'services/service_users/**'
+  push:
+    branches:
+      - main
+
+jobs:
+  db-migration-check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci_db_test_secret
+          POSTGRES_DB: krab_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://postgres:ci_db_test_secret@localhost:5432/krab_test
+      RUST_LOG: info
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build krab CLI
+        run: cargo build --package krab_cli
+
+      - name: Cache Cargo
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: 1. Fresh Migration
+        run: cargo run --package krab_cli -- db lifecycle --diagnostics
+
+      - name: 2. Rollback Simulation
+        run: cargo run --package krab_cli -- db rollback --diagnostics
+
+      - name: 3. Drift Detection
+        run: cargo run --package krab_cli -- db drift --diagnostics
+
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features rustls,postgres
+      
+      - name: 3.1 Type Metadata Consistency (Schema Evolution Check)
+        run: cargo sqlx prepare --workspace --check
+
+      - name: 4. Rollback rehearsal — run and capture evidence
+        run: |
+          cargo run --package krab_cli -- db rehearsal --out internal/audit/evidence/rollback-rehearsal-evidence.txt --diagnostics
+
+      - name: Upload rollback evidence artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-rehearsal-evidence-${{ github.run_id }}
+          path: internal/audit/evidence/rollback-rehearsal-evidence.txt
+          retention-days: 90

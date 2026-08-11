@@ -1,0 +1,81 @@
+name: Generated Project
+
+# `krab new` is the primary onboarding path and was previously unguarded: the
+# only tests asserted that files existed and contained certain substrings.
+# Nothing ever compiled the output. Under that gap the template shipped
+# `krab_core = { version = "0.1.0", features = ["db, rest"] }` — an unpublished
+# version, a stale pin, and a single feature literally named `db, rest`. Every
+# scaffolded project failed before the first line of user code ran.
+#
+# This workflow builds, tests, lints, and format-checks a real `krab new`
+# output for every template.
+
+on:
+  pull_request:
+    paths:
+      - 'crates/tooling/krab_cli/**'
+      - 'crates/framework/krab_core/**'
+      - 'crates/framework/krab_macros/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/generated-project.yaml'
+  push:
+    branches:
+      - main
+
+jobs:
+  scaffold-and-build:
+    runs-on: ubuntu-latest
+    strategy:
+      # Every template is reported, not just the first to break.
+      fail-fast: false
+      matrix:
+        template: [default, saas, edge-ssr, event-stream]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Build the CLI
+        run: cargo build -p krab_cli
+
+      # Scaffolded OUTSIDE the checkout, which is both what a real user does and
+      # a hard requirement: a crate created inside this repository would be
+      # found by Cargo's workspace walk, fail to appear in `members`, and error
+      # with "current package believes it's in a workspace when it's not".
+      #
+      # `--path-deps` points the generated manifest at this checkout. Without it
+      # the project would resolve `krab_core` from crates.io and this gate would
+      # test the last release rather than the change under review.
+      - name: Scaffold project
+        run: |
+          cd "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/target/debug/krab" new "gate-${{ matrix.template }}" \
+            --template "${{ matrix.template }}" \
+            --path-deps "$GITHUB_WORKSPACE"
+
+      - name: Show generated manifest
+        run: cat "$RUNNER_TEMP/gate-${{ matrix.template }}/Cargo.toml"
+
+      - name: Build
+        working-directory: ${{ runner.temp }}/gate-${{ matrix.template }}
+        run: cargo build
+
+      - name: Test
+        working-directory: ${{ runner.temp }}/gate-${{ matrix.template }}
+        run: cargo test
+
+      # The generated project ships its own CI workflow that runs clippy with
+      # `-D warnings` and `cargo fmt --all --check`. If the scaffold cannot pass
+      # its own gates on the first commit, it is not a usable starting point.
+      - name: Clippy
+        working-directory: ${{ runner.temp }}/gate-${{ matrix.template }}
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Format
+        working-directory: ${{ runner.temp }}/gate-${{ matrix.template }}
+        run: cargo fmt --check

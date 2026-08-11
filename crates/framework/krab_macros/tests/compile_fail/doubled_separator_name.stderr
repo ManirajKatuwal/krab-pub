@@ -1,0 +1,8 @@
+error: expected a name segment after '-' in 'data-'.
+         Names are made of segments joined by '-' or ':':
+           <div data-testid="x">
+           <use xlink:href="#icon"/>
+ --> tests/compile_fail/doubled_separator_name.rs:6:31
+  |
+6 |     let _ = view! { <div data--testid="x"></div> }.render();
+  |                               ^

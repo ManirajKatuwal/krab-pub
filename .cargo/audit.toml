@@ -1,0 +1,7 @@
+[advisories]
+ignore = [
+  # Transitive through sqlx-mysql pulled by sqlx macros; no upstream fix available.
+  # Project scope uses Postgres/SQLite runtime drivers only.
+  "RUSTSEC-2023-0071",
+]
+
