@@ -488,6 +488,13 @@ Covers all work merged after `0.1.1` (2026-03-11).
   signal, so server-side rendering produces the idle markup the browser
   hydrates against.
 
+- **A troubleshooting guide** ([docs/guides/troubleshooting.md](docs/guides/troubleshooting.md)):
+  a triage matrix and worked diagnoses for the failures developers actually
+  hit — islands that render but never become interactive (bundle, console
+  diagnostics, boundary states), services that refuse to start (config
+  validation, ports, database, feature flags), and CI gates that disagree
+  with a local run (feature-set and strictness mismatches).
+
 - **`krab_core::resource::Resource` and `create_resource`** — the read-side
   counterpart to `Action`, per [ADR 0009](docs/adr/0009-resource-ssr-semantics.md).
   A resource tracks a source closure, runs an async fetcher when it changes,
