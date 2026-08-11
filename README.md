@@ -1,8 +1,9 @@
 # Krab
 
+[![crates.io](https://img.shields.io/crates/v/krab_core.svg)](https://crates.io/crates/krab_core)
+[![docs.rs](https://img.shields.io/docsrs/krab_core)](https://docs.rs/krab_core)
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Rust: 1.75+](https://img.shields.io/badge/rust-1.75%2B-orange.svg)
-![Version: 0.2.0](https://img.shields.io/badge/version-0.2.0-informational.svg)
 
 Krab is a full-stack Rust framework for server-side rendering, island hydration, service composition, and production-oriented operational controls.
 
@@ -47,10 +48,9 @@ the server-first application that has to be *operated*.
 
 ## Installation
 
-> **Not yet on crates.io.** The workspace is prepared for publication — the
-> publish dry-run is part of the ops-hardening CI gate — but the first release
-> has not been cut. Until it is, use the path-dependency form below. Publication
-> preconditions and ordering are in [RELEASE_POLICY.md](RELEASE_POLICY.md).
+All five crates are on [crates.io](https://crates.io/crates/krab_core) as of
+`0.2.0`. Release channels and versioning policy are in
+[RELEASE_POLICY.md](RELEASE_POLICY.md).
 
 Krab is five crates. Most applications need two:
 
@@ -65,13 +65,8 @@ Krab is five crates. Most applications need two:
 ### Add to a project
 
 ```sh
-# Once published:
 cargo add krab_core --features rest
 cargo add krab_macros
-
-# Until then, against a local checkout:
-#   krab_core   = { path = "../krab/crates/framework/krab_core", features = ["rest"] }
-#   krab_macros = { path = "../krab/crates/framework/krab_macros" }
 ```
 
 `krab_core` ships **no default features**. Pick what you need: `rest`,
@@ -84,11 +79,7 @@ New to Krab? Start with **[docs/guides/getting_started.md](docs/guides/getting_s
 ### Install the CLI
 
 ```sh
-# Once published:
 cargo install krab_cli          # installs a binary named `krab`
-
-# Until then, from a local checkout:
-cargo install --path crates/tooling/krab_cli
 krab --version
 ```
 

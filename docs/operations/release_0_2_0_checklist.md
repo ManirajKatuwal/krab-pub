@@ -113,11 +113,12 @@ git tag -a v0.2.0 -m "0.2.0"
 git push origin v0.2.0
 ```
 
-- [ ] Move the `[0.2.0]` heading's "unreleased, prepared" note to a date.
-- [ ] Drop the "Not published yet" callouts in
+- [x] Move the `[0.2.0]` heading's "unreleased, prepared" note to a date
+      (2026-08-12).
+- [x] Drop the "Not published yet" callouts in
       [`README.md`](../../README.md) and
-      [`docs/guides/getting_started.md`](../guides/getting_started.md) — both
-      currently tell readers to install from a checkout.
+      [`docs/guides/getting_started.md`](../guides/getting_started.md) — the
+      crates.io install is now the primary path in both.
 - [ ] Confirm `cargo install krab_cli` puts a binary named `krab` on `PATH`.
 - [ ] Attach CI evidence links per the Required Release Artifacts table in
       [`RELEASE_POLICY.md`](../../RELEASE_POLICY.md).
