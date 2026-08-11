@@ -61,6 +61,14 @@ pub fn apply_common_http_layers<S>(router: Router<S>, state: S) -> Router<S>
 where
     S: Clone + Send + Sync + 'static + HasRuntimeState,
 {
+    // Layer ordering note: axum/tower layers wrap bottom-up, so the LAST
+    // `.layer(..)` in this chain is the OUTERMOST middleware and runs FIRST
+    // for a request. `auth_middleware` must therefore be layered AFTER
+    // `service_auth_middleware` here: `service_auth_middleware` reads the
+    // `AuthContext` extension that `auth_middleware` inserts, so on the
+    // request path auth must run first. It used to be the other way around,
+    // which made every `/internal` request a 403 — the scope check ran before
+    // any AuthContext could exist.
     router
         .layer(middleware::from_fn(security_headers_middleware))
         .layer(middleware::from_fn(api_version_header_middleware))
@@ -68,7 +76,7 @@ where
         .layer(RequestBodyLimitLayer::new(1024 * 1024 * 2))
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            auth_middleware::<S>,
+            service_auth_middleware::<S>,
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -76,7 +84,7 @@ where
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            service_auth_middleware::<S>,
+            auth_middleware::<S>,
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),

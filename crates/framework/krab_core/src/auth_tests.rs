@@ -523,4 +523,100 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
+
+    /// `service_auth_middleware` reads the `AuthContext` extension that
+    /// `auth_middleware` inserts. The layers used to run in the wrong order
+    /// (scope check before auth), so a request with a perfectly valid token
+    /// carrying the service scope still got 403 on every `/internal` route.
+    /// This drives a request through the full `apply_common_http_layers`
+    /// stack, not a hand-assembled router, so the real ordering is what is
+    /// under test.
+    #[tokio::test]
+    #[serial]
+    async fn test_internal_route_reachable_with_service_scope() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+
+        let state = TestState {
+            runtime: RuntimeState::new(),
+        };
+        let app = apply_common_http_layers(
+            Router::new().route(
+                "/internal/replicate",
+                axum::routing::get(|| async { "internal-ok" }),
+            ),
+            state.clone(),
+        )
+        .with_state(state.clone());
+
+        let scope = state.runtime.service_auth_scope.clone();
+        let token = generate_token(json!({
+            "sub": "service-caller",
+            "scope": scope,
+            "exp": 9999999999i64
+        }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/replicate")
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("x-forwarded-for", "10.10.0.30")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a valid token carrying the service scope must reach /internal routes"
+        );
+    }
+
+    /// The service-scope gate must still hold: a token that authenticates but
+    /// lacks the service scope is 403 on `/internal` routes.
+    #[tokio::test]
+    #[serial]
+    async fn test_internal_route_forbidden_without_service_scope() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+
+        let state = TestState {
+            runtime: RuntimeState::new(),
+        };
+        let app = apply_common_http_layers(
+            Router::new().route(
+                "/internal/replicate",
+                axum::routing::get(|| async { "internal-ok" }),
+            ),
+            state.clone(),
+        )
+        .with_state(state);
+
+        let token = generate_token(json!({
+            "sub": "user",
+            "scope": "users.read",
+            "exp": 9999999999i64
+        }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/replicate")
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("x-forwarded-for", "10.10.0.31")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 }

@@ -176,7 +176,10 @@ mod tests {
         assert_eq!(ServiceTopology::parse("unknown"), None);
     }
 
+    // Serialized: mutates process-global env vars, which races the other
+    // `#[serial]` env-reading suites when run concurrently.
     #[test]
+    #[serial_test::serial]
     fn topology_runtime_reads_endpoint_map() {
         std::env::set_var("KRAB_RUNTIME_TOPOLOGY", "distributed");
         std::env::set_var(

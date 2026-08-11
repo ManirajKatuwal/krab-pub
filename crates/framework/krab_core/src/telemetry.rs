@@ -162,8 +162,13 @@ impl EndpointMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
+    // Serialized: mutates process-global env vars (`KRAB_ENVIRONMENT`) that
+    // the auth/config test suites also read under their own `#[serial]` lock.
+    // Running this concurrently with them produced rare flakes.
     #[test]
+    #[serial]
     fn telemetry_config_from_env_uses_overrides() {
         std::env::set_var("KRAB_SERVICE_NAME", "service_override");
         std::env::set_var("KRAB_ENVIRONMENT", "staging");

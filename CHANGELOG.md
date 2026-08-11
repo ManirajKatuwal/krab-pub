@@ -47,6 +47,16 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
   module-by-module map of `krab_core` with its cross-cutting invariants,
   migrated from the maintainer wiki so the public docs carry them.
 
+- **Every `/internal` request through `apply_common_http_layers` was 403.**
+  Axum layers wrap bottom-up, so `service_auth_middleware` — which validates
+  the service scope on the `AuthContext` request extension — ran *before*
+  `auth_middleware` had inserted that extension. The scope check therefore
+  never saw an authenticated caller, valid token or not. The layer order is
+  swapped so authentication runs first on the request path, with a regression
+  test driving a scoped token through the full production layer stack to an
+  `/internal` route (and a second proving the scope gate still rejects tokens
+  without the service scope).
+
 - **A broken `DATABASE_URL` secret source silently fell back to the localhost
   default.** `DbConfig::from_env` swallowed `read_env_or_file` errors with
   `.ok()`, so an unreadable `DATABASE_URL_FILE` or unresolved
