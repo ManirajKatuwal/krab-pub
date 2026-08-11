@@ -140,7 +140,8 @@ async fn bootstrap_users_service() -> Result<UsersService> {
 
     let db_driver = resolve_db_driver()?;
     let default_db_url = default_db_url_for_driver(db_driver);
-    let db_cfg = DbConfig::from_env(default_db_url);
+    let db_cfg = DbConfig::from_env(default_db_url)
+        .context("failed to resolve users database configuration from environment")?;
     info!(
         db_driver = ?db_driver,
         db_url = %redact_db_url_credentials(&db_cfg.url),

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Row;
 use sqlx::{Pool, Postgres};
@@ -364,7 +364,14 @@ impl DbConfig {
         Ok(())
     }
 
-    pub fn from_env(default_url: &str) -> Self {
+    /// Load pool configuration from the environment.
+    ///
+    /// A missing `DATABASE_URL` falls back to `default_url` (the dev
+    /// convenience). An **error** resolving it — an unreadable or empty
+    /// `DATABASE_URL_FILE`, an unresolved `DATABASE_URL_VAULT_REF` — is
+    /// returned, never swallowed: a broken secret source must fail startup
+    /// rather than silently connect to the localhost default.
+    pub fn from_env(default_url: &str) -> Result<Self> {
         fn parse_u32(name: &str, default: u32) -> u32 {
             std::env::var(name)
                 .ok()
@@ -374,8 +381,7 @@ impl DbConfig {
 
         let mut cfg = Self::default();
         cfg.url = crate::config::read_env_or_file("DATABASE_URL")
-            .ok()
-            .flatten()
+            .context("failed to resolve DATABASE_URL from its configured secret source")?
             .unwrap_or_else(|| default_url.to_string());
         cfg.max_connections = parse_u32("DB_MAX_CONNECTIONS", cfg.max_connections);
         cfg.min_connections = parse_u32("DB_MIN_CONNECTIONS", cfg.min_connections);
@@ -396,7 +402,7 @@ impl DbConfig {
             "DB_IDLE_TIMEOUT_SECS",
             cfg.idle_timeout.as_secs() as u32,
         ) as u64);
-        cfg
+        Ok(cfg)
     }
 }
 
@@ -755,4 +761,67 @@ pub async fn run_versioned_migrations(
     }
 
     Ok(report)
+}
+
+#[cfg(test)]
+mod db_config_tests {
+    use super::DbConfig;
+    use serial_test::serial;
+
+    fn clear_db_url_env() {
+        for key in [
+            "DATABASE_URL",
+            "DATABASE_URL_FILE",
+            "DATABASE_URL_VAULT_REF",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn missing_database_url_still_falls_back_to_default_in_dev() {
+        clear_db_url_env();
+
+        let cfg = DbConfig::from_env("postgres://localhost:5432/dev_default")
+            .expect("an unset DATABASE_URL is not an error");
+        assert_eq!(cfg.url, "postgres://localhost:5432/dev_default");
+    }
+
+    #[test]
+    #[serial]
+    fn broken_database_url_file_fails_instead_of_defaulting() {
+        clear_db_url_env();
+        std::env::set_var(
+            "DATABASE_URL_FILE",
+            "definitely/not/a/real/path/database_url.txt",
+        );
+
+        let err = DbConfig::from_env("postgres://localhost:5432/dev_default")
+            .expect_err("an unreadable DATABASE_URL_FILE must fail, not fall back");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("DATABASE_URL"),
+            "error should name the failing variable: {message}"
+        );
+
+        std::env::remove_var("DATABASE_URL_FILE");
+    }
+
+    #[test]
+    #[serial]
+    fn unresolved_database_url_vault_ref_fails_instead_of_defaulting() {
+        clear_db_url_env();
+        std::env::set_var("DATABASE_URL_VAULT_REF", "vault://kv/krab/database-url");
+
+        let err = DbConfig::from_env("postgres://localhost:5432/dev_default")
+            .expect_err("an unresolved DATABASE_URL_VAULT_REF must fail, not fall back");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("DATABASE_URL_VAULT_REF"),
+            "error should name the failing variable: {message}"
+        );
+
+        std::env::remove_var("DATABASE_URL_VAULT_REF");
+    }
 }

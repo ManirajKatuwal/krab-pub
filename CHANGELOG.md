@@ -47,6 +47,18 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
   module-by-module map of `krab_core` with its cross-cutting invariants,
   migrated from the maintainer wiki so the public docs carry them.
 
+- **A broken `DATABASE_URL` secret source silently fell back to the localhost
+  default.** `DbConfig::from_env` swallowed `read_env_or_file` errors with
+  `.ok()`, so an unreadable `DATABASE_URL_FILE` or unresolved
+  `DATABASE_URL_VAULT_REF` produced a service happily connecting to
+  `postgres://postgres@localhost:5432/krab` instead of failing. It now returns
+  `anyhow::Result` and propagates sourcing errors; service startups already
+  return `Result`, so a broken secret source aborts boot with the failing
+  variable named. A merely *unset* `DATABASE_URL` still falls back to the
+  driver default for dev convenience. **Breaking** for direct callers of
+  `DbConfig::from_env` (unpublished `0.2.0` API): the return type gained
+  `Result`.
+
 - **The shipped wasm client could never satisfy CSRF protection.** The client
   half of `#[server]` read a cookie named `csrf_token` from `document.cookie`,
   while the server middleware set `krab_csrf_token` — and set it `HttpOnly`,
