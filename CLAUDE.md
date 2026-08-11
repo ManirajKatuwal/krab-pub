@@ -15,7 +15,7 @@ It is a **Cargo workspace**, not an application. Changes here affect downstream
 framework consumers, so API surface and governance artifacts matter as much as
 the code.
 
-- Version: `0.1.x` (workspace-wide, `[workspace.package]` in `Cargo.toml`)
+- Version: `0.2.0` — prepared, not yet published (workspace-wide, `[workspace.package]` in `Cargo.toml`; see `docs/operations/release_0_2_0_checklist.md`)
 - Edition: 2021, Rust stable 1.75+
 - License: MIT
 
