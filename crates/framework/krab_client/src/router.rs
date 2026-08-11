@@ -6,7 +6,8 @@
 //!
 //! # How it works
 //!
-//! [`start`] installs two listeners:
+//! `start` (available on `wasm32` with the `web` feature) installs two
+//! listeners:
 //!
 //! - a capturing `click` listener on `document`, which intercepts anchors that
 //!   [`should_intercept`] approves and navigates in place instead;

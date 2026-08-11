@@ -48,9 +48,10 @@ All conditions below must be satisfied before a beta release can be promoted to 
 
 ## Crate Publication
 
-Krab is consumed from crates.io, not by cloning this repository. Six crates are
-published; the four under `services/` carry `publish = false` and are reference
-applications, not distributables.
+Krab is consumed from crates.io, not by cloning this repository. Five crates are
+published; the other five workspace members — the four under `services/` and the
+reference app `examples/reference_apps/islands_rpc` — carry `publish = false`
+and are reference applications, not distributables.
 
 ### Published crates and order
 
