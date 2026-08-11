@@ -68,6 +68,11 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ### Added
 
+- **Community health files.** `CODE_OF_CONDUCT.md` (Contributor Covenant 2.1,
+  conduct reports to the maintainer), a pull-request template carrying the
+  CONTRIBUTING verification checklist, and structured issue forms (bug /
+  feature) whose config routes vulnerability reports to the private advisory
+  flow instead of public issues.
 - **`SECURITY.md`** — vulnerability reporting policy (private GitHub Security
   Advisories), supported-version table, and scope for the five published
   crates.
