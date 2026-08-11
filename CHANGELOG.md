@@ -18,6 +18,15 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ### Security
 
+- **A JWT algorithm allowlist mixing HMAC and asymmetric families is
+  rejected.** `KRAB_JWT_ALLOWED_ALGS=HS256,RS256`-style configurations are
+  the classic key-confusion footgun: with both families allowed against the
+  same key set, a public RSA/EC verification key doubles as an HMAC secret.
+  Startup now fails on a mixed allowlist outside dev, and the request path
+  fails closed (503, `jwt_allowlist_mixes...` warning) in every environment
+  rather than verifying anything under such a list. Single-family allowlists
+  are unaffected.
+
 - **Issuer/audience validation can no longer be silently absent in
   staging/prod.** `iss`/`aud` checks only run when the expected values are
   configured, so a deployment that never set them accepted tokens from any

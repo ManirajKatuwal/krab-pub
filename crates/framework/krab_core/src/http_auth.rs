@@ -99,6 +99,15 @@ fn parse_jwt_algorithm(alg: &str) -> Option<jsonwebtoken::Algorithm> {
     }
 }
 
+fn is_hmac_algorithm(alg: &jsonwebtoken::Algorithm) -> bool {
+    matches!(
+        alg,
+        jsonwebtoken::Algorithm::HS256
+            | jsonwebtoken::Algorithm::HS384
+            | jsonwebtoken::Algorithm::HS512
+    )
+}
+
 fn configured_jwt_algorithms() -> Result<Vec<jsonwebtoken::Algorithm>, StatusCode> {
     let raw = match std::env::var("KRAB_JWT_ALLOWED_ALGS") {
         Ok(raw) => raw,
@@ -119,6 +128,21 @@ fn configured_jwt_algorithms() -> Result<Vec<jsonwebtoken::Algorithm>, StatusCod
 
     if algorithms.is_empty() {
         warn!("KRAB_JWT_ALLOWED_ALGS resolved to an empty allowlist");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // An allowlist mixing HMAC (HS*) with asymmetric (RS*/PS*/ES*/EdDSA)
+    // families is the classic key-confusion footgun: with both allowed, an
+    // attacker can take a public RSA/EC verification key and present it as an
+    // HMAC secret. Fail closed rather than verify anything under such a
+    // configuration; `KrabConfig::validate` rejects it at startup outside dev.
+    let has_hmac = algorithms.iter().any(is_hmac_algorithm);
+    let has_asymmetric = algorithms.iter().any(|alg| !is_hmac_algorithm(alg));
+    if has_hmac && has_asymmetric {
+        warn!(
+            allowlist = %raw,
+            "KRAB_JWT_ALLOWED_ALGS mixes HMAC and asymmetric algorithm families; refusing to verify"
+        );
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 

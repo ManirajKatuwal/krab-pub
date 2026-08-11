@@ -619,4 +619,37 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
+
+    /// An allowlist mixing HMAC with asymmetric families is the algorithm
+    /// confusion footgun; the request path must fail closed rather than
+    /// verify anything under it.
+    #[tokio::test]
+    #[serial]
+    async fn test_mixed_algorithm_family_allowlist_fails_closed() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+        std::env::set_var("KRAB_JWT_ALLOWED_ALGS", "HS256,RS256");
+
+        let app = test_app();
+        let token = generate_token(json!({
+            "sub": "user",
+            "exp": 9999999999i64
+        }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("x-forwarded-for", "10.10.0.40")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 }

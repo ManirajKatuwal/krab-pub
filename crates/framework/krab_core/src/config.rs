@@ -144,6 +144,31 @@ pub fn env_non_empty(name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Whether a `KRAB_JWT_ALLOWED_ALGS` value names algorithms from both the
+/// HMAC family (`HS*`) and an asymmetric family (`RS*`/`PS*`/`ES*`/`EdDSA`).
+///
+/// Unknown names are ignored here — the request-path parser drops them with a
+/// warning — so only recognised algorithms determine the verdict.
+pub(crate) fn jwt_allowlist_mixes_hmac_and_asymmetric(raw: &str) -> bool {
+    let mut has_hmac = false;
+    let mut has_asymmetric = false;
+
+    for alg in raw.split(',').map(str::trim).filter(|alg| !alg.is_empty()) {
+        let upper = alg.to_ascii_uppercase();
+        if upper.starts_with("HS") {
+            has_hmac = true;
+        } else if upper.starts_with("RS")
+            || upper.starts_with("PS")
+            || upper.starts_with("ES")
+            || upper == "EDDSA"
+        {
+            has_asymmetric = true;
+        }
+    }
+
+    has_hmac && has_asymmetric
+}
+
 pub fn read_env_or_file(name: &str) -> Result<Option<String>> {
     if let Some(value) = env_non_empty(name) {
         return Ok(Some(value));
@@ -416,6 +441,23 @@ impl KrabConfig {
             if has_provider_bundle {
                 self.require_issuer_and_audience_in_provider_bundle()?;
             }
+
+            // An algorithm allowlist mixing the HMAC family with an
+            // asymmetric family is the classic key-confusion footgun (a
+            // public verification key doubles as an HMAC secret). The
+            // request path also refuses to verify under such a list; reject
+            // it at startup with an actionable error.
+            if let Some(raw) = env_non_empty("KRAB_JWT_ALLOWED_ALGS") {
+                if jwt_allowlist_mixes_hmac_and_asymmetric(&raw) {
+                    anyhow::bail!(
+                        "KRAB_JWT_ALLOWED_ALGS='{}' mixes HMAC (HS*) and asymmetric \
+                         (RS*/PS*/ES*/EdDSA) algorithm families; split verification across \
+                         providers with distinct key material instead of allowing both \
+                         families against the same keys",
+                        raw
+                    );
+                }
+            }
         } else {
             anyhow::bail!(
                 "Unsupported KRAB_AUTH_MODE='{}' in '{}' environment; use jwt or oidc",
@@ -582,6 +624,7 @@ mod tests {
             "KRAB_JWT_PROVIDERS_JSON_VAULT_REF",
             "KRAB_OIDC_ISSUER",
             "KRAB_OIDC_AUDIENCE",
+            "KRAB_JWT_ALLOWED_ALGS",
             "KRAB_CORS_ORIGINS",
             "KRAB_TRUST_PROXY_HEADERS",
             "KRAB_RATE_LIMIT_FAIL_OPEN",
@@ -1033,6 +1076,63 @@ mod tests {
             "KRAB_JWT_PROVIDERS_JSON",
             r#"[{"name":"main","issuer":"https://issuer.example.com","audience":"krab-api","keys":{"default":"k"}}]"#,
         );
+
+        let cfg = KrabConfig::from_env("users", 3002);
+        assert!(cfg.validate().is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Mixed HMAC/asymmetric algorithm allowlist
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn jwt_allowlist_family_mix_detection() {
+        use super::jwt_allowlist_mixes_hmac_and_asymmetric as mixed;
+
+        assert!(mixed("HS256,RS256"));
+        assert!(mixed("hs512, es256"));
+        assert!(mixed("RS384,EdDSA,HS256"));
+        assert!(!mixed("HS256,HS384"));
+        assert!(!mixed("RS256,ES256,PS512,EdDSA"));
+        assert!(!mixed(""));
+        // Unknown names never decide the verdict.
+        assert!(!mixed("HS256,garbage"));
+        assert!(!mixed("garbage,RS256"));
+    }
+
+    #[test]
+    #[serial]
+    fn validate_rejects_mixed_algorithm_families_in_prod() {
+        let _guard = env_lock();
+        clear_auth_env();
+        std::env::set_var("KRAB_ENVIRONMENT", "prod");
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_CORS_ORIGINS", "https://app.example.com");
+        std::env::set_var("KRAB_OIDC_ISSUER", "https://issuer.example.com");
+        std::env::set_var("KRAB_OIDC_AUDIENCE", "krab-api");
+        std::env::set_var("KRAB_JWT_SECRET_FILE", "/run/secrets/krab_jwt_secret");
+        std::env::set_var("KRAB_JWT_ALLOWED_ALGS", "HS256,RS256");
+
+        let cfg = KrabConfig::from_env("users", 3002);
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("mixes HMAC (HS*) and asymmetric"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn validate_accepts_single_family_allowlist_in_prod() {
+        let _guard = env_lock();
+        clear_auth_env();
+        std::env::set_var("KRAB_ENVIRONMENT", "prod");
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_CORS_ORIGINS", "https://app.example.com");
+        std::env::set_var("KRAB_OIDC_ISSUER", "https://issuer.example.com");
+        std::env::set_var("KRAB_OIDC_AUDIENCE", "krab-api");
+        std::env::set_var("KRAB_JWT_SECRET_FILE", "/run/secrets/krab_jwt_secret");
+        std::env::set_var("KRAB_JWT_ALLOWED_ALGS", "RS256,ES256");
 
         let cfg = KrabConfig::from_env("users", 3002);
         assert!(cfg.validate().is_ok());

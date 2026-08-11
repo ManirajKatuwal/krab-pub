@@ -98,7 +98,7 @@ Required when `KRAB_AUTH_MODE=jwt`.
 | `KRAB_JWT_PROVIDERS_JSON` | No | — | JSON array of providers, each with `name`, `issuer`, `audience`. Supports `_VAULT_REF` |
 | `KRAB_JWT_ACTIVE_KID` | No | — | KID used for newly issued tokens. Older KIDs stay valid for the rotation grace window |
 | `KRAB_JWT_REQUIRE_KID` | No | `false` | Reject tokens with no `kid` header |
-| `KRAB_JWT_ALLOWED_ALGS` | No | — | Comma-separated allow-list, e.g. `RS256,ES256`. Unset means the built-in allow-list |
+| `KRAB_JWT_ALLOWED_ALGS` | No | — | Comma-separated allow-list, e.g. `RS256,ES256`. Unset means the built-in allow-list. Mixing HMAC (`HS*`) with asymmetric (`RS*`/`PS*`/`ES*`/`EdDSA`) families is rejected — startup fails outside dev, and the request path refuses to verify (503) in every environment |
 | `KRAB_JWT_LEEWAY_SECS` | No | — | Clock-skew tolerance on `exp` and `nbf`. Unset means no leeway |
 
 ## Rate limiting, CORS, and proxy trust
