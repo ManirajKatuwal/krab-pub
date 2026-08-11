@@ -7,9 +7,15 @@ dist/.hmr_signal
 # `reference-app` CI gate and by anyone following its README.
 /examples/reference_apps/islands_rpc/pkg/
 
+# `wasm-pack build` output for the frontend service (see
+# services/service_frontend/public/README.md) and the SSG stubs written by its
+# build.rs.
+/services/service_frontend/public/pkg/
+/services/service_frontend/public/__ssg/
+
 # Local environment (never commit secrets)
-.env
-.env.local
+.env*
+!.env.example
 
 # SQLite dev databases
 *.sqlite
@@ -20,15 +26,30 @@ dist/.hmr_signal
 __pycache__/
 *.py[cod]
 
+# Node tooling
+node_modules/
+
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 
+# Editor/merge droppings and runtime logs
+*.log
+*.tmp
+*.orig
+*.rej
+*.bak
+frontend_stdout.txt
+frontend_stderr.txt
+
 # OS
 .DS_Store
 Thumbs.db
+
+# Agent tooling (maintainer-local: worktrees, skills, local settings)
+.claude/
 
 # ---------------------------------------------------------------------------
 # Internal documentation and evidence (not for public distribution).

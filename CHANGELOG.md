@@ -18,6 +18,13 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ### Fixed
 
+- **`Dockerfile.service` builds again.** The dependency-cache stage still
+  copied the manifest of `krab_server`, a crate removed in 0.2.0 (ADR 0005),
+  which failed every image build at `COPY`. The stage now copies the manifests
+  of all ten current workspace members — including `service_users_split` and
+  the `islands_rpc` example, whose absence made the cached stub build resolve
+  nothing and silently skip dependency caching.
+
 - **Docs no longer teach non-compiling `view!` code.** The `create_action`
   examples in the getting-started guide, the server-functions reference, and
   the `krab_core::action` module docs used a reactive `disabled={ move || … }`
