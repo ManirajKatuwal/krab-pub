@@ -590,6 +590,59 @@ pub fn authorize_with_jwt(req: &Request<Body>, path: &str) -> Result<AuthContext
     })
 }
 
+/// Baseline unauthenticated ("open") path patterns, used when
+/// `KRAB_AUTH_OPEN_PATHS` is unset. A trailing `*` makes a pattern a prefix
+/// match; anything else is an exact match. This is the same list that used to
+/// be hardcoded in `auth_middleware`, so defaults are backward-compatible —
+/// but operators can now override it, e.g. to close `/metrics`.
+pub(crate) const DEFAULT_AUTH_OPEN_PATHS: &[&str] = &[
+    "/",
+    "/health",
+    "/ready",
+    "/contact",
+    "/api/contact",
+    "/api/v1/auth/login",
+    "/api/v1/auth/refresh",
+    "/api/v1/auth/revoke",
+    "/api/v1/auth/jwks",
+    "/api/v1/auth/capabilities",
+    "/api/v1/auth/status",
+    "/api/status",
+    "/metrics",
+    "/metrics/prometheus",
+    "/data/dashboard",
+    "/rpc/version",
+    "/rpc/now",
+    "/asset-manifest.json",
+    "/blog/*",
+    "/pkg/*",
+];
+
+/// Resolve the open-path pattern list: `KRAB_AUTH_OPEN_PATHS` when set
+/// (comma-separated; an explicitly EMPTY value closes every default open
+/// path), the baseline list otherwise.
+pub(crate) fn auth_open_path_patterns() -> Vec<String> {
+    match std::env::var("KRAB_AUTH_OPEN_PATHS") {
+        Ok(raw) => parse_csv_set(&raw),
+        Err(_) => DEFAULT_AUTH_OPEN_PATHS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    }
+}
+
+/// Match `path` against patterns: trailing `*` is a prefix match, everything
+/// else exact. Shared by the open-path list and `KRAB_AUTH_PUBLIC_PATHS`.
+pub(crate) fn path_matches_patterns(path: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| {
+        if let Some(prefix) = pattern.strip_suffix('*') {
+            path.starts_with(prefix)
+        } else {
+            path == pattern
+        }
+    })
+}
+
 pub async fn auth_middleware<S>(
     State(state): State<S>,
     mut req: Request<Body>,
@@ -600,34 +653,8 @@ where
 {
     let path = req.uri().path();
 
-    let open = path == "/"
-        || path == "/health"
-        || path == "/ready"
-        || path == "/contact"
-        || path == "/api/contact"
-        || path == "/api/v1/auth/login"
-        || path == "/api/v1/auth/refresh"
-        || path == "/api/v1/auth/revoke"
-        || path == "/api/v1/auth/jwks"
-        || path == "/api/v1/auth/capabilities"
-        || path == "/api/v1/auth/status"
-        || path == "/api/status"
-        || path == "/metrics"
-        || path == "/metrics/prometheus"
-        || path == "/data/dashboard"
-        || path == "/rpc/version"
-        || path == "/rpc/now"
-        || path == "/asset-manifest.json"
-        || path.starts_with("/blog/")
-        || path.starts_with("/pkg/");
-
-    let is_public = state.runtime_state().public_paths.iter().any(|pattern| {
-        if let Some(prefix) = pattern.strip_suffix('*') {
-            path.starts_with(prefix)
-        } else {
-            path == pattern
-        }
-    });
+    let open = path_matches_patterns(path, &auth_open_path_patterns());
+    let is_public = path_matches_patterns(path, &state.runtime_state().public_paths);
 
     if open || is_public {
         return Ok(next.run(req).await);
@@ -756,4 +783,64 @@ where
     );
 
     Ok(next.run(req).await)
+}
+
+#[cfg(test)]
+mod open_path_tests {
+    use super::{auth_open_path_patterns, path_matches_patterns, DEFAULT_AUTH_OPEN_PATHS};
+    use serial_test::serial;
+
+    #[test]
+    fn pattern_matching_supports_exact_and_prefix() {
+        let patterns: Vec<String> = vec!["/health".into(), "/blog/*".into()];
+
+        assert!(path_matches_patterns("/health", &patterns));
+        assert!(!path_matches_patterns("/healthz", &patterns));
+        assert!(path_matches_patterns("/blog/post-1", &patterns));
+        assert!(!path_matches_patterns("/metrics", &patterns));
+    }
+
+    #[test]
+    #[serial]
+    fn default_open_paths_keep_backward_compatible_surface() {
+        std::env::remove_var("KRAB_AUTH_OPEN_PATHS");
+        let patterns = auth_open_path_patterns();
+
+        // The pre-configurability hardcoded list, byte for byte.
+        assert_eq!(
+            patterns,
+            DEFAULT_AUTH_OPEN_PATHS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(path_matches_patterns("/metrics", &patterns));
+        assert!(path_matches_patterns("/pkg/app_bg.wasm", &patterns));
+        assert!(!path_matches_patterns("/api/v1/users", &patterns));
+    }
+
+    #[test]
+    #[serial]
+    fn operators_can_close_metrics_via_env() {
+        std::env::set_var("KRAB_AUTH_OPEN_PATHS", "/health,/ready");
+        let patterns = auth_open_path_patterns();
+        std::env::remove_var("KRAB_AUTH_OPEN_PATHS");
+
+        assert!(path_matches_patterns("/health", &patterns));
+        assert!(
+            !path_matches_patterns("/metrics", &patterns),
+            "an explicit open-path list must be able to close /metrics"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn empty_env_value_closes_every_default_open_path() {
+        std::env::set_var("KRAB_AUTH_OPEN_PATHS", "");
+        let patterns = auth_open_path_patterns();
+        std::env::remove_var("KRAB_AUTH_OPEN_PATHS");
+
+        assert!(patterns.is_empty());
+        assert!(!path_matches_patterns("/health", &patterns));
+    }
 }

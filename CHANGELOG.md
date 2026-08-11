@@ -18,6 +18,15 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ### Security
 
+- **The unauthenticated ("open") path list is configurable via
+  `KRAB_AUTH_OPEN_PATHS`.** It was hardcoded in `auth_middleware`, so
+  operators could not close `/metrics` or `/metrics/prometheus` without
+  forking the middleware. When set, the variable replaces the built-in list
+  (comma-separated, trailing `*` for prefix match; an explicitly empty value
+  closes everything); unset keeps the exact previous list, so defaults are
+  backward-compatible. `KRAB_AUTH_PUBLIC_PATHS` still adds paths on top.
+  Documented in `.env.example` and `docs/reference/environment.md`.
+
 - **A JWT algorithm allowlist mixing HMAC and asymmetric families is
   rejected.** `KRAB_JWT_ALLOWED_ALGS=HS256,RS256`-style configurations are
   the classic key-confusion footgun: with both families allowed against the

@@ -54,6 +54,7 @@ mod tests {
             "KRAB_AUTH_REQUIRE_TENANT_CLAIM",
             "KRAB_AUTH_REQUIRE_TENANT_MATCH",
             "KRAB_JWT_REQUIRE_KID",
+            "KRAB_AUTH_OPEN_PATHS",
             "KRAB_TRUST_PROXY_HEADERS",
             "KRAB_RATE_LIMIT_CAPACITY",
             "KRAB_RATE_LIMIT_REFILL_PER_SEC",
@@ -651,5 +652,61 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// `/metrics` sits on the default open-path list for backward
+    /// compatibility, but operators must be able to close it:
+    /// `KRAB_AUTH_OPEN_PATHS` replaces the whole list when set.
+    #[tokio::test]
+    #[serial]
+    async fn test_open_paths_env_can_close_metrics() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+        std::env::set_var("KRAB_AUTH_OPEN_PATHS", "/health,/ready");
+
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("x-forwarded-for", "10.10.0.50")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "with an explicit open-path list omitting it, /metrics must require auth"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_metrics_stays_open_by_default() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("x-forwarded-for", "10.10.0.51")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // The test router has no /metrics route; the point is that the auth
+        // layer passes the request through (404 from routing, not 401).
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }
