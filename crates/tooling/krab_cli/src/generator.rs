@@ -63,34 +63,14 @@ fn generate_service(
         feature_names.push("rest");
     }
 
-    let cargo_toml = format!(
-        r#"[package]
-name = "{}"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-tokio = {{ version = "1.0", features = ["full"] }}
-krab_core = {{ path = "../krab_core", features = [{}] }}
-anyhow = "1.0"
-tracing = "0.1"
-tracing-subscriber = "0.3"
-serde = {{ version = "1.0", features = ["derive"] }}
-"#,
-        name,
-        feature_names
-            .iter()
-            .map(|f| format!("\"{}\"", f))
-            .collect::<Vec<String>>()
-            .join(", ")
-    );
+    let cargo_toml = render_service_manifest(name, &feature_names);
 
     fs::write(path.join("Cargo.toml"), cargo_toml)?;
     fs::create_dir(path.join("src"))?;
 
     let mut main_rs = r#"use anyhow::Result;
-use krab_core::service::{ApiService, ServiceConfig};
 use async_trait::async_trait;
+use krab_core::service::ApiService;
 
 struct Service;
 
@@ -137,6 +117,48 @@ async fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Render the manifest for a `krab gen service` single-crate service.
+///
+/// `krab_core` resolves from crates.io at the CLI's own (workspace) version.
+/// The old output emitted `path = "../krab_core"`, a directory that has not
+/// existed since the crates/ reorganisation (`crates/framework/krab_core`), so
+/// no generated service could ever resolve its dependencies. `async-trait` is
+/// declared because the generated `main.rs` implements
+/// `krab_core::service::ApiService` with `#[async_trait]`.
+fn render_service_manifest(name: &str, feature_names: &[&str]) -> String {
+    format!(
+        r#"[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = {{ version = "1.0", features = ["full"] }}
+krab_core = {{ version = "{version}", features = [{features}] }}
+async-trait = "0.1"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+serde = {{ version = "1.0", features = ["derive"] }}
+"#,
+        version = crate::project_template::FRAMEWORK_VERSION,
+        features = feature_names
+            .iter()
+            .map(|f| format!("\"{}\"", f))
+            .collect::<Vec<String>>()
+            .join(", ")
+    )
+}
+
+/// Render the manifest for one protocol-adapter crate of a split topology.
+/// Same registry-resolution rationale as [`render_service_manifest`].
+fn render_split_adapter_manifest(crate_name: &str, domain_name: &str) -> String {
+    format!(
+        "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{domain_name} = {{ path = \"../{domain_name}\" }}\nkrab_core = {{ version = \"{version}\", features = [\"rest\"] }}\n",
+        version = crate::project_template::FRAMEWORK_VERSION
+    )
 }
 
 fn resolve_protocols(
@@ -240,10 +262,7 @@ fn generate_split_service_topology(name: &str, selected_protocols: &[ServiceType
         fs::create_dir_all(crate_path.join("src/domain"))?;
         fs::write(
             crate_path.join("Cargo.toml"),
-            format!(
-                "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{} = {{ path = \"../{}\" }}\nkrab_core = {{ path = \"../krab_core\", features = [\"rest\"] }}\n",
-                crate_name, domain_name, domain_name
-            ),
+            render_split_adapter_manifest(&crate_name, &domain_name),
         )?;
         fs::write(
             crate_path.join("src/main.rs"),
@@ -379,7 +398,107 @@ pub async fn {}(input: String) -> Result<String, ServerFnError> {{
 
 #[cfg(test)]
 mod tests {
-    use super::{render_component, render_route, render_server_function};
+    use super::{
+        render_component, render_route, render_server_function, render_service_manifest,
+        render_split_adapter_manifest,
+    };
+
+    fn dependencies_of(manifest: &str) -> toml::value::Table {
+        let parsed: toml::Value = toml::from_str(manifest)
+            .unwrap_or_else(|e| panic!("generated manifest is not valid TOML: {e}\n{manifest}"));
+        parsed
+            .get("dependencies")
+            .and_then(|d| d.as_table())
+            .expect("generated manifest has no [dependencies]")
+            .clone()
+    }
+
+    /// The generated `main.rs` uses `#[async_trait]`, but the manifest never
+    /// declared the crate, and `krab_core` pointed at `../krab_core` — a path
+    /// that has not existed since the crates/ reorganisation. Neither output
+    /// could compile.
+    #[test]
+    fn service_manifest_parses_declares_async_trait_and_registry_krab_core() {
+        let manifest = render_service_manifest("demo_service", &["rest", "graphql"]);
+        let deps = dependencies_of(&manifest);
+
+        assert!(
+            deps.contains_key("async-trait"),
+            "generated main.rs uses #[async_trait]; the manifest must declare async-trait"
+        );
+
+        let core = deps.get("krab_core").expect("krab_core is a dependency");
+        assert!(
+            core.get("path").is_none(),
+            "krab_core must not be a path dependency: '../krab_core' does not exist \
+             relative to a generated service"
+        );
+        assert_eq!(
+            core.get("version").and_then(|v| v.as_str()),
+            Some(crate::project_template::FRAMEWORK_VERSION),
+            "krab_core must resolve from the registry at the workspace version"
+        );
+        let features: Vec<&str> = core
+            .get("features")
+            .and_then(|f| f.as_array())
+            .expect("krab_core carries a feature list")
+            .iter()
+            .filter_map(|f| f.as_str())
+            .collect();
+        assert_eq!(features, vec!["rest", "graphql"]);
+    }
+
+    /// Every feature the service generator can request must exist in
+    /// `krab_core`'s manifest, read rather than hard-coded so a feature
+    /// rename fails this test instead of shipping a broken generator.
+    #[test]
+    fn service_manifest_features_exist_in_krab_core() {
+        let krab_core_manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../framework/krab_core/Cargo.toml")
+            .canonicalize()
+            .expect("krab_core manifest not found");
+        let parsed: toml::Value = toml::from_str(
+            &std::fs::read_to_string(krab_core_manifest).expect("krab_core manifest unreadable"),
+        )
+        .expect("krab_core manifest is not valid TOML");
+        let declared: Vec<String> = parsed
+            .get("features")
+            .and_then(|f| f.as_table())
+            .expect("krab_core declares no [features]")
+            .keys()
+            .cloned()
+            .collect();
+
+        // The full set of features generate_service can map a protocol to.
+        for feature in ["rest", "graphql", "grpc"] {
+            assert!(
+                declared.iter().any(|d| d == feature),
+                "generator can request krab_core feature {feature:?}, which krab_core does \
+                 not declare. Declared: {declared:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_adapter_manifest_parses_and_uses_registry_krab_core() {
+        let manifest = render_split_adapter_manifest("users-rest", "users-domain");
+        let deps = dependencies_of(&manifest);
+
+        let core = deps.get("krab_core").expect("krab_core is a dependency");
+        assert!(core.get("path").is_none());
+        assert_eq!(
+            core.get("version").and_then(|v| v.as_str()),
+            Some(crate::project_template::FRAMEWORK_VERSION)
+        );
+
+        // The shared domain crate is generated alongside, so a sibling path
+        // dependency is correct there.
+        let domain = deps.get("users-domain").expect("domain dep present");
+        assert_eq!(
+            domain.get("path").and_then(|p| p.as_str()),
+            Some("../users-domain")
+        );
+    }
 
     /// Items that do not exist in Krab. Earlier templates were written against
     /// another framework's API and generated code that could not compile.

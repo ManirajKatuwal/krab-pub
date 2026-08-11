@@ -7,8 +7,10 @@ use crate::ProjectTemplate;
 /// Version requirement written into generated `Cargo.toml` files.
 ///
 /// Derived from the CLI's own package version, which is the workspace version,
-/// so a `krab` release always scaffolds against the matching `krab_core`.
-const FRAMEWORK_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// so a `krab` release always scaffolds against the matching `krab_core`. This
+/// was previously a hard-coded `"0.1.0"` literal that silently fell a version
+/// behind the workspace and produced projects that could not resolve.
+pub(crate) const FRAMEWORK_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How a generated project should depend on the framework crates.
 #[derive(Clone, Debug, PartialEq, Eq)]

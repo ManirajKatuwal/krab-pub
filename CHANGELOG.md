@@ -47,6 +47,19 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
   module-by-module map of `krab_core` with its cross-cutting invariants,
   migrated from the maintainer wiki so the public docs carry them.
 
+- **`krab gen service` output could not compile.** The generated manifest
+  declared `krab_core = { path = "../krab_core" }` — a directory that has not
+  existed since the crates/ reorganisation — and the generated `main.rs` used
+  `#[async_trait]` without the manifest declaring `async-trait`. Both the
+  single-crate and split-topology generators now emit a registry dependency
+  pinned to the CLI's own workspace version (the same resolution `krab new`
+  uses) and declare `async-trait`; the unused `ServiceConfig` import is gone.
+  Tests parse the generated manifests and pin the dependency set, and verify
+  every feature the generator can request exists in `krab_core`. Note the
+  registry dependency resolves once the workspace version is published; for
+  building generated output against a local checkout, use `krab new
+  --path-deps`.
+
 - **Migration checksums survive a Rust toolchain bump.** They were computed
   with std's `DefaultHasher`, whose output is documented as unstable across
   Rust releases — the next toolchain bump would have flagged every previously
