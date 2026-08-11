@@ -47,6 +47,17 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
   module-by-module map of `krab_core` with its cross-cutting invariants,
   migrated from the maintainer wiki so the public docs carry them.
 
+- **Migration checksums survive a Rust toolchain bump.** They were computed
+  with std's `DefaultHasher`, whose output is documented as unstable across
+  Rust releases — the next toolchain bump would have flagged every previously
+  applied migration as drifted. Checksums are now SHA-256 (hex, 64 chars).
+  Rows written in the old format are recognised (same SQL, legacy hash) and
+  rewritten to SHA-256 in place during the next migration run or drift check
+  instead of being reported as drift; a genuine mismatch still fails. The
+  legacy hash is only reproducible on the toolchain that wrote it, so run one
+  migration pass or `krab db drift` before bumping the toolchain to upgrade
+  existing databases. See `docs/reference/database.md`.
+
 - **Every `/internal` request through `apply_common_http_layers` was 403.**
   Axum layers wrap bottom-up, so `service_auth_middleware` — which validates
   the service scope on the `AuthContext` request extension — ran *before*

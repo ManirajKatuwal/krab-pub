@@ -255,6 +255,118 @@ mod tests {
             .expect("governance should pass with rehearsal artifact");
     }
 
+    #[tokio::test]
+    async fn test_legacy_checksum_rows_are_rewritten_not_flagged() {
+        let pool = match get_test_pool().await {
+            Some(p) => p,
+            None => {
+                println!(
+                    "Skipping test_legacy_checksum_rows_are_rewritten_not_flagged: database not available"
+                );
+                return;
+            }
+        };
+        clean_test_db(&pool).await.expect("failed to clean db");
+
+        let migrations = test_users_service_migrations();
+        run_versioned_migrations(&pool, &migrations, MigrationFailurePolicy::Halt)
+            .await
+            .expect("migration run failed");
+
+        // Simulate a row written before the SHA-256 switch: same SQL, legacy
+        // DefaultHasher checksum format.
+        let legacy = crate::db::postgres::legacy_checksum(migrations[0].sql);
+        sqlx::query("UPDATE krab_migrations SET checksum = $1 WHERE version = $2")
+            .bind(&legacy)
+            .bind(migrations[0].version)
+            .execute(&pool)
+            .await
+            .expect("failed to plant legacy checksum");
+
+        // Drift detection must upgrade the row in place, not flag it.
+        let drift = detect_migration_drift(&pool, &migrations)
+            .await
+            .expect("drift detection failed");
+        assert!(
+            drift.checksum_mismatches.is_empty(),
+            "legacy checksum must be upgraded, not reported as drift: {:?}",
+            drift.checksum_mismatches
+        );
+
+        let stored: String =
+            sqlx::query_scalar("SELECT checksum FROM krab_migrations WHERE version = $1")
+                .bind(migrations[0].version)
+                .fetch_one(&pool)
+                .await
+                .expect("failed to read back checksum");
+        assert_eq!(
+            stored,
+            crate::db::postgres::checksum(migrations[0].sql),
+            "row must be rewritten to the SHA-256 checksum"
+        );
+
+        // A re-run of the migrations must also accept-and-rewrite.
+        sqlx::query("UPDATE krab_migrations SET checksum = $1 WHERE version = $2")
+            .bind(&legacy)
+            .bind(migrations[0].version)
+            .execute(&pool)
+            .await
+            .expect("failed to re-plant legacy checksum");
+
+        let report = run_versioned_migrations(&pool, &migrations, MigrationFailurePolicy::Halt)
+            .await
+            .expect("re-run over a legacy checksum row must not fail");
+        assert!(report.skipped_versions.contains(&migrations[0].version));
+
+        let stored: String =
+            sqlx::query_scalar("SELECT checksum FROM krab_migrations WHERE version = $1")
+                .bind(migrations[0].version)
+                .fetch_one(&pool)
+                .await
+                .expect("failed to read back checksum");
+        assert_eq!(stored, crate::db::postgres::checksum(migrations[0].sql));
+    }
+
+    #[tokio::test]
+    async fn test_true_checksum_mismatch_is_still_flagged() {
+        let pool = match get_test_pool().await {
+            Some(p) => p,
+            None => {
+                println!(
+                    "Skipping test_true_checksum_mismatch_is_still_flagged: database not available"
+                );
+                return;
+            }
+        };
+        clean_test_db(&pool).await.expect("failed to clean db");
+
+        let migrations = test_users_service_migrations();
+        run_versioned_migrations(&pool, &migrations, MigrationFailurePolicy::Halt)
+            .await
+            .expect("migration run failed");
+
+        // Neither the SHA-256 nor the legacy checksum of this SQL: real drift.
+        sqlx::query(
+            "UPDATE krab_migrations SET checksum = 'not-any-known-format' WHERE version = $1",
+        )
+        .bind(migrations[0].version)
+        .execute(&pool)
+        .await
+        .expect("failed to plant drifted checksum");
+
+        let drift = detect_migration_drift(&pool, &migrations)
+            .await
+            .expect("drift detection failed");
+        assert!(drift.checksum_mismatches.contains(&migrations[0].version));
+
+        let rerun =
+            run_versioned_migrations(&pool, &migrations, MigrationFailurePolicy::Halt).await;
+        assert!(
+            rerun.is_err(),
+            "a genuine checksum mismatch must still fail the migration run"
+        );
+    }
+
     #[test]
     fn test_enforce_drift_policy() {
         use crate::db::{enforce_drift_policy, MigrationDriftReport};

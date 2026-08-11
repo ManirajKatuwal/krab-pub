@@ -109,7 +109,7 @@ Migration {
 
 Key guarantees:
 
-- **Checksum integrity**: Every migration's SQL is checksummed at apply time. Re-applying a migration with modified SQL fails with a checksum mismatch error.
+- **Checksum integrity**: Every migration's SQL is checksummed (SHA-256, hex) at apply time. Re-applying a migration with modified SQL fails with a checksum mismatch error. Rows written by versions before the SHA-256 switch (which used std's `DefaultHasher`) are recognised and rewritten in place on the next migration run or drift check, provided that upgrade pass happens **before** a Rust toolchain bump — `DefaultHasher` output is not stable across releases, which is why the format changed.
 - **Idempotent**: Already-applied migrations are skipped.
 - **Destructive guard**: Migrations marked `destructive: true` must provide `rollback_sql` or the engine refuses to proceed.
 - **Failure policy**: Configurable via `DB_MIGRATION_FAILURE_POLICY` (`halt` or `continue_non_critical`).

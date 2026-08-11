@@ -471,10 +471,72 @@ pub async fn run_migrations(pool: &DbPool) -> Result<()> {
     Ok(())
 }
 
-fn checksum(input: &str) -> String {
+/// SHA-256 checksum of a migration's SQL, hex-encoded (64 characters).
+///
+/// Checksums are persisted in `krab_migrations` and compared across process
+/// and toolchain boundaries, so they must be computed by a stable, specified
+/// hash. They used to come from std's `DefaultHasher`, whose output is
+/// documented as unstable across Rust releases — a toolchain bump would have
+/// flagged every previously applied migration as drifted.
+pub(crate) fn checksum(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(input.as_bytes());
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// The pre-0.2.0 checksum format: std's `DefaultHasher`, 16 hex characters.
+///
+/// Only used to recognise rows written by earlier versions so they can be
+/// upgraded in place. This value is reproducible only while the running
+/// toolchain's `DefaultHasher` matches the one that wrote the row — which is
+/// exactly the upgrade window: run any 0.2.0 migration pass (or drift check)
+/// before bumping the Rust toolchain and every legacy row is rewritten to
+/// SHA-256; afterwards the legacy hash is never consulted for that row again.
+pub(crate) fn legacy_checksum(input: &str) -> String {
     let mut hasher = DefaultHasher::new();
     input.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChecksumStatus {
+    /// Stored value matches the current SHA-256 checksum.
+    Current,
+    /// Stored value matches the legacy `DefaultHasher` checksum of the same
+    /// SQL — the row predates the SHA-256 switch and should be rewritten.
+    Legacy,
+    /// Stored value matches neither: real drift.
+    Mismatch,
+}
+
+pub(crate) fn classify_checksum(stored: &str, sql: &str) -> ChecksumStatus {
+    if stored == checksum(sql) {
+        ChecksumStatus::Current
+    } else if stored == legacy_checksum(sql) {
+        ChecksumStatus::Legacy
+    } else {
+        ChecksumStatus::Mismatch
+    }
+}
+
+/// Rewrite a legacy-format checksum row to the current SHA-256 value.
+async fn upgrade_legacy_checksum_row(pool: &DbPool, version: i64, sql: &str) -> Result<()> {
+    sqlx::query("UPDATE krab_migrations SET checksum = $1 WHERE version = $2")
+        .bind(checksum(sql))
+        .bind(version)
+        .execute(pool)
+        .await?;
+    warn!(
+        version,
+        "migration_checksum_upgraded_from_legacy_default_hasher_to_sha256"
+    );
+    Ok(())
 }
 
 pub async fn enforce_promotion_policy(pool: &DbPool, cfg: &PromotionConfig) -> Result<()> {
@@ -546,31 +608,35 @@ pub async fn detect_migration_drift(
     .fetch_all(pool)
     .await?;
 
-    let expected: std::collections::BTreeMap<i64, String> = migrations
-        .iter()
-        .map(|m| (m.version, checksum(m.sql)))
-        .collect();
+    let expected_sql: std::collections::BTreeMap<i64, &str> =
+        migrations.iter().map(|m| (m.version, m.sql)).collect();
     let applied: std::collections::BTreeMap<i64, String> = rows
         .iter()
         .map(|m| (m.version, m.checksum.clone()))
         .collect();
 
-    for version in expected.keys() {
+    for version in expected_sql.keys() {
         if !applied.contains_key(version) {
             report.missing_versions.push(*version);
         }
     }
 
     for version in applied.keys() {
-        if !expected.contains_key(version) {
+        if !expected_sql.contains_key(version) {
             report.unexpected_versions.push(*version);
         }
     }
 
-    for (version, expected_checksum) in &expected {
+    for (version, sql) in &expected_sql {
         if let Some(applied_checksum) = applied.get(version) {
-            if applied_checksum != expected_checksum {
-                report.checksum_mismatches.push(*version);
+            match classify_checksum(applied_checksum, sql) {
+                ChecksumStatus::Current => {}
+                ChecksumStatus::Legacy => {
+                    // Row written before the SHA-256 switch and the SQL is
+                    // unchanged: upgrade in place instead of flagging drift.
+                    upgrade_legacy_checksum_row(pool, *version, sql).await?;
+                }
+                ChecksumStatus::Mismatch => report.checksum_mismatches.push(*version),
             }
         }
     }
@@ -703,13 +769,21 @@ pub async fn run_versioned_migrations(
         .await?;
 
         if let Some(record) = existing {
-            if record.checksum != expected_checksum {
-                anyhow::bail!(
-                    "migration checksum mismatch for version {}: expected {}, found {}",
-                    migration.version,
-                    expected_checksum,
-                    record.checksum
-                );
+            match classify_checksum(&record.checksum, migration.sql) {
+                ChecksumStatus::Current => {}
+                ChecksumStatus::Legacy => {
+                    // Same SQL, pre-SHA-256 checksum format: rewrite the row
+                    // rather than failing the run.
+                    upgrade_legacy_checksum_row(pool, migration.version, migration.sql).await?;
+                }
+                ChecksumStatus::Mismatch => {
+                    anyhow::bail!(
+                        "migration checksum mismatch for version {}: expected {}, found {}",
+                        migration.version,
+                        expected_checksum,
+                        record.checksum
+                    );
+                }
             }
             report.skipped_versions.push(migration.version);
             continue;
@@ -761,6 +835,47 @@ pub async fn run_versioned_migrations(
     }
 
     Ok(report)
+}
+
+#[cfg(test)]
+mod checksum_tests {
+    use super::{checksum, classify_checksum, legacy_checksum, ChecksumStatus};
+
+    #[test]
+    fn checksum_is_stable_sha256_hex() {
+        // Known SHA-256 digest: independently verifiable, and pins the
+        // implementation to a specified hash rather than std's unstable
+        // DefaultHasher.
+        assert_eq!(
+            checksum("SELECT 1"),
+            "e004ebd5b5532a4b85984a62f8ad48a81aa3460c1ca07701f386135d72cdecf5"
+        );
+        assert_eq!(checksum("SELECT 1").len(), 64);
+        assert_ne!(checksum("SELECT 1"), checksum("SELECT 2"));
+    }
+
+    #[test]
+    fn classify_checksum_distinguishes_current_legacy_and_drift() {
+        let sql = "CREATE TABLE t (id BIGINT PRIMARY KEY)";
+
+        assert_eq!(
+            classify_checksum(&checksum(sql), sql),
+            ChecksumStatus::Current
+        );
+        assert_eq!(
+            classify_checksum(&legacy_checksum(sql), sql),
+            ChecksumStatus::Legacy
+        );
+        assert_eq!(
+            classify_checksum("0123456789abcdef", sql),
+            ChecksumStatus::Mismatch
+        );
+        // A legacy checksum of DIFFERENT sql is drift, not an upgrade case.
+        assert_eq!(
+            classify_checksum(&legacy_checksum("SELECT other"), sql),
+            ChecksumStatus::Mismatch
+        );
+    }
 }
 
 #[cfg(test)]
