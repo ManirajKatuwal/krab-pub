@@ -373,7 +373,7 @@ fn an_attribute_difference_alone_does_not_replace_the_node() {
 }
 
 // ---------------------------------------------------------------------------
-// Regressions from the 2026-08-11 review, hydration path.
+// Regression tests, hydration path.
 // ---------------------------------------------------------------------------
 
 use krab_core::signal::{batch, create_signal, ReadSignal, WriteSignal};

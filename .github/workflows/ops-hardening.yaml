@@ -38,8 +38,8 @@ jobs:
           components: rustfmt, clippy
 
       # Cheap and fails fast: keeps every crate under crates/framework,
-      # crates/tooling, or services. See
-      # internal/plans/09_workspace_structure_standard.md §6 Phase C.
+      # crates/tooling, or services, and keeps inter-crate version pins in
+      # step with the workspace version.
       - name: Workspace layout check
         run: python3 scripts/check_workspace_layout.py
 

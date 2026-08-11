@@ -12,14 +12,12 @@ Also checks that each `krab_*` entry in `[workspace.dependencies]` carries a
 duplicated by necessity and drifts silently — a stale pin only surfaces at
 `cargo publish`, which is the worst possible moment to find out.
 
-Implements the CI guard specified in
-`internal/plans/09_workspace_structure_standard.md` §6 Phase C, and the
-publication preconditions in `RELEASE_POLICY.md`.
+The rules above are the enforced layout standard; the version-pin check
+implements the publication preconditions in `RELEASE_POLICY.md`.
 """
 
 import pathlib
 import re
-import sys
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -199,10 +197,6 @@ def main() -> int:
     if failures:
         for item in failures:
             print(f"ERROR: {item}")
-        print(
-            "\nLayout standard: internal/plans/09_workspace_structure_standard.md",
-            file=sys.stderr,
-        )
         return 1
 
     print(f"OK: workspace layout checks passed ({len(members)} members)")

@@ -1,6 +1,6 @@
 # krab_core
 
-Shared runtime for the [Krab](https://github.com/krab-framework/krab) full-stack
+Shared runtime for the [Krab](https://github.com/ManirajKatuwal/krab) full-stack
 Rust web framework.
 
 `krab_core` holds the pieces every Krab service depends on: configuration and
@@ -32,7 +32,7 @@ Deprecated aliases, removable no earlier than `0.3.0`: `grpc` →
 > — no transport, no codegen, no `.proto` handling, no client. `tonic` and
 > `prost` appear nowhere in this workspace. Bring your own transport if you need
 > one. The feature was called `grpc` until
-> [ADR 0007](https://github.com/krab-framework/krab/blob/main/docs/adr/0007-grpc-feature-disposition.md),
+> [ADR 0007](https://github.com/ManirajKatuwal/krab/blob/main/docs/adr/0007-grpc-feature-disposition.md),
 > which is when the name stopped implying a capability the crate does not have.
 
 ## Usage
@@ -44,15 +44,15 @@ krab_core = { version = "0.1", features = ["rest", "db"] }
 
 ## Documentation
 
-- [Architecture deep-dive](https://github.com/krab-framework/krab/blob/main/docs/architecture/design.md)
-- [Environment reference](https://github.com/krab-framework/krab/blob/main/docs/reference/environment.md)
-- [Database and migration governance](https://github.com/krab-framework/krab/blob/main/docs/reference/database.md)
+- [Architecture deep-dive](https://github.com/ManirajKatuwal/krab/blob/main/docs/architecture/design.md)
+- [Environment reference](https://github.com/ManirajKatuwal/krab/blob/main/docs/reference/environment.md)
+- [Database and migration governance](https://github.com/ManirajKatuwal/krab/blob/main/docs/reference/database.md)
 
 ## Note on `Node`
 
 `krab_core::Node` is `!Send` — it uses `Rc` via the `Dynamic` variant and holds
 `EventListener`. Do not hold a `Node` across an `.await`. See
-[signal safety](https://github.com/krab-framework/krab/blob/main/docs/architecture/signal_safety.md).
+[signal safety](https://github.com/ManirajKatuwal/krab/blob/main/docs/architecture/signal_safety.md).
 
 ## License
 

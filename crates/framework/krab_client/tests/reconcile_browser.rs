@@ -507,8 +507,8 @@ fn a_hydrated_dynamic_list_updates_without_duplicating() {
 }
 
 // ---------------------------------------------------------------------------
-// Regressions from the 2026-08-11 review. Each test is named for the confirmed
-// bug it pins; all of them fail against the pre-fix reconciler.
+// Regression tests. Each test is named for the confirmed bug it pins; all of
+// them fail against the pre-fix reconciler.
 // ---------------------------------------------------------------------------
 
 /// The fragment-husk bug: a Dynamic nested inside another Dynamic was tracked

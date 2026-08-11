@@ -1,10 +1,6 @@
 # Benchmarks and Load-Test Artifacts
 
-This directory is the canonical repository for non-functional multi-service load-test evidence and regression controls.
-
-> Formerly `plans/load_test_artifacts/`. It was moved to the repository root
-> because `thresholds.json` and `benchmark_config.json` are **CI inputs**, not
-> planning documents, and must stay tracked.
+This directory is the canonical repository for non-functional multi-service load-test evidence and regression controls. `thresholds.json` and `benchmark_config.json` are **CI inputs** and must stay tracked.
 
 ## Tracked vs generated
 
@@ -30,11 +26,11 @@ them as workflow artifacts rather than committing them.
 
 - `thresholds.json` — source of truth for per-service percentile limits, horizontal-scaling gates, and auto-fail rules.
 - `trend_history.csv` — append-only time series used for regression detection.
-- `latest_summary.md` — most recent run summary with service-by-service p95/p99 outcomes and gate decision.
-- `latest_summary_single.md` — single-replica (`N=1`) service results.
-- `latest_summary_scaled.md` — scaled (`N=3`) service results.
-- `shared_state_validation.json` — distributed/shared-state abuse-control validation output (expects block behavior under scaled topology).
-- `release_evidence_bundle.json` / `release_evidence_bundle.md` — consolidated release-evidence presence report aligned to release policy artifacts.
+- `latest_summary.md` — most recent run summary with service-by-service p95/p99 outcomes and gate decision. Generated at runtime; absent until a run happens.
+- `latest_summary_single.md` — single-replica (`N=1`) service results. Generated at runtime; absent until a run happens.
+- `latest_summary_scaled.md` — scaled (`N=3`) service results. Generated at runtime; absent until a run happens.
+- `shared_state_validation.json` — distributed/shared-state abuse-control validation output (expects block behavior under scaled topology). Generated at runtime; absent until a run happens.
+- `release_evidence_bundle.json` / `release_evidence_bundle.md` — consolidated release-evidence presence report aligned to release policy artifacts. Generated at runtime; absent until a run happens.
 
 ## CI/Workflow Contract
 

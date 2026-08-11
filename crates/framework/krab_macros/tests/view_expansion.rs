@@ -180,9 +180,9 @@ fn hyphenated_names_accept_expression_values() {
     assert_eq!(html, "<div data-krab-boundary-id=\"island-7\"></div>");
 }
 
-/// The concrete gap from the audit: `#[island]` constructs the hydration
-/// wrapper by building `krab_core::Attribute` values by hand because `view!`
-/// could not express any of these names. It can now.
+/// `#[island]` constructs the hydration wrapper by building
+/// `krab_core::Attribute` values by hand because `view!` could not express any
+/// of these names. It can now.
 #[test]
 fn view_can_emit_a_complete_island_wrapper() {
     let props = r#"{"count":0}"#;

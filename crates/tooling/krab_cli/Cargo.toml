@@ -2,10 +2,13 @@
 name = "krab_cli"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
+documentation = "https://docs.rs/krab_cli"
 description = "The `krab` CLI: dev workflow, generators, governance, and release operations for the Krab framework"
 keywords = ["krab", "cli", "web", "framework", "codegen"]
 categories = ["command-line-utilities", "development-tools", "web-programming"]

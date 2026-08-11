@@ -554,9 +554,8 @@ fn render_home_page_localized(locale: &str) -> String {
                             const evtSource = new EventSource('/api/hmr');
                             evtSource.onmessage = (e) => {
                                 console.log('HMR signal received:', e.data);
-                                // Simple state-preserving HMR: we'll fetch the current page and diff the DOM,
-                                // but for now a simple reload is best since we don't have a full VDOM diffing engine.
-                                // In a real framework, we'd update loaded modules and re-render the components.
+                                // Full page reload is the current HMR strategy. Module-level hot
+                                // swapping would require DOM diffing that the runtime does not yet do.
                                 window.location.reload();
                             };
                         }
@@ -738,9 +737,9 @@ fn render_home_page_localized(locale: &str) -> String {
                             "The full-stack Rust framework designed for performance, type safety, and developer joy."
                         </p>
                         <div class="links">
-                            <a href="https://github.com/bishesh/krab" class="btn btn-primary">"Get Started"</a>
+                            <a href="https://github.com/ManirajKatuwal/krab" class="btn btn-primary">"Get Started"</a>
                             <a href="/docs" class="btn btn-secondary">"Documentation"</a>
-                            <a href="https://github.com/bishesh/krab" class="btn btn-secondary">"GitHub"</a>
+                            <a href="https://github.com/ManirajKatuwal/krab" class="btn btn-secondary">"GitHub"</a>
                         </div>
                     </header>
 

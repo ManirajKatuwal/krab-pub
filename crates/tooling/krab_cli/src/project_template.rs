@@ -7,9 +7,7 @@ use crate::ProjectTemplate;
 /// Version requirement written into generated `Cargo.toml` files.
 ///
 /// Derived from the CLI's own package version, which is the workspace version,
-/// so a `krab` release always scaffolds against the matching `krab_core`. This
-/// was previously a hard-coded `"0.1.0"` literal that silently fell a version
-/// behind the workspace and produced projects that could not resolve.
+/// so a `krab` release always scaffolds against the matching `krab_core`.
 const FRAMEWORK_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How a generated project should depend on the framework crates.
@@ -984,8 +982,8 @@ mod tests {
         Ok(())
     }
 
-    /// The template pinned a hard-coded `"0.1.0"` while the workspace moved to
-    /// `0.1.1`, so generated projects requested a version that did not exist.
+    /// The template version must track the workspace version; a stale pin
+    /// would make generated projects request a version that does not exist.
     #[test]
     fn every_template_pins_the_current_framework_version() -> Result<()> {
         for template in ALL_TEMPLATES {

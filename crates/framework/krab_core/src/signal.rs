@@ -1568,10 +1568,9 @@ mod batch_unwind_tests {
     }
 }
 
-/// Unwind recovery and subscriber-growth regressions found by the 2026-08-11
-/// review of the reactive-core branch. Each test is named for the failure it
-/// prevents; all of them passed *before* their fix only by accident of not
-/// exercising the panic or growth path.
+/// Unwind recovery and subscriber-growth regression tests. Each test is named
+/// for the failure it prevents; all of them passed *before* their fix only by
+/// accident of not exercising the panic or growth path.
 #[cfg(test)]
 mod unwind_and_growth_tests {
     use super::*;

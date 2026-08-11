@@ -2,10 +2,13 @@
 name = "krab_orchestrator"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
+documentation = "https://docs.rs/krab_orchestrator"
 description = "Multi-process service runner for Krab workspaces, driven by krab.toml"
 keywords = ["krab", "orchestrator", "supervisor", "microservices"]
 categories = ["command-line-utilities", "development-tools", "web-programming"]

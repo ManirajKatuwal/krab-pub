@@ -2,7 +2,9 @@
 name = "krab_client"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
@@ -10,6 +12,10 @@ documentation = "https://docs.rs/krab_client"
 description = "WASM island hydration runtime for the Krab framework"
 keywords = ["krab", "wasm", "hydration", "islands", "frontend"]
 categories = ["wasm", "web-programming"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]

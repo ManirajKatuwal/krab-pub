@@ -2,7 +2,9 @@
 name = "krab_core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
@@ -10,6 +12,12 @@ documentation = "https://docs.rs/krab_core"
 description = "Shared runtime for the Krab framework: config, HTTP, database, telemetry, resilience, signals, and protocol governance"
 keywords = ["krab", "web", "ssr", "runtime", "framework"]
 categories = ["web-programming", "web-programming::http-server", "development-tools"]
+
+# The crate has no default features, so a plain docs.rs build would publish a
+# nearly empty API page. Build documentation with every feature enabled.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }

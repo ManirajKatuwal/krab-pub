@@ -1,6 +1,6 @@
 # krab_client
 
-WASM island hydration runtime for the [Krab](https://github.com/krab-framework/krab)
+WASM island hydration runtime for the [Krab](https://github.com/ManirajKatuwal/krab)
 full-stack Rust web framework.
 
 `krab_client` runs in the browser. It locates the hydration markers emitted by
@@ -22,9 +22,9 @@ krab_client = "0.1"
 
 ## Documentation
 
-- [Hydration](https://github.com/krab-framework/krab/blob/main/docs/architecture/hydration.md)
-- [ADR 0001 — hydration markers](https://github.com/krab-framework/krab/blob/main/docs/adr/0001-hydration-markers.md)
-- [Signal safety](https://github.com/krab-framework/krab/blob/main/docs/architecture/signal_safety.md)
+- [Hydration](https://github.com/ManirajKatuwal/krab/blob/main/docs/architecture/hydration.md)
+- [ADR 0001 — hydration markers](https://github.com/ManirajKatuwal/krab/blob/main/docs/adr/0001-hydration-markers.md)
+- [Signal safety](https://github.com/ManirajKatuwal/krab/blob/main/docs/architecture/signal_safety.md)
 
 ## License
 

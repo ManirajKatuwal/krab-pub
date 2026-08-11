@@ -87,8 +87,7 @@ pub use krab_core::resource::{
 /// silent no-op — would be a worse answer than not offering one.
 ///
 /// For richer needs (pending state, error handling, cancellation) this is the
-/// primitive an `Action` will be built on; see
-/// `internal/plans/reactive_core.md` Phase 5.
+/// primitive that `Action`-style async state is built on.
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 pub fn spawn<F>(future: F)
 where

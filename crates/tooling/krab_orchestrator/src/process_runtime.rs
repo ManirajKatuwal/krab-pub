@@ -358,7 +358,7 @@ pub(super) async fn spawn_service_and_wait_ready(
 
 /// Probe a service health endpoint until it becomes ready or retries are exhausted.
 ///
-/// A small circuit breaker is used to prevent hammering obviously unavailable services during
+/// A small circuit breaker is used to prevent hammering unavailable services during
 /// bootstrap or automatic restart flows.
 pub(super) async fn wait_for_service_health(name: &str, service: &ServiceDefinition) -> Result<()> {
     let Some(url) = service.effective_healthcheck_url() else {

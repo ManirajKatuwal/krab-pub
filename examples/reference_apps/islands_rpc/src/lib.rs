@@ -268,8 +268,8 @@ mod tests {
         );
     }
 
-    /// The point of Phase 4: `view!` emitting hyphenated attribute names. If
-    /// this regresses, the page silently loses its test hooks and ARIA labels.
+    /// Covers `view!` emitting hyphenated attribute names. If this regresses,
+    /// the page silently loses its test hooks and ARIA labels.
     #[test]
     fn view_macro_emits_hyphenated_and_aria_attributes() {
         let html = html();
