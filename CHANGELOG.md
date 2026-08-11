@@ -16,7 +16,53 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ## [Unreleased]
 
-Nothing yet — `0.2.0` is the current release.
+### Security
+
+- Server-function errors converted from `anyhow::Error` no longer serialize the
+  underlying error chain (connection strings, SQL fragments, filesystem paths)
+  into the client-visible 500 envelope. The full chain now goes to the server
+  log (`server_fn_internal_error`); the wire message is a generic
+  `internal server error`. Callers that want a client-visible message construct
+  one explicitly with `ServerFnError::new`.
+- Malformed `KRAB_AUTH_ROUTE_POLICIES_JSON` now fails closed. Previously a JSON
+  typo silently parsed to an empty policy set and every configured route
+  restriction vanished; the enforcement path now rejects requests with 500 and
+  logs `auth_route_policies_json_malformed_failing_closed`. New
+  `try_load_route_policies()` exposes the parse result.
+- Malformed `KRAB_PROTOCOL_RESTRICTED_OPS_JSON` / `KRAB_PROTOCOL_TENANT_OVERRIDES_JSON`
+  no longer silently drop every protocol restriction: `ProtocolConfig::validate()`
+  reports bad JSON and unknown protocol names as startup errors, and
+  `from_env` logs the failure instead of ignoring it.
+- `DbConfig`'s `Debug` output redacts the userinfo section of the database URL,
+  so a `{:?}` in error context can no longer print the `DATABASE_URL` password.
+
+### Fixed
+
+- `run_versioned_migrations` now serializes concurrent migrators with a
+  session-level Postgres advisory lock. Two replicas booting through a rolling
+  deploy could both observe a version as unapplied and both execute its DDL —
+  one crashed on the `krab_migrations` primary key.
+- `enforce_migration_governance` creates the rollback-rehearsal ledger before
+  querying it, so a fresh release-environment database reports the governance
+  verdict ("missing successful rollback rehearsal") instead of a raw
+  `relation does not exist` error.
+- `MemoryStore` reaps expired entries during writes (every 256 writes).
+  Epoch-suffixed rate-limit and auth-failure keys were written once and never
+  read again, so they accumulated for the life of the process — one per client
+  IP per window. `incr` also logs when it resets a non-numeric value instead
+  of silently clobbering it.
+- The `krab_inflight_requests` gauge decrements via a drop guard, so a client
+  disconnecting mid-request no longer leaks an increment and drifts the gauge
+  upward permanently.
+- `serve_with_graceful_shutdown` also listens for SIGTERM on Unix. Kubernetes
+  and Docker stop containers with SIGTERM; previously only Ctrl+C (SIGINT)
+  triggered a drain, so stopped pods were SIGKILLed at the grace deadline.
+- `init_tracing`/`init_tracing_with_config` use `try_init` and log instead of
+  panicking when a global tracing subscriber is already installed.
+- Native `call_server_fn` reuses one shared `reqwest` client with a request
+  timeout (default 30 s, `KRAB_SERVER_FN_TIMEOUT_MS`) instead of building an
+  unpooled client with no timeout per call, and non-JSON error bodies decoded
+  into `ServerFnError` are truncated to 2 KiB.
 
 ---
 

@@ -70,9 +70,19 @@ where
     runtime.protocol_request_totals[protocol_index].fetch_add(1, Ordering::Relaxed);
     runtime.inflight_requests.fetch_add(1, Ordering::Relaxed);
 
-    let response = next.run(req).await;
+    // Decrement in a drop guard, not after the await: when the client
+    // disconnects mid-request hyper drops this future, and a plain
+    // `fetch_sub` after `next.run` would never execute — the gauge (exported
+    // to Prometheus) would drift upward permanently.
+    struct InflightGuard(std::sync::Arc<std::sync::atomic::AtomicU64>);
+    impl Drop for InflightGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    let _inflight = InflightGuard(runtime.inflight_requests.clone());
 
-    runtime.inflight_requests.fetch_sub(1, Ordering::Relaxed);
+    let response = next.run(req).await;
 
     let code = response.status().as_u16();
     if let Some(class_index) = response_status_class_index(code) {

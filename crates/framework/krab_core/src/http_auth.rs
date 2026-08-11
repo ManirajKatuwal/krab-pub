@@ -252,11 +252,22 @@ pub fn tenant_from_path(path: &str) -> Option<&str> {
     None
 }
 
+/// Parse `KRAB_AUTH_ROUTE_POLICIES_JSON`, distinguishing "not configured"
+/// (`Ok(empty)`) from "configured but malformed" (`Err`). The enforcement path
+/// treats the latter as a hard failure: a typo in the policy JSON must not
+/// silently strip every route policy.
+pub fn try_load_route_policies() -> Result<Vec<RoutePolicy>, serde_json::Error> {
+    match std::env::var("KRAB_AUTH_ROUTE_POLICIES_JSON") {
+        Ok(raw) => serde_json::from_str::<Vec<RoutePolicy>>(&raw),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
 pub fn load_route_policies() -> Vec<RoutePolicy> {
-    std::env::var("KRAB_AUTH_ROUTE_POLICIES_JSON")
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Vec<RoutePolicy>>(&raw).ok())
-        .unwrap_or_default()
+    try_load_route_policies().unwrap_or_else(|error| {
+        tracing::error!(error = %error, "auth_route_policies_json_malformed");
+        Vec::new()
+    })
 }
 
 pub fn validate_provider_claims(
@@ -400,7 +411,17 @@ pub fn enforce_claim_policy(
         }
     }
 
-    for policy in load_route_policies()
+    // Fail closed on malformed policy JSON: returning an empty policy set here
+    // would silently drop every configured restriction, while the sibling
+    // KRAB_AUTH_REQUIRED_CLAIMS_JSON path below already rejects on bad JSON.
+    let route_policies = try_load_route_policies().map_err(|error| {
+        tracing::error!(
+            error = %error,
+            "auth_route_policies_json_malformed_failing_closed"
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    for policy in route_policies
         .into_iter()
         .filter(|p| path.starts_with(&p.prefix))
     {

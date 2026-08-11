@@ -36,6 +36,7 @@ pub trait DistributedStore: Send + Sync {
 #[derive(Clone, Default)]
 pub struct MemoryStore {
     inner: Arc<RwLock<HashMap<String, MemoryEntry>>>,
+    writes_since_sweep: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -44,9 +45,30 @@ struct MemoryEntry {
     expires_at: Option<Instant>,
 }
 
+/// Writes between full sweeps of expired entries. Amortizes the O(n) scan so
+/// steady-state writes stay O(1).
+const SWEEP_EVERY_N_WRITES: usize = 256;
+
 impl MemoryStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Reap every expired entry once per [`SWEEP_EVERY_N_WRITES`] writes.
+    ///
+    /// Point-`get` only reaps the key it touches, and epoch-suffixed keys
+    /// (`rate:ip:<ip>:<epoch>`) are never touched again once their window
+    /// passes — without this sweep they accumulate for the life of the
+    /// process, one per client IP per window.
+    fn sweep_if_due(&self, entries: &mut HashMap<String, MemoryEntry>) {
+        use std::sync::atomic::Ordering;
+
+        if self.writes_since_sweep.fetch_add(1, Ordering::Relaxed) + 1 < SWEEP_EVERY_N_WRITES {
+            return;
+        }
+        self.writes_since_sweep.store(0, Ordering::Relaxed);
+        let now = Instant::now();
+        entries.retain(|_, entry| !entry.expires_at.map(|ts| now >= ts).unwrap_or(false));
     }
 }
 
@@ -87,6 +109,7 @@ impl DistributedStore for MemoryStore {
                 expires_at,
             },
         );
+        self.sweep_if_due(&mut guard);
         Ok(())
     }
 
@@ -99,7 +122,16 @@ impl DistributedStore for MemoryStore {
                 guard.remove(key);
                 0
             }
-            Some(entry) => entry.value.parse::<u64>().unwrap_or(0),
+            Some(entry) => match entry.value.parse::<u64>() {
+                Ok(value) => value,
+                Err(_) => {
+                    // A non-numeric value here is a key collision with a
+                    // non-counter entry; resetting silently would corrupt
+                    // whichever caller loses.
+                    tracing::warn!(key, "memory_store_incr_reset_non_numeric_value");
+                    0
+                }
+            },
             None => 0,
         };
 
@@ -112,6 +144,7 @@ impl DistributedStore for MemoryStore {
                 expires_at: ttl,
             },
         );
+        self.sweep_if_due(&mut guard);
         Ok(next)
     }
 
@@ -290,4 +323,41 @@ fn escape_scan_glob(input: &str) -> String {
         out.push(ch);
     }
     out
+}
+
+#[cfg(test)]
+mod memory_store_tests {
+    use super::*;
+
+    /// Epoch-suffixed keys (rate limiting) are written once and never touched
+    /// again; the periodic write sweep is the only thing that reclaims them.
+    #[tokio::test]
+    async fn write_sweep_reaps_expired_untouched_keys() {
+        let store = MemoryStore::new();
+        for i in 0..SWEEP_EVERY_N_WRITES {
+            store
+                .set(
+                    &format!("rate:ip:10.0.0.1:{i}"),
+                    "1",
+                    Duration::from_millis(1),
+                )
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Enough writes to guarantee a sweep fires after the entries expired.
+        for _ in 0..SWEEP_EVERY_N_WRITES {
+            store
+                .set("rate:ip:10.0.0.2:current", "1", Duration::from_secs(60))
+                .await
+                .unwrap();
+        }
+
+        let remaining = store.inner.read().await.len();
+        assert_eq!(
+            remaining, 1,
+            "expired epoch keys must be swept; {remaining} entries remain"
+        );
+    }
 }

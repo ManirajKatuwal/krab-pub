@@ -57,7 +57,7 @@ pub async fn serve_with_graceful_shutdown(app: axum::Router, config: &ServiceCon
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        wait_for_shutdown_signal().await;
         tracing::info!(service = %service_name_for_signal, "service_shutdown_signal_received");
     })
     .await
@@ -65,4 +65,35 @@ pub async fn serve_with_graceful_shutdown(app: axum::Router, config: &ServiceCon
 
     tracing::info!(service = %config.name, "service_shutdown_complete");
     Ok(())
+}
+
+/// Resolve on SIGINT (Ctrl+C) — and, on Unix, also SIGTERM.
+///
+/// Kubernetes and Docker stop containers with SIGTERM; listening only for
+/// Ctrl+C meant the process never drained in-flight requests and was
+/// SIGKILLed at the grace-period deadline.
+#[cfg(feature = "rest")]
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    // Registration failing is exceptional; fall back to
+                    // Ctrl+C alone rather than refusing to serve.
+                    tracing::warn!(error = %error, "sigterm_handler_registration_failed");
+                    let _ = tokio::signal::ctrl_c().await;
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

@@ -172,6 +172,7 @@ which are reachable and where they resolve. See
 | `KRAB_PROTOCOL_GATEWAY_BASE_URL` | No | — | Gateway origin when `KRAB_PROTOCOL_EXTERNAL_MODE` is on |
 | `KRAB_RUNTIME_TOPOLOGY` | No | — | Overrides the service-contract topology mode at runtime |
 | `KRAB_RUNTIME_ENDPOINTS_JSON` | No | — | JSON map of service name → endpoint. Overrides `KRAB_AUTH_BASE_URL` and `KRAB_USERS_BASE_URL` |
+| `KRAB_SERVER_FN_TIMEOUT_MS` | No | `30000` | Timeout in milliseconds for native (non-WASM) server-function RPC calls. Read once at first call; `0` or a non-numeric value falls back to the default |
 
 ## Frontend rendering and caching
 

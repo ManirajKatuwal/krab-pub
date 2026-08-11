@@ -525,6 +525,47 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// A typo in `KRAB_AUTH_ROUTE_POLICIES_JSON` used to parse to an empty
+    /// policy set — every configured restriction silently vanished, fail-open.
+    /// A configured-but-unparseable policy set must reject the request.
+    #[tokio::test]
+    #[serial]
+    async fn test_malformed_route_policy_json_fails_closed() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+        std::env::set_var(
+            "KRAB_AUTH_ROUTE_POLICIES_JSON",
+            // Trailing comma makes this invalid JSON. The prefix deliberately
+            // does not match the request path: the parse failure alone must
+            // reject, before any prefix filtering.
+            r#"[{"prefix":"/api/reports","all_scopes":["audit.read"],}]"#,
+        );
+
+        let app = test_app();
+        let claims = json!({
+            "sub": "user",
+            "scope": "audit.read",
+            "exp": 9999999999i64
+        });
+        let token = generate_token(claims);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("x-forwarded-for", "10.10.0.8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     /// `service_auth_middleware` reads the `AuthContext` extension that
     /// `auth_middleware` inserts. The layers used to run in the wrong order
     /// (scope check before auth), so a request with a perfectly valid token

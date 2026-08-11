@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::Row;
+use sqlx::{Connection, Row};
 use sqlx::{Pool, Postgres};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -164,14 +164,11 @@ impl PromotionConfig {
     }
 }
 
-pub async fn record_rollback_rehearsal(
-    pool: &DbPool,
-    service_name: &str,
-    environment: &str,
-    rollback_target: i64,
-    artifact_uri: &str,
-    succeeded: bool,
-) -> Result<()> {
+/// Create the rehearsal ledger if absent. Shared by the recording path and the
+/// governance check so a fresh database yields the governance verdict
+/// ("missing successful rollback rehearsal") rather than a raw
+/// `relation does not exist` error.
+async fn ensure_rehearsal_table(pool: &DbPool) -> Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS krab_migration_rollback_rehearsals (
             id BIGSERIAL PRIMARY KEY,
@@ -185,6 +182,18 @@ pub async fn record_rollback_rehearsal(
     )
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+pub async fn record_rollback_rehearsal(
+    pool: &DbPool,
+    service_name: &str,
+    environment: &str,
+    rollback_target: i64,
+    artifact_uri: &str,
+    succeeded: bool,
+) -> Result<()> {
+    ensure_rehearsal_table(pool).await?;
 
     sqlx::query(
         "INSERT INTO krab_migration_rollback_rehearsals
@@ -246,6 +255,7 @@ pub async fn enforce_migration_governance(
         .any(|e| e.eq_ignore_ascii_case(&cfg.environment));
 
     if is_release && cfg.require_rollback_rehearsal_in_release {
+        ensure_rehearsal_table(pool).await?;
         let has_rehearsal: bool = sqlx::query_scalar(
             "SELECT EXISTS(
                 SELECT 1
@@ -313,7 +323,7 @@ pub fn enforce_drift_policy(report: &MigrationDriftReport, max_unexpected: usize
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DbConfig {
     pub url: String,
     pub max_connections: u32,
@@ -323,6 +333,46 @@ pub struct DbConfig {
     pub idle_timeout: Duration,
     pub connect_retries: u32,
     pub connect_retry_delay: Duration,
+}
+
+/// Manual impl, not derived: `url` is a full `DATABASE_URL` and usually
+/// carries the password, so a `{:?}` in error context or a diagnostic dump
+/// must never print it verbatim.
+impl std::fmt::Debug for DbConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbConfig")
+            .field("url", &redact_db_url(&self.url))
+            .field("max_connections", &self.max_connections)
+            .field("min_connections", &self.min_connections)
+            .field("acquire_timeout", &self.acquire_timeout)
+            .field("max_lifetime", &self.max_lifetime)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("connect_retries", &self.connect_retries)
+            .field("connect_retry_delay", &self.connect_retry_delay)
+            .finish()
+    }
+}
+
+/// Mask the userinfo section of a connection URL (`scheme://user:pass@host`).
+/// Anything between `//` and the last `@` before the host is replaced, so
+/// neither username nor password survives into logs.
+fn redact_db_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("//") else {
+        return url.to_string();
+    };
+    let authority_start = scheme_end + 2;
+    let authority_end = url[authority_start..]
+        .find('/')
+        .map(|i| authority_start + i)
+        .unwrap_or(url.len());
+    match url[authority_start..authority_end].rfind('@') {
+        Some(at) => format!(
+            "{}***@{}",
+            &url[..authority_start],
+            &url[authority_start + at + 1..]
+        ),
+        None => url.to_string(),
+    }
 }
 
 impl Default for DbConfig {
@@ -733,7 +783,50 @@ pub async fn run_preflight_checks(pool: &DbPool) -> Result<()> {
     Ok(())
 }
 
+/// Advisory-lock key serializing migration runs across processes: ASCII
+/// `krab_mig` as an `i64`. Session-level, so a migrator that crashes mid-run
+/// releases it when its connection dies.
+const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x6b72_6162_5f6d_6967;
+
 pub async fn run_versioned_migrations(
+    pool: &DbPool,
+    migrations: &[Migration],
+    failure_policy: MigrationFailurePolicy,
+) -> Result<MigrationReport> {
+    // Two replicas booting through a rolling deploy both reach this function;
+    // without cross-process serialization both observe version N as unapplied
+    // and both execute its DDL — one commits, the other crashes on the
+    // `krab_migrations` primary key. Hold a session-level advisory lock on a
+    // dedicated connection for the whole run so exactly one migrator proceeds
+    // at a time; the loser waits, then skips the now-applied versions.
+    let mut lock_conn = pool
+        .acquire()
+        .await
+        .context("failed to acquire a connection for the migration advisory lock")?;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(MIGRATION_ADVISORY_LOCK_KEY)
+        .execute(&mut *lock_conn)
+        .await
+        .context("failed to take the migration advisory lock")?;
+
+    let result = run_versioned_migrations_locked(pool, migrations, failure_policy).await;
+
+    let unlocked: std::result::Result<bool, sqlx::Error> =
+        sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+            .bind(MIGRATION_ADVISORY_LOCK_KEY)
+            .fetch_one(&mut *lock_conn)
+            .await;
+    if !matches!(unlocked, Ok(true)) {
+        // Advisory locks belong to the session, and pooled sessions are
+        // reused: a connection returned while still holding the lock would
+        // block every future migrator. Close it so Postgres releases the lock.
+        let _ = lock_conn.detach().close().await;
+    }
+
+    result
+}
+
+async fn run_versioned_migrations_locked(
     pool: &DbPool,
     migrations: &[Migration],
     failure_policy: MigrationFailurePolicy,
@@ -835,6 +928,36 @@ pub async fn run_versioned_migrations(
     }
 
     Ok(report)
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::{redact_db_url, DbConfig};
+
+    #[test]
+    fn debug_output_never_contains_the_password() {
+        let cfg = DbConfig {
+            url: "postgres://svc_user:s3cret@db.internal:5432/krab".to_string(),
+            ..DbConfig::default()
+        };
+        let printed = format!("{cfg:?}");
+        assert!(!printed.contains("s3cret"));
+        assert!(!printed.contains("svc_user"));
+        assert!(printed.contains("db.internal:5432/krab"));
+    }
+
+    #[test]
+    fn redaction_handles_urls_without_credentials_or_scheme() {
+        assert_eq!(
+            redact_db_url("postgres://localhost:5432/krab"),
+            "postgres://localhost:5432/krab"
+        );
+        assert_eq!(redact_db_url("not-a-url"), "not-a-url");
+        assert_eq!(
+            redact_db_url("postgres://u:p@ss@host/db"),
+            "postgres://***@host/db"
+        );
+    }
 }
 
 #[cfg(test)]

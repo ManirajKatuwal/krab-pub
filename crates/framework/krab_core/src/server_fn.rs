@@ -217,6 +217,11 @@ where
     }
 }
 
+/// Longest non-JSON error body copied verbatim into a decoded error message.
+/// Anything past this is upstream noise (an HTML error page, a proxy banner),
+/// not signal worth carrying around.
+const MAX_FALLBACK_ERROR_BODY_LEN: usize = 2_048;
+
 /// Decode a server-function error response body into the canonical error type.
 pub fn decode_server_fn_error_body(body: &str, fallback_status_code: u16) -> ServerFnError {
     if let Ok(envelope) = serde_json::from_str::<ServerFnErrorEnvelope>(body) {
@@ -225,7 +230,16 @@ pub fn decode_server_fn_error_body(body: &str, fallback_status_code: u16) -> Ser
     if let Ok(err) = serde_json::from_str::<ServerFnError>(body) {
         return err;
     }
-    ServerFnError::from_status(fallback_status_code, body)
+    let truncated = if body.len() > MAX_FALLBACK_ERROR_BODY_LEN {
+        let mut end = MAX_FALLBACK_ERROR_BODY_LEN;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        &body[..end]
+    } else {
+        body
+    };
+    ServerFnError::from_status(fallback_status_code, truncated)
 }
 
 impl From<serde_json::Error> for ServerFnError {
@@ -235,8 +249,16 @@ impl From<serde_json::Error> for ServerFnError {
 }
 
 impl From<anyhow::Error> for ServerFnError {
+    /// Converts to a generic 500 without carrying the error text.
+    ///
+    /// The chain behind an `anyhow::Error` routinely contains connection
+    /// strings, SQL fragments, or filesystem paths, and this envelope is
+    /// serialized straight to the browser. The full chain goes to the server
+    /// log instead; callers that want a client-visible message construct one
+    /// deliberately via [`ServerFnError::new`].
     fn from(err: anyhow::Error) -> Self {
-        Self::new(err.to_string())
+        tracing::error!(error = ?err, "server_fn_internal_error");
+        Self::new("internal server error")
     }
 }
 
@@ -482,14 +504,39 @@ async fn fetch_csrf_token(window: &web_sys::Window) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// Default timeout for native server-function calls, overridable via
+/// `KRAB_SERVER_FN_TIMEOUT_MS`.
+#[cfg(not(target_arch = "wasm32"))]
+const DEFAULT_SERVER_FN_TIMEOUT_MS: u64 = 30_000;
+
+/// Shared HTTP client for native server-function calls.
+///
+/// One client per process: reqwest has no default timeout, so a hung upstream
+/// would otherwise block the calling task forever, and a per-call client
+/// defeats connection pooling. The timeout is read once, at first use.
+#[cfg(not(target_arch = "wasm32"))]
+fn native_rpc_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        let timeout_ms = std::env::var("KRAB_SERVER_FN_TIMEOUT_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .unwrap_or(DEFAULT_SERVER_FN_TIMEOUT_MS);
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(timeout_ms))
+            .build()
+            .unwrap_or_default()
+    })
+}
+
 /// Native client-side call path for non-WASM targets.
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn call_server_fn<A: Serialize, T: serde::de::DeserializeOwned>(
     url: &str,
     args: &A,
 ) -> Result<T, ServerFnError> {
-    let client = reqwest::Client::new();
-    let response = client
+    let response = native_rpc_client()
         .post(url)
         .json(args)
         .send()
@@ -629,11 +676,20 @@ mod tests {
     }
 
     #[test]
-    fn server_fn_error_from_anyhow() {
-        let anyhow_err = anyhow::anyhow!("something failed");
+    fn server_fn_error_from_anyhow_does_not_leak_internal_detail() {
+        let anyhow_err = anyhow::anyhow!("postgres://user:s3cret@db/prod: connection refused");
         let err: ServerFnError = anyhow_err.into();
         assert_eq!(err.status_code, 500);
-        assert!(err.message.contains("something failed"));
+        assert_eq!(err.message, "internal server error");
+        assert!(!err.message.contains("s3cret"));
+    }
+
+    #[test]
+    fn decode_server_fn_error_body_truncates_oversized_fallback_bodies() {
+        let body = "x".repeat(MAX_FALLBACK_ERROR_BODY_LEN * 4);
+        let err = decode_server_fn_error_body(&body, 502);
+        assert_eq!(err.status_code, 502);
+        assert_eq!(err.message.len(), MAX_FALLBACK_ERROR_BODY_LEN);
     }
 
     #[test]

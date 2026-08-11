@@ -49,13 +49,19 @@ pub fn init_tracing_with_config(cfg: &TelemetryConfig) {
         .and_then(|s| EnvFilter::try_new(s).ok())
         .unwrap_or_else(|| EnvFilter::new("info"));
 
-    tracing_subscriber::fmt()
+    // `try_init`, not `init`: a second initialisation (embedding scenario,
+    // test harness, a service that also sets its own subscriber) must not
+    // panic the startup path — the first subscriber simply stays in place.
+    if let Err(error) = tracing_subscriber::fmt()
         .json()
         .flatten_event(true)
         .with_env_filter(filter)
         .with_current_span(false)
         .with_target(true)
-        .init();
+        .try_init()
+    {
+        tracing::warn!(error = %error, "tracing_subscriber_already_initialised");
+    }
 
     tracing::info!(
         service = %cfg.service,
