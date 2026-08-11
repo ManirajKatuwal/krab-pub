@@ -143,4 +143,5 @@ control flow does not commit us to it either way.
 
 - Refines: [ADR 0006](0006-view-component-composition.md)
 - Reconciler this depends on: `krab_client::patch_children`
-- Plan: `internal/plans/reactive_core.md` Phase 4
+- Plan: `internal/plans/reactive_core.md` Phase 4 (internal planning document,
+  not distributed)

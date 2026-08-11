@@ -11,10 +11,12 @@ Something has to decide which adapter serves a given request, and two
 incompatible models were specified during design.
 
 The policy layer
-(`internal/plans/api_protocol_flexibility_plan.md` §4.5) required protocol to be
+(`internal/plans/api_protocol_flexibility_plan.md` §4.5; internal planning
+document, not distributed) required protocol to be
 chosen by **explicit endpoint**, with runtime override headers removed. The
 execution layer (`internal/plans/protocol_flexibility/01_detailed_implementation_blueprint.md`
-§3.2) made **client-header selection** implementation goal #1 and ranked client
+§3.2; internal planning document, not distributed) made **client-header
+selection** implementation goal #1 and ranked client
 preference third in a four-step resolver, ahead of the service default.
 
 The two documents contradicted each other for the whole life of the project, and

@@ -85,7 +85,8 @@ GraphQL / gRPC as three peers needs correcting to REST / GraphQL / RPC, with
 gRPC semantics as gateway support.
 
 **Nothing downstream breaks.** No crate is published (see ADR 0005's sibling
-finding and `internal/plans/framework_viability.md` C1), so the deprecation
+finding and `internal/plans/framework_viability.md` C1; internal planning
+document, not distributed), so the deprecation
 alias is a formality here rather than a real compatibility bridge. It is kept
 anyway because the policy applies uniformly and the cost is one line.
 
@@ -114,4 +115,5 @@ documentation most users see.
 - Feature declaration: `crates/framework/krab_core/Cargo.toml`
 - Already-correct description: [`CHANGELOG.md`](../../CHANGELOG.md) `[Unreleased]` → Added
 - Protocol selection: [ADR 0004](0004-protocol-selection-by-explicit-endpoint.md)
-- Remediation plan: `internal/plans/framework_viability.md` Phase 5
+- Remediation plan: `internal/plans/framework_viability.md` Phase 5 (internal
+  planning document, not distributed)

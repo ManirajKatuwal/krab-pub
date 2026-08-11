@@ -169,10 +169,10 @@ When disabled, middleware ignores forwarded headers and falls back to the TCP pe
 
 ### Current proxy-header trust semantics
 
-- [`extract_client_ip()`](../../crates/framework/krab_core/src/http.rs:590) only consults `x-forwarded-for` and `x-real-ip` when [`KRAB_TRUST_PROXY_HEADERS`](../../crates/framework/krab_core/src/config.rs:253) is enabled.
-- When enabled, [`extract_client_ip()`](../../crates/framework/krab_core/src/http.rs:590) takes the left-most `x-forwarded-for` value if present, otherwise `x-real-ip`.
-- When proxy headers are disabled or absent, [`extract_client_ip()`](../../crates/framework/krab_core/src/http.rs:590) now falls back to the socket peer address when Axum connect-info is available, and only then to `unknown`.
-- Krab does **not** currently implement a trusted proxy CIDR allowlist or hop-count validation in [`extract_client_ip()`](../../crates/framework/krab_core/src/http.rs:590). This means `KRAB_TRUST_PROXY_HEADERS=true` should only be enabled behind an ingress or reverse proxy that strips and rewrites those headers.
+- [`extract_client_ip()`](../../crates/framework/krab_core/src/http.rs#L590) only consults `x-forwarded-for` and `x-real-ip` when [`KRAB_TRUST_PROXY_HEADERS`](../../crates/framework/krab_core/src/config.rs#L253) is enabled.
+- When enabled, [`extract_client_ip()`](../../crates/framework/krab_core/src/http.rs#L590) takes the left-most `x-forwarded-for` value if present, otherwise `x-real-ip`.
+- When proxy headers are disabled or absent, [`extract_client_ip()`](../../crates/framework/krab_core/src/http.rs#L590) now falls back to the socket peer address when Axum connect-info is available, and only then to `unknown`.
+- Krab does **not** currently implement a trusted proxy CIDR allowlist or hop-count validation in [`extract_client_ip()`](../../crates/framework/krab_core/src/http.rs#L590). This means `KRAB_TRUST_PROXY_HEADERS=true` should only be enabled behind an ingress or reverse proxy that strips and rewrites those headers.
 
 ---
 
@@ -182,31 +182,31 @@ CSRF protection in Krab is currently **opt-in**, not universally enforced.
 
 ### Enforcement conditions
 
-- CSRF checks are enabled only when [`csrf_protection_enabled()`](../../crates/framework/krab_core/src/http.rs:722) returns true.
+- CSRF checks are enabled only when [`csrf_protection_enabled()`](../../crates/framework/krab_core/src/http.rs#L722) returns true.
 - That currently happens when either `KRAB_CSRF_ENABLED=true` or `KRAB_AUTH_COOKIE_SESSION_ENABLED=true`.
-- [`csrf_protection_middleware()`](../../crates/framework/krab_core/src/http.rs:794) only enforces checks for unsafe HTTP methods (`POST`, `PUT`, `PATCH`, `DELETE`) and only when the request carries a `cookie` header.
-- Requests without cookies are treated as non-browser or token-style requests and bypass CSRF validation in [`csrf_protection_middleware()`](../../crates/framework/krab_core/src/http.rs:810).
+- [`csrf_protection_middleware()`](../../crates/framework/krab_core/src/http.rs#L794) only enforces checks for unsafe HTTP methods (`POST`, `PUT`, `PATCH`, `DELETE`) and only when the request carries a `cookie` header.
+- Requests without cookies are treated as non-browser or token-style requests and bypass CSRF validation in [`csrf_protection_middleware()`](../../crates/framework/krab_core/src/http.rs#L810).
 
 ### Token model
 
-- [`csrf_token_endpoint()`](../../crates/framework/krab_core/src/http.rs:752) issues a double-submit token and sets a `krab_csrf_token` cookie with `SameSite=Strict; HttpOnly; Secure; Path=/`.
-- The middleware compares the cookie token from [`csrf_cookie_token()`](../../crates/framework/krab_core/src/http.rs:733) with the header token from [`csrf_header_token()`](../../crates/framework/krab_core/src/http.rs:741) using constant-time comparison in [`csrf_protection_middleware()`](../../crates/framework/krab_core/src/http.rs:818).
+- [`csrf_token_endpoint()`](../../crates/framework/krab_core/src/http.rs#L752) issues a double-submit token and sets a `krab_csrf_token` cookie with `SameSite=Strict; HttpOnly; Secure; Path=/`.
+- The middleware compares the cookie token from [`csrf_cookie_token()`](../../crates/framework/krab_core/src/http.rs#L733) with the header token from [`csrf_header_token()`](../../crates/framework/krab_core/src/http.rs#L741) using constant-time comparison in [`csrf_protection_middleware()`](../../crates/framework/krab_core/src/http.rs#L818).
 
 ### Current limitation
 
-- The WASM server-function client helper in [`call_server_fn()`](../../crates/framework/krab_core/src/server_fn.rs:230) looks for a cookie named `csrf_token`, but the HTTP middleware currently issues and validates `krab_csrf_token` in [`csrf_token_endpoint()`](../../crates/framework/krab_core/src/http.rs:752).
+- The WASM server-function client helper in [`call_server_fn()`](../../crates/framework/krab_core/src/server_fn.rs#L230) looks for a cookie named `csrf_token`, but the HTTP middleware currently issues and validates `krab_csrf_token` in [`csrf_token_endpoint()`](../../crates/framework/krab_core/src/http.rs#L752).
 - As a result, CSRF propagation for server functions is **not aligned by default** with the middleware-issued token name and should not be described as guaranteed protection until the names or integration are unified.
 
 ## Browser security headers and CSP
 
-- Krab sets security headers in the shared HTTP layer in [`security_headers_middleware()`](../../crates/framework/krab_core/src/http.rs:680).
+- Krab sets security headers in the shared HTTP layer in [`security_headers_middleware()`](../../crates/framework/krab_core/src/http.rs#L680).
 - The current Content Security Policy is:
 
 ```text
 default-src 'self'; script-src 'self' 'wasm-unsafe-eval'
 ```
 
-- The `'wasm-unsafe-eval'` directive is presently enabled in [`crates/framework/krab_core/src/http.rs`](../../crates/framework/krab_core/src/http.rs:693) to support the current WebAssembly execution model.
+- The `'wasm-unsafe-eval'` directive is presently enabled in [`crates/framework/krab_core/src/http.rs`](../../crates/framework/krab_core/src/http.rs#L693) to support the current WebAssembly execution model.
 - This is a deliberate compatibility tradeoff, not a maximally strict CSP posture. Deployments with stricter browser isolation requirements should review whether their runtime path still needs this directive before tightening policy.
 
 ---

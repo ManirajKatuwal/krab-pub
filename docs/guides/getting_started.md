@@ -25,7 +25,7 @@ not take it.
 > checkout:
 >
 > ```sh
-> git clone https://github.com/krab-framework/krab.git
+> git clone https://github.com/ManirajKatuwal/krab.git
 > cargo install --path krab/crates/tooling/krab_cli
 > ```
 

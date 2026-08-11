@@ -96,7 +96,8 @@ it has always been in practice.**
 3. Correct [`docs/roadmap.md`](../roadmap.md) and the `Router::add_route` claim
    in [`CLAUDE.md`](../../CLAUDE.md).
 4. Annotate the frozen-boundary record in `internal/plans/fullstack_remediation.md`
-   with a dated pointer here. Do not rewrite its history.
+   (internal planning document, not distributed) with a dated pointer here. Do
+   not rewrite its history.
 
 `krab_server` is unpublished, so no consumer can be broken by removing it.
 
@@ -146,4 +147,5 @@ for no gain a user can name. Rejected.
 - Crate: `crates/framework/krab_server/src/lib.rs` (502 LOC)
 - Actual serving path: [`services/service_frontend/build.rs`](../../services/service_frontend/build.rs)
 - Contradicted claims: [`docs/roadmap.md`](../roadmap.md) item 4, [`CLAUDE.md`](../../CLAUDE.md) Known constraints
-- Remediation plan: `internal/plans/framework_viability.md` Phase 3
+- Remediation plan: `internal/plans/framework_viability.md` Phase 3 (internal
+  planning document, not distributed)

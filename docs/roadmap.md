@@ -57,7 +57,7 @@ Each gate must be green before production certification rollout.
 
 ### Gate G2 — DB lifecycle
 
-- Promotion policy and drift checks enforced via [crates/framework/krab_core/src/db.rs](../crates/framework/krab_core/src/db.rs).
+- Promotion policy and drift checks enforced via [crates/framework/krab_core/src/db/](../crates/framework/krab_core/src/db/).
 - CI validates migrate-from-zero + rollback simulation + drift failure path.
 - Destructive migration guardrails and rollback runbook in place.
 

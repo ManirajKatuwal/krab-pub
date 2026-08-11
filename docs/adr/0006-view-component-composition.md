@@ -112,4 +112,5 @@ author wanted, so there is no case in which compiling on is the right outcome.
   (`parse_html_name`, `impl Parse for Element`)
 - Compile-fail case: `crates/framework/krab_macros/tests/compile_fail/component_tag_unsupported.rs`
 - Hydration and island model: [`docs/architecture/hydration.md`](../architecture/hydration.md)
-- Remediation plan: `internal/plans/framework_viability.md` Phase 4
+- Remediation plan: `internal/plans/framework_viability.md` Phase 4 (internal
+  planning document, not distributed)

@@ -780,17 +780,18 @@ Covers all work merged after `0.1.1` (2026-03-11).
   `internal/reports/PRE_RELEASE_AUDIT_REPORT.md`.
 
 > **Verification status (2026-08-07).** Partial. `cargo fmt --all --check`,
-> `cargo audit`, and `cargo deny check advisories licenses bans sources` all
-> pass at HEAD — bundle:
-> [`internal/audit/evidence/2026-08-07_remediation/`](internal/audit/evidence/2026-08-07_remediation).
+> `cargo audit`, and `cargo deny check advisories licenses bans sources`
+> passed at HEAD; the evidence bundle is recorded in
+> `internal/audit/evidence/2026-08-07_remediation/` (maintainer-local,
+> gitignored).
 >
-> Everything requiring a linker is **unrun**: `cargo test --workspace`, the
-> feature-gated `krab_core` suites, `cargo clippy --all-targets`, `cargo doc`,
-> and every `krab` governance command. The current machine has no MSVC C++
-> Build Tools, so proc-macro and binary targets cannot link. This is an
-> environment gap, not a code failure, but it means **this section is a record
-> of merged changes, not an attestation that all gates are green at HEAD.** See
-> [`internal/audit/VERIFICATION_EVIDENCE_LOG.md`](internal/audit/VERIFICATION_EVIDENCE_LOG.md) §7.
+> Link-dependent gates were deferred to a later verification pass:
+> `cargo test --workspace`, the feature-gated `krab_core` suites,
+> `cargo clippy --all-targets`, `cargo doc`, and the `krab` governance
+> commands. This section therefore records merged changes as of that date
+> rather than a full-gate attestation. Deferred-gate status is tracked in
+> `internal/audit/VERIFICATION_EVIDENCE_LOG.md` §7 (maintainer-local,
+> gitignored).
 
 ---
 
