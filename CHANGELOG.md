@@ -16,6 +16,27 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ## [Unreleased]
 
+Nothing yet — `0.2.0` is the current release.
+
+---
+
+## [0.2.0] — 2026-08-12
+
+First public release: pushed to
+[github.com/ManirajKatuwal/krab-pub](https://github.com/ManirajKatuwal/krab-pub)
+and published to crates.io (`krab_core`, `krab_macros`, `krab_client`,
+`krab_cli`, `krab_orchestrator`). Covers all work merged after `0.1.1`
+(2026-03-11).
+
+> **Why `0.2.0` and not `0.1.2`.** This release contains breaking changes:
+> `IsrCache` became async, `DistributedStore` gained required methods,
+> `IsrEntry::generated_at` changed type, `ProtocolKind::parse("grpc")` stopped
+> resolving, the credential format changed, and `krab_server` was removed. Under
+> Cargo's semver rules a pre-`1.0` crate uses the **minor** field as its
+> compatibility boundary — `0.1` and `0.2` are incompatible, `0.1.1` and `0.1.2`
+> are not. Shipping this as a patch would break every downstream `^0.1` build
+> without a version bump to signal it.
+
 ### Security
 
 - **The unauthenticated ("open") path list is configurable via
@@ -189,24 +210,8 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
   members (path dependencies) from the `"*"` package spec, so `[profile.dev]
   debug = true` still applies to them.
 
----
+<!-- The categories below continue the 0.2.0 release notes. -->
 
-## [0.2.0] — unreleased, prepared
-
-Covers all work merged after `0.1.1` (2026-03-11).
-
-> **Why `0.2.0` and not `0.1.2`.** This release contains breaking changes:
-> `IsrCache` became async, `DistributedStore` gained required methods,
-> `IsrEntry::generated_at` changed type, `ProtocolKind::parse("grpc")` stopped
-> resolving, the credential format changed, and `krab_server` was removed. Under
-> Cargo's semver rules a pre-`1.0` crate uses the **minor** field as its
-> compatibility boundary — `0.1` and `0.2` are incompatible, `0.1.1` and `0.1.2`
-> are not. Shipping this as a patch would break every downstream `^0.1` build
-> without a version bump to signal it.
->
-> The previous cutoff line pinned a commit (`bac72c5`) and went stale twice as
-> work landed on top of it, silently: the entries below were current while the
-> header claimed they could not exist.
 
 ### Security
 

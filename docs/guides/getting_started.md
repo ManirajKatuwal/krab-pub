@@ -21,8 +21,8 @@ The package is `krab_cli`; the installed binary is **`krab`**. The crates.io
 name `krab` was registered in 2023 by an unrelated crate, so the package could
 not take it.
 
-> **Not published yet.** Until the first crates.io release, install from a
-> checkout:
+> Prefer building against a checkout (for example, to test an unreleased
+> framework change)? Clone and install the CLI from the path instead:
 >
 > ```sh
 > git clone https://github.com/ManirajKatuwal/krab-pub.git
