@@ -77,6 +77,16 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
   module-by-module map of `krab_core` with its cross-cutting invariants,
   migrated from the maintainer wiki so the public docs carry them.
 
+- **Generated project README and Dockerfile were dishonest about what
+  works.** The `krab new` README told consumers to run `krab release certify
+  --out release-evidence` — a governance command hardcoded to the framework's
+  own `service_auth`/`service_users` and meaningless in a generated project.
+  The Testing section now says `cargo test` and carries an explicit note that
+  the governance commands operate on the framework workspace only. The
+  generated Dockerfile also `COPY`d a `Cargo.lock` that a fresh scaffold does
+  not have, failing every `docker build`; it now copies only `Cargo.toml`,
+  with a comment on re-adding the lockfile once committed.
+
 - **`krab gen service` output could not compile.** The generated manifest
   declared `krab_core = { path = "../krab_core" }` — a directory that has not
   existed since the crates/ reorganisation — and the generated `main.rs` used

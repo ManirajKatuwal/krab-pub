@@ -172,8 +172,13 @@ krab doctor --diagnostics
 
 ```bash
 cargo test
-krab release certify --out release-evidence
 ```
+
+> Note: the `krab` governance commands (`release certify`, `contract check`,
+> `db lifecycle`) currently operate on the Krab framework workspace itself —
+> they are hardcoded to its internal services and are not wired to generated
+> projects. Use your project's own CI (see `.github/workflows/ci.yaml`) as the
+> release gate.
 
 ## Deployment
 
@@ -816,7 +821,10 @@ fn generate_dockerfile(name: &str) -> String {
         r#"# Build stage
 FROM rust:1.77-slim-bookworm AS builder
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
+# No Cargo.lock COPY: generated projects do not ship one until the first
+# local build, and a COPY of a missing file fails the whole build. Commit
+# your Cargo.lock and add it here for reproducible container builds.
+COPY Cargo.toml ./
 COPY src/ src/
 RUN cargo build --release --bin {name}
 
@@ -901,7 +909,23 @@ mod tests {
 
         let readme = fs::read_to_string(project_dir.join("README.md"))?;
         assert!(readme.contains("krab doctor --diagnostics"));
-        assert!(readme.contains("krab release certify --out release-evidence"));
+        // Governance commands are framework-internal today; the README must
+        // not tell a consumer to run them, only note their current scope.
+        assert!(
+            !readme.contains("krab release certify --out release-evidence"),
+            "generated README instructs consumers to run framework-internal governance"
+        );
+        assert!(readme.contains("operate on the Krab framework workspace itself"));
+
+        // The Dockerfile must not COPY files the scaffold does not create:
+        // generated projects have no committed Cargo.lock, and a COPY of a
+        // missing file fails `docker build` outright.
+        let dockerfile = fs::read_to_string(project_dir.join("Dockerfile"))?;
+        assert!(
+            !dockerfile.contains("COPY Cargo.toml Cargo.lock"),
+            "generated Dockerfile copies a Cargo.lock that does not exist in a fresh project"
+        );
+        assert!(dockerfile.contains("COPY Cargo.toml ./"));
         Ok(())
     }
 
