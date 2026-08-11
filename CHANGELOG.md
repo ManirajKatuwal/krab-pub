@@ -117,6 +117,15 @@ Covers all work merged after `0.1.1` (2026-03-11).
   routing defects are now pinned by regression tests in `service_frontend`. See
   [ADR 0005](docs/adr/0005-krab-server-disposition.md). The crate was never
   published, so no consumer is affected.
+- **`krab_core::loading` (`LoadingState`, `LoadingFallback`, `RouteTransition`)
+  is deleted.** Dead surface: nothing in the workspace, the services, or the
+  reference app ever constructed any of it — its only executions were its own
+  unit tests. [ADR 0009](docs/adr/0009-resource-ssr-semantics.md) flagged the
+  module as remove-or-use when `Resource` landed, and `Resource` already covers
+  the ergonomics: `ResourceState::Pending` is the loading state a component
+  actually renders against, with `state`/`value` as live signals instead of a
+  hand-driven string-rendering state machine. The crate is unpublished, so no
+  consumer is affected.
 
 ### Changed
 
@@ -387,6 +396,14 @@ Covers all work merged after `0.1.1` (2026-03-11).
   install, scaffold, first page, first island, first server function. The
   documentation set had 29 files and no file matching `*start*`, `*quick*`, or
   `*tutorial*`; nothing covered building your own application.
+- **[`docs/reference/benchmarks.md`](docs/reference/benchmarks.md)** — the
+  benchmark/NFT methodology and every committed result snapshot in one lookup
+  page: what each harness in `scripts/` measures, the release-blocking limits
+  in `benchmarks/thresholds.json`, the `N=1` vs `N=3` scaling gate, the
+  external-comparison matrix, and exact reproduction commands. The committed
+  snapshots previously carried numbers with no public statement of method or
+  caveats — including that the 2026-03-08 "comparison" run measured Krab only,
+  on a local machine, against a size-optimised (`opt-level = "z"`) build.
 - **`krab_core` gained an `auth` feature** providing
   `credentials::CredentialStore`, `EnvHashCredentialStore`, `hash_password`,
   `verify_password`, and `is_valid_password_hash`. Off by default, so a consumer

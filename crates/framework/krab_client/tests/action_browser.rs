@@ -18,20 +18,11 @@ use std::rc::Rc;
 use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
+#[path = "support/mod.rs"]
+mod support;
+use support::settle;
+
 wasm_bindgen_test_configure!(run_in_browser);
-
-/// Yield to the microtask queue so a spawned future can make progress.
-async fn tick() {
-    let promise = js_sys::Promise::resolve(&wasm_bindgen::JsValue::UNDEFINED);
-    let _ = JsFuture::from(promise).await;
-}
-
-/// Several ticks, for futures that await more than once internally.
-async fn settle() {
-    for _ in 0..8 {
-        tick().await;
-    }
-}
 
 #[wasm_bindgen_test]
 async fn a_successful_dispatch_moves_through_pending_to_value() {

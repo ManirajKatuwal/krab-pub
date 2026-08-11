@@ -28,11 +28,10 @@
 //! passed down as island props and into [`create_resource_with_initial`] — the
 //! client then hydrates `Ready` and does **not** refetch on mount.
 
-use crate::action::{spawn_local_task, DISPATCH_HAS_EXECUTOR};
-use crate::signal::{batch, create_effect, create_signal, untrack, ReadSignal, WriteSignal};
+use crate::action::{flatten_display_errors, run_guarded, GuardedFuture};
+use crate::signal::{create_effect, create_signal, untrack, ReadSignal, WriteSignal};
 use std::cell::Cell;
 use std::future::Future;
-use std::pin::Pin;
 use std::rc::Rc;
 
 /// Where a [`Resource`] is in its load cycle.
@@ -79,8 +78,7 @@ pub struct Resource<S, T: 'static> {
     value: ReadSignal<Option<T>>,
     set_value: WriteSignal<Option<T>>,
     source: Rc<dyn Fn() -> S>,
-    #[allow(clippy::type_complexity)]
-    fetcher: Rc<dyn Fn(S) -> Pin<Box<dyn Future<Output = Result<T, String>>>>>,
+    fetcher: Rc<dyn Fn(S) -> GuardedFuture<T>>,
     /// Bumped on every fetch so a slow earlier request cannot overwrite a
     /// faster later one — the same discard-superseded-responses rule as
     /// [`Action`](crate::action::Action).
@@ -131,43 +129,31 @@ where
     }
 
     /// Start a fetch. Superseded responses are discarded, never applied.
+    ///
+    /// The executor check, generation bump, and stale-discard live in
+    /// [`run_guarded`], shared with [`Action::dispatch`](crate::action::Action::dispatch):
+    /// with no executor nothing polls the future, so this returns before
+    /// touching any signal and SSR renders the same idle shape regardless of
+    /// call count.
     fn fetch(&self, input: S) {
-        // No executor, nothing to poll the future — return before touching any
-        // signal, so SSR renders the same idle shape regardless of call count.
-        // See `Action::dispatch` for the latch bug this ordering prevents.
-        if !DISPATCH_HAS_EXECUTOR {
-            drop(input);
-            return;
-        }
-
-        let generation = self.generation.get().wrapping_add(1);
-        self.generation.set(generation);
-
-        // Pending during a refetch as well: consumers rendering a spinner off
-        // `state` see the reload, while `value` keeps the data on screen.
-        self.set_state.set(ResourceState::Pending);
-
-        let future = (self.fetcher)(input);
-        let expected = self.generation.clone();
         let set_state = self.set_state.clone();
         let set_value = self.set_value.clone();
 
-        spawn_local_task(async move {
-            let outcome = future.await;
-
-            // A newer fetch has started; this response is stale.
-            if expected.get() != generation {
-                return;
-            }
-
-            batch(|| match outcome {
+        run_guarded(
+            &self.generation,
+            // Pending during a refetch as well: consumers rendering a spinner
+            // off `state` see the reload, while `value` keeps the data on
+            // screen.
+            || self.set_state.set(ResourceState::Pending),
+            || (self.fetcher)(input),
+            move |outcome| match outcome {
                 Ok(value) => {
                     set_value.set(Some(value));
                     set_state.set(ResourceState::Ready);
                 }
                 Err(message) => set_state.set(ResourceState::Error(message)),
-            });
-        });
+            },
+        );
     }
 }
 
@@ -240,13 +226,7 @@ where
         value,
         set_value,
         source: Rc::new(source),
-        // Flattened to a string like `Action`, so the error type does not
-        // infect every signature. `ServerFnError` renders usefully via
-        // `Display`.
-        fetcher: Rc::new(move |input| {
-            let fut = fetcher(input);
-            Box::pin(async move { fut.await.map_err(|e| e.to_string()) })
-        }),
+        fetcher: flatten_display_errors(fetcher),
         generation: Rc::new(Cell::new(0)),
     };
 

@@ -4,6 +4,8 @@ use krab_core::Node;
 #[cfg(feature = "web")]
 use std::cell::{Cell, RefCell};
 #[cfg(feature = "web")]
+use std::collections::{HashMap, VecDeque};
+#[cfg(feature = "web")]
 use std::panic::{catch_unwind, AssertUnwindSafe};
 #[cfg(feature = "web")]
 use std::rc::Rc;
@@ -981,11 +983,14 @@ type EmptyRunPosition = (Element, Option<WebNode>);
 /// Apply one new render of a dynamic region to the DOM.
 #[cfg(feature = "web")]
 fn update_dynamic_region(cells: &DynamicRegionCells, new_v_node: Node) {
-    // Cloned out of the cells rather than borrowed across the update:
-    // reconciliation writes back to them, and an outstanding shared borrow
-    // would make that a panic.
+    // Taken out of the cells rather than borrowed across the update: the cells
+    // are written back to below, and an outstanding shared borrow would make
+    // that a panic. The vnode is *moved*, not cloned — every exit path of this
+    // function overwrites the cell with `new_v_node`, so a clone here paid for
+    // a deep copy of the entire previous tree only to discard it. The rendered
+    // nodes are cheap `WebNode` handles, but still cloned only once.
     let previous_nodes = cells.rendered.borrow().clone();
-    let previous_vnode = cells.current_vnode.borrow().clone();
+    let previous_vnode = cells.current_vnode.borrow_mut().take();
 
     let anchor_node = {
         let existing = cells.anchor.borrow().clone();
@@ -1043,7 +1048,7 @@ fn update_dynamic_region(cells: &DynamicRegionCells, new_v_node: Node) {
 
     let next = reconcile_range(
         &parent,
-        previous_nodes.clone(),
+        previous_nodes,
         previous_vnode.as_slice(),
         std::slice::from_ref(&new_v_node),
         Some(&anchor_node),
@@ -1053,8 +1058,12 @@ fn update_dynamic_region(cells: &DynamicRegionCells, new_v_node: Node) {
         Some(nodes) => *cells.rendered.borrow_mut() = nodes,
         None => {
             // Reconciliation declined — rebuild the run wholesale, still
-            // bounded by the anchor so siblings are untouched.
-            for node in &previous_nodes {
+            // bounded by the anchor so siblings are untouched. `reconcile_range`
+            // consumed the node list but never writes to the cells, so the cell
+            // still holds the previous run; take it rather than keeping a
+            // second clone alive for this path.
+            let stale = std::mem::take(&mut *cells.rendered.borrow_mut());
+            for node in &stale {
                 remove_tracked_node(&parent, node);
             }
 
@@ -1198,6 +1207,22 @@ fn reconcile_range(
     let mut consumed = vec![false; existing.len()];
     let mut placed: Vec<WebNode> = Vec::with_capacity(new_flat.len());
 
+    // Keyed sources, resolved up front: key → source indices in first-to-last
+    // order, drained from the front as they are claimed. This replaces a linear
+    // scan of `old_flat` per new child — O(n×m) across an update, and every
+    // probe re-scanned the attribute `Vec` inside `reconcile_key` — with one
+    // pass here and an O(1) lookup per child. Only keyed old nodes enter the
+    // map, and a keyed old node can only ever be consumed through it (the
+    // positional fallback below refuses keyed sources), so front-to-back
+    // draining claims exactly the first unconsumed match, duplicate keys
+    // included — the same source the scan used to find.
+    let mut keyed_sources: HashMap<&str, VecDeque<usize>> = HashMap::new();
+    for (index, old) in old_flat.iter().enumerate() {
+        if let Some(key) = reconcile_key(old) {
+            keyed_sources.entry(key).or_default().push_back(index);
+        }
+    }
+
     // Where the run currently begins. Captured before any mutation and used as
     // the reference for the first node, so a node already in place is
     // recognised and left alone. Falls back to the anchor for an empty run.
@@ -1211,13 +1236,9 @@ fn reconcile_range(
         // back to the node at the same position, and only if that node is
         // itself unkeyed — otherwise a keyed node could be consumed by an
         // unrelated positional match and then rebuilt when its own key comes up.
-        let keyed_source = reconcile_key(new_child).and_then(|key| {
-            old_flat
-                .iter()
-                .enumerate()
-                .find(|(index, old)| !consumed[*index] && reconcile_key(old) == Some(key))
-                .map(|(index, _)| index)
-        });
+        let keyed_source = reconcile_key(new_child)
+            .and_then(|key| keyed_sources.get_mut(key))
+            .and_then(VecDeque::pop_front);
 
         let source_index = keyed_source.or_else(|| {
             let positional = target_index;

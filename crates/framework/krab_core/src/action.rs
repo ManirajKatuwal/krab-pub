@@ -50,8 +50,7 @@ pub struct Action<I, O: 'static> {
     set_pending: WriteSignal<bool>,
     set_value: WriteSignal<Option<O>>,
     set_error: WriteSignal<Option<String>>,
-    #[allow(clippy::type_complexity)]
-    run: Rc<dyn Fn(I) -> Pin<Box<dyn Future<Output = Result<O, String>>>>>,
+    run: Rc<dyn Fn(I) -> GuardedFuture<O>>,
     /// Bumped on every dispatch so a slow earlier call cannot overwrite a
     /// faster later one. Without it, dispatching twice and having the first
     /// request finish second leaves stale data on screen with `pending` false —
@@ -106,50 +105,29 @@ where
     /// earlier future still runs to completion — but its result is discarded,
     /// so only the latest dispatch can write state.
     pub fn dispatch(&self, input: I) {
-        // Off the browser there is no executor, so the operation would never be
-        // polled. Returning *first* is the whole point: were the pending write
-        // below to run anyway, `pending` would latch true for the lifetime of
-        // the render and every `disabled={pending}` button in the server-rendered
-        // markup would ship disabled.
-        if !DISPATCH_HAS_EXECUTOR {
-            drop(input);
-            return;
-        }
-
-        let generation = self.generation.get().wrapping_add(1);
-        self.generation.set(generation);
-
-        // One update, so anything reading both `pending` and `error` sees a
-        // single consistent transition rather than two.
-        let set_pending = self.set_pending.clone();
-        let set_error = self.set_error.clone();
-        batch(|| {
-            set_pending.set(true);
-            set_error.set(None);
-        });
-
-        let future = (self.run)(input);
-        let expected = self.generation.clone();
         let set_pending = self.set_pending.clone();
         let set_value = self.set_value.clone();
         let set_error = self.set_error.clone();
 
-        spawn_local_task(async move {
-            let outcome = future.await;
-
-            // A newer dispatch has started; this result is stale.
-            if expected.get() != generation {
-                return;
-            }
-
-            batch(|| {
+        run_guarded(
+            &self.generation,
+            // One update, so anything reading both `pending` and `error` sees a
+            // single consistent transition rather than two.
+            || {
+                batch(|| {
+                    self.set_pending.set(true);
+                    self.set_error.set(None);
+                })
+            },
+            || (self.run)(input),
+            move |outcome| {
                 set_pending.set(false);
                 match outcome {
                     Ok(value) => set_value.set(Some(value)),
                     Err(message) => set_error.set(Some(message)),
                 }
-            });
-        });
+            },
+        );
     }
 }
 
@@ -176,15 +154,74 @@ where
         set_pending,
         set_value,
         set_error,
-        // The error is flattened to a string here so `Action` does not carry the
-        // error type into every signature that mentions it. `ServerFnError`
-        // already renders usefully through `Display`.
-        run: Rc::new(move |input| {
-            let fut = f(input);
-            Box::pin(async move { fut.await.map_err(|e| e.to_string()) })
-        }),
+        run: flatten_display_errors(f),
         generation: Rc::new(Cell::new(0)),
     }
+}
+
+/// A future factory: what [`run_guarded`] runs and [`flatten_display_errors`]
+/// produces. `Action` stores one as `run`, `Resource` as `fetcher`.
+pub(crate) type GuardedFuture<T> = Pin<Box<dyn Future<Output = Result<T, String>>>>;
+
+/// Wrap an async operation so its error type is flattened to a `String` through
+/// `Display`, keeping the error type out of every signature that mentions the
+/// [`Action`] or [`Resource`](crate::resource::Resource) holding it.
+/// `ServerFnError` already renders usefully through `Display`.
+pub(crate) fn flatten_display_errors<I, T, F, Fut, E>(f: F) -> Rc<dyn Fn(I) -> GuardedFuture<T>>
+where
+    F: Fn(I) -> Fut + 'static,
+    Fut: Future<Output = Result<T, E>> + 'static,
+    E: std::fmt::Display + 'static,
+{
+    Rc::new(move |input| {
+        let fut = f(input);
+        Box::pin(async move { fut.await.map_err(|e| e.to_string()) })
+    })
+}
+
+/// The generation-guarded run shared by [`Action::dispatch`] and
+/// [`Resource::fetch`](crate::resource::Resource): bump the generation, apply
+/// the start-of-run writes, spawn the future, and discard its result if a newer
+/// run superseded it before completion.
+///
+/// Off the browser there is no executor, so the operation would never be
+/// polled. Returning *first* is the whole point: were `begin`'s writes to run
+/// anyway, `pending` would latch true for the lifetime of the render and every
+/// `disabled={pending}` button in the server-rendered markup would ship
+/// disabled. The unrun closures are dropped, input and all, before any signal
+/// is touched.
+///
+/// `apply` receives the completed outcome inside one [`batch`], so consumers
+/// reading several of the completion signals see a single consistent
+/// transition.
+pub(crate) fn run_guarded<T: 'static>(
+    generation: &Rc<Cell<u64>>,
+    begin: impl FnOnce(),
+    make_future: impl FnOnce() -> GuardedFuture<T>,
+    apply: impl FnOnce(Result<T, String>) + 'static,
+) {
+    if !DISPATCH_HAS_EXECUTOR {
+        return;
+    }
+
+    let current = generation.get().wrapping_add(1);
+    generation.set(current);
+
+    begin();
+
+    let future = make_future();
+    let expected = generation.clone();
+
+    spawn_local_task(async move {
+        let outcome = future.await;
+
+        // A newer run has started; this result is stale.
+        if expected.get() != current {
+            return;
+        }
+
+        batch(|| apply(outcome));
+    });
 }
 
 /// Whether this target has an executor [`Action::dispatch`] can hand a future to.
@@ -201,7 +238,7 @@ pub(crate) const DISPATCH_HAS_EXECUTOR: bool = false;
 
 /// Run a future on the local task queue.
 ///
-/// Natively this is unreachable — [`Action::dispatch`] returns at
+/// Natively this is unreachable — [`run_guarded`] returns at
 /// [`DISPATCH_HAS_EXECUTOR`] before getting here — but the body is compiled on
 /// both targets so the two paths cannot drift apart silently. Dropping is the
 /// safe fallback if that early return is ever removed: it loses the operation,

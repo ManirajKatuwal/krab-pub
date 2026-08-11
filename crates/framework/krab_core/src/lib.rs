@@ -37,7 +37,6 @@ pub mod image;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod isr;
 pub mod layout;
-pub mod loading;
 pub mod protocol;
 pub mod render_policy;
 pub mod render_stream;
@@ -185,16 +184,7 @@ pub fn annotate_hydration_tree(node: Node, boundary_id: &str) -> Node {
 fn annotate_hydration_tree_with_marker(node: Node, marker: &HydrationNodeMarker) -> Node {
     match node {
         Node::Element(mut element) => {
-            if !element
-                .attributes
-                .iter()
-                .any(|attr| attr.name == HYDRATION_NODE_ID_ATTR)
-            {
-                element.attributes.push(Attribute::new(
-                    HYDRATION_NODE_ID_ATTR.to_string(),
-                    marker.as_attr_value(),
-                ));
-            }
+            stamp_hydration_marker_if_absent(&mut element, || marker.as_attr_value());
 
             if !element
                 .attributes
@@ -230,11 +220,37 @@ fn annotate_hydration_children(
         .collect()
 }
 
-fn child_hydration_path(parent_path: &str, child_index: usize) -> String {
+/// The `{parent}.{index}` path scheme shared by hydration annotation and
+/// `<For>`'s fragment-row keying (`control_flow::with_key`). One definition, so
+/// the two walkers cannot drift apart.
+pub(crate) fn child_hydration_path(parent_path: &str, child_index: usize) -> String {
     if parent_path.is_empty() {
         child_index.to_string()
     } else {
         format!("{parent_path}.{child_index}")
+    }
+}
+
+/// Stamp `value()` onto `element` as [`HYDRATION_NODE_ID_ATTR`] unless the
+/// marker is already present — an existing marker always wins. Both
+/// `annotate_hydration_tree` and `<For>`'s key stamping go through here, which
+/// is what lets a key set by `with_key` survive hydration annotation instead of
+/// being overwritten by a positional path (and vice versa).
+///
+/// `value` is a closure so callers that build the attribute value on demand pay
+/// for it only when the stamp is actually applied.
+pub(crate) fn stamp_hydration_marker_if_absent(
+    element: &mut Element,
+    value: impl FnOnce() -> String,
+) {
+    if !element
+        .attributes
+        .iter()
+        .any(|attr| attr.name == HYDRATION_NODE_ID_ATTR)
+    {
+        element
+            .attributes
+            .push(Attribute::new(HYDRATION_NODE_ID_ATTR.to_string(), value()));
     }
 }
 

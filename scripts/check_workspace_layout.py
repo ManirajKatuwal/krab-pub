@@ -37,6 +37,13 @@ ALLOWED_ROOTS = (
     "examples/reference_apps/",
 )
 
+# The root Cargo.toml is workspace metadata, not a crate: only these top-level
+# tables may appear. Anything else — [package], [dependencies],
+# [dev-dependencies], [build-dependencies], [lib], [[bin]] — means someone has
+# started turning the workspace root into a crate, which is the same boundary
+# violation as a crate directory at the repository root.
+ALLOWED_ROOT_MANIFEST_TABLES = {"workspace", "profile", "patch"}
+
 # Directories at the repository root that may exist without being crates.
 # Dot-directories (.git, .github, .cargo, .vscode, ...) are skipped generically.
 NON_CRATE_ROOT_DIRS = {
@@ -122,6 +129,35 @@ def check_inter_crate_versions(manifest_text: str):
     return failures
 
 
+def check_root_manifest_is_metadata_only(manifest_text: str):
+    """Return failures for crate-level sections in the root Cargo.toml.
+
+    Uses tomllib when available and falls back to a regex over section headers,
+    the same split as `parse_members`. The regex only needs the *first* segment
+    of each table path (`[workspace.dependencies]` → `workspace`), so unlike
+    the version-pin check it does not risk false passes on old interpreters.
+    """
+    try:
+        import tomllib
+
+        top_level = set(tomllib.loads(manifest_text).keys())
+    except ModuleNotFoundError:
+        top_level = {
+            match.group(1)
+            for match in re.finditer(
+                r"(?m)^\s*\[\[?\s*([A-Za-z0-9_-]+)", manifest_text
+            )
+        }
+
+    return [
+        f"Root Cargo.toml declares [{table}]. The root manifest is workspace "
+        f"metadata only ([workspace], [workspace.*], [profile.*], [patch.*]); "
+        f"crate sections belong in a member under one of "
+        f"{', '.join(ALLOWED_ROOTS)}"
+        for table in sorted(top_level - ALLOWED_ROOT_MANIFEST_TABLES)
+    ]
+
+
 def main() -> int:
     if not MANIFEST.is_file():
         print(f"ERROR: workspace manifest not found at {MANIFEST}")
@@ -131,6 +167,7 @@ def main() -> int:
     manifest_text = MANIFEST.read_text(encoding="utf-8")
     members = parse_members(manifest_text)
     failures.extend(check_inter_crate_versions(manifest_text))
+    failures.extend(check_root_manifest_is_metadata_only(manifest_text))
 
     if not members:
         print("ERROR: no workspace members parsed from Cargo.toml")

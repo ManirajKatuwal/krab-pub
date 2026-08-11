@@ -30,6 +30,7 @@ choose Krab at all, read [Why Krab](guides/why_krab.md) first.
 | [security.md](reference/security.md) | Security architecture, secret management, threat model |
 | [deployment.md](reference/deployment.md) | Docker, Kubernetes, and self-hosted deployment |
 | [server_functions.md](reference/server_functions.md) | Server-function endpoint contract and safety patterns |
+| [benchmarks.md](reference/benchmarks.md) | Benchmark/NFT methodology, gate thresholds, committed result snapshots |
 
 ## Architecture — how and why
 
@@ -82,7 +83,7 @@ risk log.
 | Contribute a change | [CONTRIBUTING.md](../CONTRIBUTING.md) |
 | Understand release gates | [RELEASE_POLICY.md](../RELEASE_POLICY.md) |
 | See what changed | [CHANGELOG.md](../CHANGELOG.md) |
-| Read benchmark thresholds | [benchmarks/](../benchmarks/) |
+| Read benchmark thresholds | [benchmarks/](../benchmarks/) and [reference/benchmarks.md](reference/benchmarks.md) |
 | Configure alerts and dashboards | [monitoring/](../monitoring/) |
 
 ## Contributing to these docs

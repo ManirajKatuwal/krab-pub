@@ -39,51 +39,26 @@
 #![cfg(target_arch = "wasm32")]
 
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
-use web_sys::{Document, Element};
+use web_sys::Element;
+
+#[path = "support/mod.rs"]
+mod support;
+use support::document;
 
 wasm_bindgen_test_configure!(run_in_browser);
-
-fn document() -> Document {
-    web_sys::window()
-        .expect("no window")
-        .document()
-        .expect("no document")
-}
 
 /// Id of the container every test mounts into.
 const TEST_ROOT_ID: &str = "krab-test-root";
 
 /// Mount `markup` into a dedicated container and return the first island in it.
 ///
-/// **Never write to `document.body.innerHTML` here.** `wasm-bindgen-test`
-/// renders its own progress and results into the body; replacing the body's
-/// HTML destroys the harness's output element, after which the runner reports
-/// `Failed to detect test as having been run. It might have timed out.` — with
-/// no indication that the tests themselves were fine. This cost a long
-/// debugging detour through the driver and the toolchain before the cause
-/// turned out to be the test helper.
-///
-/// Each test gets a freshly emptied container, because `hydrate()` scans the
-/// whole document for `[data-island]` and would otherwise re-hydrate leftovers
-/// from the previous test.
+/// The container comes from [`support::mount_container`] — see the warning
+/// there about never writing `document.body.innerHTML`. Each test gets a
+/// freshly emptied container, because `hydrate()` scans the whole document for
+/// `[data-island]` and would otherwise re-hydrate leftovers from the previous
+/// test.
 fn mount(markup: &str) -> Element {
-    let doc = document();
-
-    let root = match doc.query_selector(&format!("#{TEST_ROOT_ID}")) {
-        Ok(Some(existing)) => existing,
-        _ => {
-            let created = doc
-                .create_element("div")
-                .expect("failed to create test root");
-            created.set_id(TEST_ROOT_ID);
-            doc.body()
-                .expect("no body")
-                .append_child(&created)
-                .expect("failed to append test root");
-            created
-        }
-    };
-
+    let root = support::mount_container(TEST_ROOT_ID);
     root.set_inner_html(markup);
     root.query_selector("[data-island]")
         .expect("query failed")

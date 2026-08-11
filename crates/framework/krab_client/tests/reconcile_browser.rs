@@ -16,38 +16,21 @@ use krab_macros::view;
 use std::rc::Rc;
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
-use web_sys::{Document, Element};
+use web_sys::Element;
+
+#[path = "support/mod.rs"]
+mod support;
+use support::document;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
-fn document() -> Document {
-    web_sys::window()
-        .expect("no window")
-        .document()
-        .expect("no document")
-}
-
 const ROOT_ID: &str = "krab-reconcile-root";
 
-/// An empty container. Never writes `document.body.innerHTML` — the harness
-/// renders its own results there, and clearing it makes every test look like a
-/// timeout.
+/// An empty container, distinct from the hydration suite's. See
+/// [`support::mount_container`] for why it never writes
+/// `document.body.innerHTML`.
 fn mount_root() -> Element {
-    let doc = document();
-    let root = match doc.query_selector(&format!("#{ROOT_ID}")) {
-        Ok(Some(existing)) => existing,
-        _ => {
-            let created = doc.create_element("div").expect("create root");
-            created.set_id(ROOT_ID);
-            doc.body()
-                .expect("no body")
-                .append_child(&created)
-                .expect("append root");
-            created
-        }
-    };
-    root.set_inner_html("");
-    root
+    support::mount_container(ROOT_ID)
 }
 
 fn keyed(tag: &str, key: &str, children: Vec<Node>, extra: Vec<Attribute>) -> Node {

@@ -7,7 +7,7 @@
 //! machinery as any other reactive interpolation — there is no separate update
 //! path to keep in step.
 
-use crate::{Attribute, Node};
+use crate::Node;
 use std::rc::Rc;
 
 /// Render `children` when `when` is true, `fallback` otherwise.
@@ -63,32 +63,26 @@ where
 
 /// Stamp `key` onto `node` as the reconciliation marker.
 ///
-/// A node that already carries the marker keeps it: `annotate_hydration_tree`
-/// applies the same rule, so a key set here survives hydration annotation
-/// instead of being overwritten by a positional path.
+/// A node that already carries the marker keeps it: this and
+/// `annotate_hydration_tree` share [`crate::stamp_hydration_marker_if_absent`],
+/// so a key set here survives hydration annotation instead of being
+/// overwritten by a positional path.
 ///
 /// A `Fragment` is keyed by keying its children — it has no node of its own to
 /// carry the attribute, and the reconciler flattens fragments before matching.
+/// The children's paths come from [`crate::child_hydration_path`], the same
+/// scheme hydration annotation uses, so the two cannot drift.
 fn with_key(node: Node, key: &str) -> Node {
     match node {
         Node::Element(mut element) => {
-            if !element
-                .attributes
-                .iter()
-                .any(|attr| attr.name == crate::HYDRATION_NODE_ID_ATTR)
-            {
-                element.attributes.push(Attribute::new(
-                    crate::HYDRATION_NODE_ID_ATTR.to_string(),
-                    key.to_string(),
-                ));
-            }
+            crate::stamp_hydration_marker_if_absent(&mut element, || key.to_string());
             Node::Element(element)
         }
         Node::Fragment(children) => Node::Fragment(
             children
                 .into_iter()
                 .enumerate()
-                .map(|(index, child)| with_key(child, &format!("{key}.{index}")))
+                .map(|(index, child)| with_key(child, &crate::child_hydration_path(key, index)))
                 .collect(),
         ),
         // Text and Dynamic carry no attributes. A keyed list of bare text nodes
@@ -100,7 +94,7 @@ fn with_key(node: Node, key: &str) -> Node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Element, Render};
+    use crate::{Attribute, Element, Render};
 
     fn div(text: &str) -> Node {
         Node::Element(Element {
