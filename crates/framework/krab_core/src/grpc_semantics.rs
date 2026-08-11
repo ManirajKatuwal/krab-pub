@@ -10,7 +10,7 @@
 //!
 //! The module and its feature were called `grpc`, which implied otherwise at
 //! the point of `cargo add` — before anyone reads a caveat. See
-//! [ADR 0007](https://github.com/ManirajKatuwal/krab/blob/main/docs/adr/0007-grpc-feature-disposition.md).
+//! [ADR 0007](https://github.com/ManirajKatuwal/krab-pub/blob/main/docs/adr/0007-grpc-feature-disposition.md).
 //!
 //! A real transport is not foreclosed; it is simply a separate piece of work
 //! with its own ADR.

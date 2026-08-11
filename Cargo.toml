@@ -20,8 +20,8 @@ rust-version = "1.75"
 license = "MIT"
 authors = ["Maniraj Katuwal"]
 description = "A full-stack rust web framework"
-repository = "https://github.com/ManirajKatuwal/krab"
-homepage = "https://github.com/ManirajKatuwal/krab"
+repository = "https://github.com/ManirajKatuwal/krab-pub"
+homepage = "https://github.com/ManirajKatuwal/krab-pub"
 keywords = ["web", "ssr", "islands", "wasm", "framework"]
 categories = ["web-programming", "wasm", "development-tools"]
 

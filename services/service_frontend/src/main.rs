@@ -737,9 +737,9 @@ fn render_home_page_localized(locale: &str) -> String {
                             "The full-stack Rust framework designed for performance, type safety, and developer joy."
                         </p>
                         <div class="links">
-                            <a href="https://github.com/ManirajKatuwal/krab" class="btn btn-primary">"Get Started"</a>
+                            <a href="https://github.com/ManirajKatuwal/krab-pub" class="btn btn-primary">"Get Started"</a>
                             <a href="/docs" class="btn btn-secondary">"Documentation"</a>
-                            <a href="https://github.com/ManirajKatuwal/krab" class="btn btn-secondary">"GitHub"</a>
+                            <a href="https://github.com/ManirajKatuwal/krab-pub" class="btn btn-secondary">"GitHub"</a>
                         </div>
                     </header>
 

@@ -1,7 +1,7 @@
 //! Serving static assets safely.
 //!
 //! Ported from `krab_server` when that crate was removed (see
-//! [ADR 0005](https://github.com/ManirajKatuwal/krab/blob/main/docs/adr/0005-krab-server-disposition.md)).
+//! [ADR 0005](https://github.com/ManirajKatuwal/krab-pub/blob/main/docs/adr/0005-krab-server-disposition.md)).
 //! `tower_http::services::ServeDir` covers most of what that crate did, but the
 //! explicit canonicalise-and-compare in [`resolve_static_pkg_path`] is a
 //! security control worth keeping rather than re-deriving at each call site.

@@ -1,7 +1,7 @@
 //! Runtime behind `view!`'s built-in control-flow tags.
 //!
 //! `<Show>` and `<For>` expand into calls to [`show`] and [`for_each`]; see
-//! [ADR 0008](https://github.com/ManirajKatuwal/krab/blob/main/docs/adr/0008-view-control-flow-tags.md).
+//! [ADR 0008](https://github.com/ManirajKatuwal/krab-pub/blob/main/docs/adr/0008-view-control-flow-tags.md).
 //!
 //! Both return [`Node::Dynamic`], so they re-evaluate through the same effect
 //! machinery as any other reactive interpolation — there is no separate update

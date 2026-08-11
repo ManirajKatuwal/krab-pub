@@ -25,8 +25,8 @@ not take it.
 > checkout:
 >
 > ```sh
-> git clone https://github.com/ManirajKatuwal/krab.git
-> cargo install --path krab/crates/tooling/krab_cli
+> git clone https://github.com/ManirajKatuwal/krab-pub.git
+> cargo install --path krab-pub/crates/tooling/krab_cli
 > ```
 
 ---

@@ -1,6 +1,6 @@
 # krab_macros
 
-Procedural macros for the [Krab](https://github.com/ManirajKatuwal/krab)
+Procedural macros for the [Krab](https://github.com/ManirajKatuwal/krab-pub)
 full-stack Rust web framework.
 
 | Macro | Purpose |
@@ -22,8 +22,8 @@ krab_macros = "0.1"
 
 ## Documentation
 
-- [Server functions](https://github.com/ManirajKatuwal/krab/blob/main/docs/reference/server_functions.md)
-- [ADR 0003 — server functions as public endpoints](https://github.com/ManirajKatuwal/krab/blob/main/docs/adr/0003-server-functions-public-endpoints.md)
+- [Server functions](https://github.com/ManirajKatuwal/krab-pub/blob/main/docs/reference/server_functions.md)
+- [ADR 0003 — server functions as public endpoints](https://github.com/ManirajKatuwal/krab-pub/blob/main/docs/adr/0003-server-functions-public-endpoints.md)
 
 ## License
 

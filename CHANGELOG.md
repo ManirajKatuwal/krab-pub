@@ -170,7 +170,7 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 ### Changed
 
 - **First-public-release normalization.** Repository, homepage, clone, and
-  rustdoc URLs unified on `github.com/ManirajKatuwal/krab`; README gained
+  rustdoc URLs unified on `github.com/ManirajKatuwal/krab-pub`; README gained
   badges, a completed documentation map, and a consistent
   not-yet-on-crates.io installation story; generated artifacts
   (`docker/composed.nft.rendered.yaml`, `service_frontend/public/__ssg/`)

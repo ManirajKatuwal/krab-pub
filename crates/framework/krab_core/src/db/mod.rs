@@ -27,7 +27,7 @@
 //! Migration governance — checksums, drift detection, rollback rehearsal — is
 //! Postgres-only and stays that way. SQLite is supported as a development and
 //! embedded target; it does not carry the same governance guarantees. See
-//! [`docs/reference/database.md`](https://github.com/ManirajKatuwal/krab/blob/main/docs/reference/database.md).
+//! [`docs/reference/database.md`](https://github.com/ManirajKatuwal/krab-pub/blob/main/docs/reference/database.md).
 
 mod driver;
 pub use driver::{default_db_url_for_driver, resolve_db_driver, DbDriver};

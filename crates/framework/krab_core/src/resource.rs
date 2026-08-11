@@ -20,7 +20,7 @@
 //!
 //! # Server-side rendering
 //!
-//! Per [ADR 0009](https://github.com/ManirajKatuwal/krab/blob/main/docs/adr/0009-resource-ssr-semantics.md),
+//! Per [ADR 0009](https://github.com/ManirajKatuwal/krab-pub/blob/main/docs/adr/0009-resource-ssr-semantics.md),
 //! a resource never polls its future on the server. Construction and every read
 //! are pure signal operations: with an initial value it renders `Ready`,
 //! without one it renders `Pending`, and the fetch happens in the browser after

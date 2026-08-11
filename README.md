@@ -113,8 +113,8 @@ application, see the Installation section above.
 
 ```sh
 # Clone and configure
-git clone https://github.com/ManirajKatuwal/krab.git
-cd krab
+git clone https://github.com/ManirajKatuwal/krab-pub.git
+cd krab-pub
 cp .env.example .env
 # Edit .env with your local settings (DATABASE_URL, KRAB_AUTH_MODE, etc.)
 ```

@@ -1,7 +1,7 @@
 # krab_cli
 
 The `krab` command-line tool for the
-[Krab](https://github.com/ManirajKatuwal/krab) full-stack Rust web framework.
+[Krab](https://github.com/ManirajKatuwal/krab-pub) full-stack Rust web framework.
 
 ## Install
 
@@ -42,9 +42,9 @@ machine-readable results. These are the same binaries CI runs.
 
 ## Documentation
 
-- [Dev workflow](https://github.com/ManirajKatuwal/krab/blob/main/docs/guides/dev_workflow.md)
-- [Production readiness](https://github.com/ManirajKatuwal/krab/blob/main/docs/operations/production_readiness.md)
-- [Release policy](https://github.com/ManirajKatuwal/krab/blob/main/RELEASE_POLICY.md)
+- [Dev workflow](https://github.com/ManirajKatuwal/krab-pub/blob/main/docs/guides/dev_workflow.md)
+- [Production readiness](https://github.com/ManirajKatuwal/krab-pub/blob/main/docs/operations/production_readiness.md)
+- [Release policy](https://github.com/ManirajKatuwal/krab-pub/blob/main/RELEASE_POLICY.md)
 
 ## License
 

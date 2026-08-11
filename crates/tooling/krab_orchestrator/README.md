@@ -1,7 +1,7 @@
 # krab_orchestrator
 
 Multi-process service runner for
-[Krab](https://github.com/ManirajKatuwal/krab) workspaces.
+[Krab](https://github.com/ManirajKatuwal/krab-pub) workspaces.
 
 The orchestrator reads `krab.toml`, starts every declared service as a
 supervised child process, and manages them as one unit: health-aware startup
@@ -28,7 +28,7 @@ orchestrator is started from. The directory is created automatically on startup
 ## Configuration
 
 Services are declared in `krab.toml` at the workspace root. See
-[service composition](https://github.com/ManirajKatuwal/krab/blob/main/docs/architecture/service_composition.md)
+[service composition](https://github.com/ManirajKatuwal/krab-pub/blob/main/docs/architecture/service_composition.md)
 for the topology model.
 
 ## License
