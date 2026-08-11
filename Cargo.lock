@@ -1665,6 +1665,7 @@ dependencies = [
  "krab_core",
  "serde",
  "serde_json",
+ "serial_test",
  "tempfile",
  "toml 0.8.23",
 ]

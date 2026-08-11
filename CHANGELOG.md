@@ -47,6 +47,16 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
   module-by-module map of `krab_core` with its cross-cutting invariants,
   migrated from the maintainer wiki so the public docs carry them.
 
+- **`krab release check --json` exited 0 on failure.** The `--json` branch
+  printed the report and returned success, so any pipeline gating on the exit
+  code shipped through failed checks. Both output modes now share one exit
+  path: a failed report is a non-zero exit, and `--json` only changes what is
+  printed. In the same pass: an invalid `KRAB_PORT` no longer panics the
+  release check (`KrabConfig::from_env_checked` is used and a bad value is
+  reported as a failed `secrets_policy` check), and `release check` /
+  `release certify` no longer leak `KRAB_ENVIRONMENT=prod` into later gates
+  running in the same process — the prior value is saved and restored.
+
 ### Changed
 
 - **First-public-release normalization.** Repository, homepage, clone, and

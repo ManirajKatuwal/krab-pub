@@ -34,3 +34,4 @@ krab_core = { workspace = true, features = ["auth"] }
 
 [dev-dependencies]
 tempfile = "3"
+serial_test = "3"

@@ -218,101 +218,43 @@ pub(super) fn run_dependency_gate(diagnostics: bool) -> Result<()> {
     Ok(())
 }
 
+/// Sets an environment variable for the current scope and restores the prior
+/// value (or removes the variable) on drop, so release checks that evaluate
+/// policy under `KRAB_ENVIRONMENT=prod` do not leak that setting into later
+/// gates running in the same process.
+struct EnvVarGuard {
+    name: &'static str,
+    prior: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(name: &'static str, value: &str) -> Self {
+        let prior = std::env::var(name).ok();
+        std::env::set_var(name, value);
+        Self { name, prior }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.prior {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
+
 pub(super) fn run_release_check(diagnostics: bool, json: bool) -> Result<()> {
     if !json {
         println!("🚀 Running pre-flight release checklist...");
     }
 
-    let mut checks = std::collections::BTreeMap::new();
-    let mut all_passed = true;
-
-    std::env::set_var("KRAB_ENVIRONMENT", "prod");
-    let config = krab_core::config::KrabConfig::from_env("krab_cli", 8080);
-    let secrets_report = config.validate_secrets_sources();
-    if secrets_report.has_errors() {
-        checks.insert(
-            "secrets_policy",
-            serde_json::json!({
-                "status": "failed",
-                "issues": secrets_report.issues.iter()
-                    .filter(|i| i.severity == krab_core::config::SecretIssueSeverity::Error)
-                    .map(|i| i.reason.clone())
-                    .collect::<Vec<_>>()
-            }),
-        );
-        all_passed = false;
-    } else {
-        checks.insert("secrets_policy", serde_json::json!({ "status": "passed" }));
-    }
-
-    let mut headers_present = false;
-    let mut files = Vec::new();
-    let _ = collect_rust_files_under(Path::new("services"), &mut files);
-    let _ = collect_rust_files_under(Path::new("crates/framework"), &mut files);
-    for file in &files {
-        if check_code_pattern_present(file.to_str().unwrap_or(""), "security_headers_middleware") {
-            headers_present = true;
-            break;
-        }
-    }
-    checks.insert(
-        "secure_headers",
-        serde_json::json!({ "status": if headers_present { "passed" } else { "failed" } }),
-    );
-    if !headers_present {
-        all_passed = false;
-    }
-
-    let mut csrf_present = false;
-    for file in &files {
-        if check_code_pattern_present(file.to_str().unwrap_or(""), "csrf_protection_middleware") {
-            csrf_present = true;
-            break;
-        }
-    }
-    checks.insert(
-        "csrf_strategy",
-        serde_json::json!({ "status": if csrf_present { "passed" } else { "failed" } }),
-    );
-    if !csrf_present {
-        all_passed = false;
-    }
-
-    let mut telemetry_present = false;
-    for file in &files {
-        if check_code_pattern_present(
-            file.to_str().unwrap_or(""),
-            "krab_core::telemetry::init_tracing",
-        ) {
-            telemetry_present = true;
-            break;
-        }
-    }
-    checks.insert(
-        "telemetry_initialization",
-        serde_json::json!({ "status": if telemetry_present { "passed" } else { "failed" } }),
-    );
-    if !telemetry_present {
-        all_passed = false;
-    }
-
-    let deny_result = run_dependency_gate(diagnostics);
-    checks.insert(
-        "dependency_gate",
-        serde_json::json!({ "status": if deny_result.is_ok() { "passed" } else { "failed" } }),
-    );
-    if deny_result.is_err() {
-        all_passed = false;
-    }
+    let report = collect_release_check_report(diagnostics);
 
     if json {
-        let output = serde_json::json!({
-            "success": all_passed,
-            "checks": checks,
-        });
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        for (name, result) in &checks {
+        for (name, result) in &report.checks {
             let status = result
                 .get("status")
                 .and_then(|v| v.as_str())
@@ -329,37 +271,71 @@ pub(super) fn run_release_check(diagnostics: bool, json: bool) -> Result<()> {
                 }
             }
         }
-        if all_passed {
+        if report.success {
             println!("🎉 All release checks passed!");
-        } else {
-            anyhow::bail!("One or more release checks failed.");
         }
     }
 
-    Ok(())
+    finish_release_check(&report)
+}
+
+/// The exit-code contract for `krab release check`: a failed report is a
+/// non-zero exit in every output mode. `--json` only changes what is printed,
+/// never the exit status.
+fn finish_release_check(report: &ReleaseCheckReport) -> Result<()> {
+    if report.success {
+        Ok(())
+    } else {
+        anyhow::bail!("One or more release checks failed.");
+    }
+}
+
+/// Evaluate the secrets policy under prod rules and record the result.
+/// Invalid configuration (for example a malformed `KRAB_PORT`) is a failed
+/// check, not a panic. Returns whether the check passed.
+fn collect_secrets_policy_check(checks: &mut BTreeMap<&'static str, serde_json::Value>) -> bool {
+    match krab_core::config::KrabConfig::from_env_checked("krab_cli", 8080) {
+        Ok(config) => {
+            let secrets_report = config.validate_secrets_sources();
+            if secrets_report.has_errors() {
+                checks.insert(
+                    "secrets_policy",
+                    serde_json::json!({
+                        "status": "failed",
+                        "issues": secrets_report.issues.iter()
+                            .filter(|i| i.severity == krab_core::config::SecretIssueSeverity::Error)
+                            .map(|i| i.reason.clone())
+                            .collect::<Vec<_>>()
+                    }),
+                );
+                false
+            } else {
+                checks.insert("secrets_policy", serde_json::json!({ "status": "passed" }));
+                true
+            }
+        }
+        Err(err) => {
+            checks.insert(
+                "secrets_policy",
+                serde_json::json!({
+                    "status": "failed",
+                    "issues": [format!("invalid configuration: {err}")]
+                }),
+            );
+            false
+        }
+    }
 }
 
 fn collect_release_check_report(diagnostics: bool) -> ReleaseCheckReport {
     let mut checks = BTreeMap::new();
     let mut all_passed = true;
 
-    std::env::set_var("KRAB_ENVIRONMENT", "prod");
-    let config = krab_core::config::KrabConfig::from_env("krab_cli", 8080);
-    let secrets_report = config.validate_secrets_sources();
-    if secrets_report.has_errors() {
-        checks.insert(
-            "secrets_policy",
-            serde_json::json!({
-                "status": "failed",
-                "issues": secrets_report.issues.iter()
-                    .filter(|i| i.severity == krab_core::config::SecretIssueSeverity::Error)
-                    .map(|i| i.reason.clone())
-                    .collect::<Vec<_>>()
-            }),
-        );
+    // Secrets policy is evaluated under prod rules; the guard restores the
+    // caller's KRAB_ENVIRONMENT once the report has been collected.
+    let _env_guard = EnvVarGuard::set("KRAB_ENVIRONMENT", "prod");
+    if !collect_secrets_policy_check(&mut checks) {
         all_passed = false;
-    } else {
-        checks.insert("secrets_policy", serde_json::json!({ "status": "passed" }));
     }
 
     let mut headers_present = false;
@@ -413,20 +389,20 @@ fn collect_release_check_report(diagnostics: bool) -> ReleaseCheckReport {
         all_passed = false;
     }
 
-    let deny_result = run_dependency_gate(diagnostics);
-    checks.insert(
-        "dependency_gate",
-        serde_json::json!({ "status": if deny_result.is_ok() { "passed" } else { "failed" } }),
-    );
-    if let Err(err) = deny_result {
-        checks.insert(
-            "dependency_gate",
-            serde_json::json!({
-                "status": "failed",
-                "error": err.to_string(),
-            }),
-        );
-        all_passed = false;
+    match run_dependency_gate(diagnostics) {
+        Ok(()) => {
+            checks.insert("dependency_gate", serde_json::json!({ "status": "passed" }));
+        }
+        Err(err) => {
+            checks.insert(
+                "dependency_gate",
+                serde_json::json!({
+                    "status": "failed",
+                    "error": err.to_string(),
+                }),
+            );
+            all_passed = false;
+        }
     }
 
     ReleaseCheckReport {
@@ -828,10 +804,94 @@ fn run_protocol_version_compatibility_check() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_release_certification_index, render_release_certification_index_markdown,
-        CertificationStepReport, ReleaseCertificationReport,
+        build_release_certification_index, collect_secrets_policy_check, finish_release_check,
+        render_release_certification_index_markdown, CertificationStepReport, EnvVarGuard,
+        ReleaseCertificationReport, ReleaseCheckReport,
     };
+    use serial_test::serial;
+    use std::collections::BTreeMap;
     use std::path::Path;
+
+    #[test]
+    fn failed_release_check_report_exits_nonzero_regardless_of_output_mode() {
+        let mut checks = BTreeMap::new();
+        checks.insert("secrets_policy", serde_json::json!({ "status": "failed" }));
+        let failed = ReleaseCheckReport {
+            success: false,
+            checks,
+        };
+
+        // `finish_release_check` is the single exit path for both `--json` and
+        // plain output; a failed report must be an error (non-zero exit).
+        assert!(finish_release_check(&failed).is_err());
+
+        let passed = ReleaseCheckReport {
+            success: true,
+            checks: BTreeMap::new(),
+        };
+        assert!(finish_release_check(&passed).is_ok());
+    }
+
+    #[test]
+    fn failed_release_check_report_serializes_success_false() {
+        let mut checks = BTreeMap::new();
+        checks.insert("secrets_policy", serde_json::json!({ "status": "failed" }));
+        let report = ReleaseCheckReport {
+            success: false,
+            checks,
+        };
+
+        let rendered = serde_json::to_string_pretty(&report).expect("report should serialize");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&rendered).expect("report should round-trip");
+        assert_eq!(parsed.get("success"), Some(&serde_json::Value::Bool(false)));
+    }
+
+    #[test]
+    #[serial]
+    fn env_var_guard_restores_prior_value_and_absence() {
+        std::env::set_var("KRAB_RELEASE_OPS_TEST_VAR", "before");
+        {
+            let _guard = EnvVarGuard::set("KRAB_RELEASE_OPS_TEST_VAR", "prod");
+            assert_eq!(
+                std::env::var("KRAB_RELEASE_OPS_TEST_VAR").as_deref(),
+                Ok("prod")
+            );
+        }
+        assert_eq!(
+            std::env::var("KRAB_RELEASE_OPS_TEST_VAR").as_deref(),
+            Ok("before")
+        );
+
+        std::env::remove_var("KRAB_RELEASE_OPS_TEST_VAR");
+        {
+            let _guard = EnvVarGuard::set("KRAB_RELEASE_OPS_TEST_VAR", "prod");
+        }
+        assert!(std::env::var("KRAB_RELEASE_OPS_TEST_VAR").is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn invalid_krab_port_is_a_failed_check_not_a_panic() {
+        let _env = EnvVarGuard::set("KRAB_ENVIRONMENT", "prod");
+        let _port = EnvVarGuard::set("KRAB_PORT", "not-a-port");
+
+        let mut checks = BTreeMap::new();
+        let passed = collect_secrets_policy_check(&mut checks);
+
+        assert!(!passed, "invalid KRAB_PORT must fail the secrets check");
+        let entry = checks
+            .get("secrets_policy")
+            .expect("secrets_policy check should be recorded");
+        assert_eq!(entry.get("status").and_then(|v| v.as_str()), Some("failed"));
+        let issues = entry
+            .get("issues")
+            .and_then(|v| v.as_array())
+            .expect("failed check should carry issues");
+        assert!(issues
+            .iter()
+            .any(|issue| issue.as_str().unwrap_or_default().contains("KRAB_PORT")));
+    }
 
     #[test]
     fn certification_index_tracks_summary_paths() {
