@@ -79,3 +79,10 @@ opt-level = "z"
 [profile.dev]
 debug = true
 
+# Dependencies get no debuginfo: nobody steps into sqlx or axum in a debugger,
+# and dependency debuginfo dominates dev-profile artifact size and link time.
+# Workspace crates keep full debuginfo via [profile.dev] above — Cargo excludes
+# workspace members (path dependencies) from the "*" package spec.
+[profile.dev.package."*"]
+debug = false
+

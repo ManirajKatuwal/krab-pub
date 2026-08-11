@@ -16,7 +16,13 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **Dev profile no longer emits debuginfo for dependency crates**
+  (`[profile.dev.package."*"] debug = false`), cutting dev target size and
+  link time. Workspace crates keep full debuginfo: Cargo excludes workspace
+  members (path dependencies) from the `"*"` package spec, so `[profile.dev]
+  debug = true` still applies to them.
 
 ---
 
