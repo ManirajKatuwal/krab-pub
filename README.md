@@ -54,13 +54,13 @@ All five crates are on [crates.io](https://crates.io/crates/krab_core) as of
 
 Krab is five crates. Most applications need two:
 
-| Crate | Purpose |
-|---|---|
-| [`krab_core`](crates/framework/krab_core/) | Runtime: config, HTTP, database, telemetry, signals, protocol |
-| [`krab_macros`](crates/framework/krab_macros/) | `view!`, `#[island]`, `#[server]` |
-| [`krab_client`](crates/framework/krab_client/) | WASM island hydration, for the browser bundle |
-| [`krab_cli`](crates/tooling/krab_cli/) | The `krab` binary: scaffolding, dev workflow, governance |
-| [`krab_orchestrator`](crates/tooling/krab_orchestrator/) | Multi-process service runner driven by `krab.toml` |
+| Crate | Purpose | Source |
+|---|---|---|
+| [`krab_core`](https://crates.io/crates/krab_core) | Runtime: config, HTTP, database, telemetry, signals, protocol | [crates/framework/krab_core/](crates/framework/krab_core/) |
+| [`krab_macros`](https://crates.io/crates/krab_macros) | `view!`, `#[island]`, `#[server]` | [crates/framework/krab_macros/](crates/framework/krab_macros/) |
+| [`krab_client`](https://crates.io/crates/krab_client) | WASM island hydration, for the browser bundle | [crates/framework/krab_client/](crates/framework/krab_client/) |
+| [`krab_cli`](https://crates.io/crates/krab_cli) | The `krab` binary: scaffolding, dev workflow, governance | [crates/tooling/krab_cli/](crates/tooling/krab_cli/) |
+| [`krab_orchestrator`](https://crates.io/crates/krab_orchestrator) | Multi-process service runner driven by `krab.toml` | [crates/tooling/krab_orchestrator/](crates/tooling/krab_orchestrator/) |
 
 ### Add to a project
 
