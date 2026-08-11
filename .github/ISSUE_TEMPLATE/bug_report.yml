@@ -1,0 +1,46 @@
+name: Bug report
+description: Something in Krab behaves incorrectly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: check [docs/guides/troubleshooting.md](../../docs/guides/troubleshooting.md) —
+        hydration, service-startup, and local-vs-CI issues are covered there.
+        **Security vulnerabilities do not go here** — use the private
+        [Report a vulnerability](../../security/advisories) flow instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal steps or code. For `view!`/`#[island]` issues, the smallest component that shows it.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Krab version / commit
+      placeholder: "0.2.0, or a commit hash"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: "rustc 1.75, Windows 11 / Ubuntu 24.04, KRAB_DB_DRIVER=postgres, browser if hydration-related"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / output
+      description: Relevant `tracing` output, compiler errors, or browser-console diagnostics. Redact secrets.
+      render: text

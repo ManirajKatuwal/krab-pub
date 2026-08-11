@@ -2,6 +2,9 @@
 
 Thank you for your interest in contributing to Krab! This guide defines the required workflow, quality gates, and engineering standards for all contributions.
 
+Participation in this project is governed by the
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
 ---
 
 ## Prerequisites

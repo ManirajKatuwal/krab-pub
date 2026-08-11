@@ -1,0 +1,29 @@
+name: Feature request
+description: Propose new framework capability or an API change
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check [docs/roadmap.md](../../docs/roadmap.md) and the
+        [ADRs](../../docs/adr/) first — some gaps (component composition,
+        reactive attributes, progressive streaming) are known and tracked.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can't you do today, and in what kind of application?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed shape
+      description: API sketch, config knob, or behavior — whatever level you have.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you tried, or how other frameworks solve it.
