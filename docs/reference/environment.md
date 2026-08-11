@@ -91,8 +91,8 @@ Required when `KRAB_AUTH_MODE=jwt`.
 
 | Variable | Required | Default | Accepts |
 |---|---|---|---|
-| `KRAB_OIDC_ISSUER` | **Conditional** | — | Expected `iss`. Checked strictly |
-| `KRAB_OIDC_AUDIENCE` | **Conditional** | — | Expected `aud`. Checked strictly |
+| `KRAB_OIDC_ISSUER` | **Conditional** | — | Expected `iss`. Checked strictly. **Required in staging/prod** when `KRAB_AUTH_MODE=jwt\|oidc` unless every provider in `KRAB_JWT_PROVIDERS_JSON` declares its own `issuer`; startup fails otherwise |
+| `KRAB_OIDC_AUDIENCE` | **Conditional** | — | Expected `aud`. Checked strictly. **Required in staging/prod** when `KRAB_AUTH_MODE=jwt\|oidc` unless every provider in `KRAB_JWT_PROVIDERS_JSON` declares its own `audience`; startup fails otherwise |
 | `KRAB_JWT_SECRET` | Conditional | — | **Secret.** HMAC signing secret for symmetric algorithms |
 | `KRAB_JWT_KEYS_JSON` | Conditional | — | **Secret.** JSON key set for asymmetric verification and KID rotation |
 | `KRAB_JWT_PROVIDERS_JSON` | No | — | JSON array of providers, each with `name`, `issuer`, `audience`. Supports `_VAULT_REF` |

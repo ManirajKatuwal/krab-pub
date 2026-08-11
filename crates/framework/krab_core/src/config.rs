@@ -407,12 +407,76 @@ impl KrabConfig {
                     self.environment.as_str()
                 );
             }
+
+            // Issuer/audience validation is only performed when the values are
+            // configured, so outside dev they must BE configured or a token
+            // from any issuer, minted for any audience, verifies. The fallback
+            // tuple enforces KRAB_OIDC_ISSUER + KRAB_OIDC_AUDIENCE above; a
+            // provider bundle must declare both per provider.
+            if has_provider_bundle {
+                self.require_issuer_and_audience_in_provider_bundle()?;
+            }
         } else {
             anyhow::bail!(
                 "Unsupported KRAB_AUTH_MODE='{}' in '{}' environment; use jwt or oidc",
                 auth_mode,
                 self.environment.as_str()
             );
+        }
+
+        Ok(())
+    }
+
+    /// Enforce that every provider in `KRAB_JWT_PROVIDERS_JSON` declares a
+    /// non-empty `issuer` and `audience`. Called only outside dev.
+    ///
+    /// When the bundle is sourced through an unresolvable reference (a
+    /// `*_VAULT_REF` with no runtime vault resolution) this fails too — the
+    /// secrets-source policy already rejects that configuration in
+    /// staging/prod, and a bundle whose contents cannot be inspected cannot
+    /// be certified to validate issuer and audience.
+    fn require_issuer_and_audience_in_provider_bundle(&self) -> anyhow::Result<()> {
+        let raw = match read_env_or_file("KRAB_JWT_PROVIDERS_JSON") {
+            Ok(Some(raw)) => raw,
+            Ok(None) => return Ok(()),
+            Err(err) => {
+                return Err(err.context(format!(
+                    "KRAB_JWT_PROVIDERS_JSON could not be resolved in '{}' environment",
+                    self.environment.as_str()
+                )))
+            }
+        };
+
+        let parsed: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|err| anyhow::anyhow!("KRAB_JWT_PROVIDERS_JSON is not valid JSON: {err}"))?;
+        let providers = parsed
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("KRAB_JWT_PROVIDERS_JSON must be a JSON array"))?;
+
+        for (index, provider) in providers.iter().enumerate() {
+            let name = provider
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| format!("#{index}"));
+            let non_empty = |key: &str| {
+                provider
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .is_some_and(|v| !v.is_empty())
+            };
+
+            if !non_empty("issuer") || !non_empty("audience") {
+                anyhow::bail!(
+                    "JWT provider '{}' in KRAB_JWT_PROVIDERS_JSON must declare non-empty \
+                     'issuer' and 'audience' in '{}' environment; issuer/audience validation \
+                     only runs when they are configured, so leaving them unset would accept \
+                     tokens from any issuer for any audience",
+                    name,
+                    self.environment.as_str()
+                );
+            }
         }
 
         Ok(())
@@ -906,6 +970,89 @@ mod tests {
         assert!(
             err.contains("JWT/OIDC provider configuration required")
                 || err.contains("Secrets policy violation")
+                || err.contains("KRAB_JWT_PROVIDERS_JSON could not be resolved"),
+            "unexpected error: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issuer/audience enforcement outside dev
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn validate_rejects_provider_bundle_missing_audience_in_prod() {
+        let _guard = env_lock();
+        clear_auth_env();
+        std::env::set_var("KRAB_ENVIRONMENT", "prod");
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_CORS_ORIGINS", "https://app.example.com");
+        std::env::set_var(
+            "KRAB_JWT_PROVIDERS_JSON",
+            r#"[{"name":"main","issuer":"https://issuer.example.com","keys":{"default":"k"}}]"#,
+        );
+
+        let cfg = KrabConfig::from_env("users", 3002);
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("must declare non-empty 'issuer' and 'audience'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn validate_rejects_provider_bundle_missing_issuer_in_staging() {
+        let _guard = env_lock();
+        clear_auth_env();
+        std::env::set_var("KRAB_ENVIRONMENT", "staging");
+        std::env::set_var("KRAB_AUTH_MODE", "oidc");
+        std::env::set_var("KRAB_CORS_ORIGINS", "https://app.example.com");
+        std::env::set_var(
+            "KRAB_JWT_PROVIDERS_JSON",
+            r#"[{"name":"main","audience":"krab-api","keys":{"default":"k"}}]"#,
+        );
+
+        let cfg = KrabConfig::from_env("users", 3002);
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("must declare non-empty 'issuer' and 'audience'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn validate_accepts_provider_bundle_with_issuer_and_audience_in_prod() {
+        let _guard = env_lock();
+        clear_auth_env();
+        std::env::set_var("KRAB_ENVIRONMENT", "prod");
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_CORS_ORIGINS", "https://app.example.com");
+        std::env::set_var(
+            "KRAB_JWT_PROVIDERS_JSON",
+            r#"[{"name":"main","issuer":"https://issuer.example.com","audience":"krab-api","keys":{"default":"k"}}]"#,
+        );
+
+        let cfg = KrabConfig::from_env("users", 3002);
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// Dev keeps its current, permissive behaviour: a provider bundle without
+    /// issuer/audience is accepted (validate() skips all checks in dev).
+    #[test]
+    #[serial]
+    fn validate_accepts_provider_bundle_without_issuer_in_dev() {
+        let _guard = env_lock();
+        clear_auth_env();
+        std::env::set_var("KRAB_ENVIRONMENT", "dev");
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var(
+            "KRAB_JWT_PROVIDERS_JSON",
+            r#"[{"name":"main","keys":{"default":"k"}}]"#,
+        );
+
+        let cfg = KrabConfig::from_env("users", 3002);
+        assert!(cfg.validate().is_ok());
     }
 }

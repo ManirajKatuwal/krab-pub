@@ -16,6 +16,18 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ## [Unreleased]
 
+### Security
+
+- **Issuer/audience validation can no longer be silently absent in
+  staging/prod.** `iss`/`aud` checks only run when the expected values are
+  configured, so a deployment that never set them accepted tokens from any
+  issuer, minted for any audience. With `KRAB_AUTH_MODE=jwt|oidc` outside
+  dev, startup now requires `KRAB_OIDC_ISSUER` + `KRAB_OIDC_AUDIENCE` (the
+  fallback-tuple path already did) and, when `KRAB_JWT_PROVIDERS_JSON` is
+  used, that **every** provider declares non-empty `issuer` and `audience`.
+  Dev behaviour is unchanged. Documented in `.env.example` and
+  `docs/reference/environment.md`.
+
 ### Fixed
 
 - **`Dockerfile.service` builds again.** The dependency-cache stage still
