@@ -1,3 +1,85 @@
+//! Browser-side runtime for Krab's island architecture.
+//!
+//! Krab renders a page on the server and ships it as HTML. Only the
+//! interactive parts — *islands* — are then brought to life in the browser by
+//! this crate. It is the WASM half of the framework: it adopts the
+//! server-rendered DOM instead of rebuilding it, wires event listeners onto the
+//! nodes that are already there, and keeps [`Node::Dynamic`] regions in sync
+//! with the reactive graph re-exported from `krab_core`.
+//!
+//! # The `web` feature
+//!
+//! Everything that touches the DOM is behind the `web` feature. Without it the
+//! crate still compiles — so a workspace-wide `cargo check` on the host target
+//! succeeds — but [`hydrate`] does nothing and the DOM entry points below are
+//! not compiled at all. Anything built for the browser must enable `web`.
+//!
+//! The optional `debug` feature adds informational `console.log` tracing of the
+//! hydration pass. Warnings and errors are always reported; `debug` only
+//! controls the chatter, so production bundles stay quiet.
+//!
+//! # The hydration model
+//!
+//! The server emits each island as an element carrying `data-island` (the
+//! registered component name), `data-props` (its JSON props), and a
+//! `data-krab-boundary-id`. [`hydrate`] finds those elements, rebuilds each
+//! island's virtual tree by calling the factory registered for its name, and
+//! walks that tree against the live DOM:
+//!
+//! - a matching element is **reused**, and its listeners are attached to it;
+//! - a text node whose content differs is **patched in place**, which is what
+//!   lets a selection or an IME composition survive hydration;
+//! - only a genuine shape mismatch causes a node to be replaced.
+//!
+//! Every boundary is stamped with the outcome — `data-krab-boundary-state`
+//! (`ok`, `patched`, `error`, `missing-definition`, …) and
+//! `data-krab-boundary-mismatches` — so monitoring can see a drifting boundary
+//! without reading the console.
+//!
+//! That stamp is also what makes hydration **idempotent**. The server ships
+//! `data-krab-boundary-state="ssr"`; a boundary whose state has moved off `ssr`
+//! is skipped, so a second pass cannot bind a second copy of every handler.
+//! [`unmount`] reverses a pass — releasing event closures and dynamic-region
+//! effects, and clearing the stamp — so `unmount` followed by
+//! [`hydrate_within`] is a supported re-hydration cycle.
+//!
+//! # Usage
+//!
+//! Islands register themselves; the application only has to call [`hydrate`]
+//! once the WASM module is loaded.
+//!
+//! ```ignore
+//! use krab_client::{create_signal, hydrate};
+//! use krab_macros::{island, view};
+//!
+//! #[island]
+//! fn Counter(start: i32) -> Node {
+//!     let (count, set_count) = create_signal(start);
+//!     view! {
+//!         <button on:click={move |_| set_count.set(count.get() + 1)}>
+//!             {move || count.get().to_string()}
+//!         </button>
+//!     }
+//! }
+//!
+//! // Entry point invoked from the page once the module is instantiated.
+//! #[wasm_bindgen(start)]
+//! pub fn main() {
+//!     hydrate();
+//! }
+//! ```
+//!
+//! To bring up a fragment that arrived after the initial load — a modal, a
+//! client-routed view — hydrate just that subtree, and release it when it goes
+//! away:
+//!
+//! ```ignore
+//! krab_client::hydrate_within(&panel);
+//! // …later…
+//! krab_client::unmount(&panel);
+//! panel.remove();
+//! ```
+
 extern crate self as krab_client;
 
 use krab_core::Node;
@@ -6,6 +88,9 @@ use std::cell::{Cell, RefCell};
 #[cfg(feature = "web")]
 use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "web")]
+// Only the non-wasm32 island error boundary uses these; on wasm32 the target is
+// `panic = "abort"` and the boundary is deliberately absent. See `hydrate_island`.
+#[cfg(not(target_arch = "wasm32"))]
 use std::panic::{catch_unwind, AssertUnwindSafe};
 #[cfg(feature = "web")]
 use std::rc::Rc;
@@ -14,14 +99,41 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::console;
 #[cfg(feature = "web")]
-use web_sys::{Element, HtmlElement, Node as WebNode, NodeList};
+use web_sys::{Element, Node as WebNode, NodeList};
 
 #[cfg(feature = "web")]
 type EventClosure = Closure<dyn FnMut(web_sys::Event)>;
 #[cfg(feature = "web")]
 type EventClosureMap = std::collections::HashMap<u32, Vec<(String, EventClosure)>>;
 #[cfg(feature = "web")]
-type DynamicRegionMap = std::collections::HashMap<u32, Rc<RefCell<Vec<WebNode>>>>;
+type DynamicRegionMap = std::collections::HashMap<u32, DynamicRegionCells>;
+
+/// Reports what happened at a boundary. Read to decide whether a boundary has
+/// already been hydrated, written on the way through, and cleared by
+/// [`unmount`].
+#[cfg(feature = "web")]
+const BOUNDARY_STATE_ATTR: &str = "data-krab-boundary-state";
+
+/// The value `#[island]` stamps on server-rendered markup: "rendered, never
+/// hydrated". Every other value on this attribute was written by a client that
+/// already claimed the boundary.
+#[cfg(feature = "web")]
+const BOUNDARY_STATE_SSR: &str = "ssr";
+
+/// Whether a boundary has already been claimed by a hydration pass.
+///
+/// The attribute's *presence* cannot answer this: `#[island]` ships
+/// `data-krab-boundary-state="ssr"` from the server, so presence is the normal
+/// state of un-hydrated markup. Only a value other than `ssr` means a client
+/// has been here — `hydrating`, the terminal states this crate writes, or
+/// `minimal_js` from the no-WASM escape hatch, whose islands already carry
+/// hand-wired listeners and must not be hydrated over either.
+#[cfg(feature = "web")]
+fn boundary_is_hydrated(element: &Element) -> bool {
+    element
+        .get_attribute(BOUNDARY_STATE_ATTR)
+        .is_some_and(|state| state != BOUNDARY_STATE_SSR)
+}
 
 // Holds event-listener closures for the lifetime of the page or node so they are not
 // dropped (which would invalidate the JS function pointer) but also not
@@ -30,16 +142,20 @@ type DynamicRegionMap = std::collections::HashMap<u32, Rc<RefCell<Vec<WebNode>>>
 thread_local! {
     static EVENT_CLOSURES: RefCell<EventClosureMap> = RefCell::new(EventClosureMap::new());
     static NEXT_DOM_ID: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
-    /// The rendered run of every live [`Node::Dynamic`] region, keyed by the
-    /// `__krab_region` expando on its anchor comment. A parent that tracks a
-    /// nested region by its anchor uses this to remove the region's *content*
-    /// too — the anchor alone cannot reach it.
+    /// Every live [`Node::Dynamic`] region, keyed by the `__krab_region`
+    /// expando on its anchor comment. A parent that tracks a nested region by
+    /// its anchor uses this to reach the region's *content* and its effect —
+    /// the anchor alone cannot reach either.
     static DYNAMIC_REGIONS: RefCell<DynamicRegionMap> = RefCell::new(DynamicRegionMap::new());
 }
 
 pub use krab_core::signal::*;
 
 pub mod components;
+// The module stays (its items are individually `cfg`'d, so a file-level
+// `#![cfg]` would break this re-export), but with `demo-islands` off it is
+// empty and the glob has nothing to import.
+#[cfg(feature = "demo-islands")]
 pub use components::*;
 
 pub mod router;
@@ -357,8 +473,259 @@ fn realign_node_by_hydration_id(
     (node_list.item(index), HydrationStats::default())
 }
 
+/// The island name → factory lookup, built once per hydration pass.
+///
+/// `inventory::iter` walks a runtime linked list, so resolving each boundary
+/// against it directly cost one linear scan *per island*: `n` islands against
+/// `m` registered definitions meant `n × m` string comparisons on every load.
+#[cfg(feature = "web")]
+fn island_factories() -> HashMap<&'static str, ComponentFactory> {
+    inventory::iter::<IslandDefinition>
+        .into_iter()
+        .map(|definition| (definition.name, definition.factory))
+        .collect()
+}
+
+/// Hydrate one island boundary against the DOM element the server rendered it
+/// into.
+///
+/// `ordinal` is only used to name a boundary whose markup predates
+/// `data-krab-boundary-id`.
+#[cfg(feature = "web")]
+fn hydrate_island(
+    element: &Element,
+    ordinal: u32,
+    factories: &HashMap<&'static str, ComponentFactory>,
+) {
+    // Idempotence. This function moves the boundary off `ssr` before anything
+    // else happens, so a non-`ssr` state means the boundary already owns a
+    // generation of event closures and region effects. Hydrating over it would
+    // bind a second copy of every handler and orphan the first — the leak that
+    // made callers strip `data-island` by hand after hydrating. `unmount`
+    // clears the state, which is how a re-hydration is requested.
+    if boundary_is_hydrated(element) {
+        return;
+    }
+
+    let Some(name) = element.get_attribute("data-island") else {
+        console::warn_1(&format!("Island element at index {ordinal} missing data-island").into());
+        return;
+    };
+
+    let boundary_id_attr = element.get_attribute("data-krab-boundary-id");
+    let boundary = HydrationBoundary {
+        island: name.clone(),
+        id: boundary_id_attr
+            .clone()
+            .unwrap_or_else(|| format!("{name}:legacy-{ordinal}")),
+    };
+    if boundary_id_attr.is_none() {
+        log_hydration_boundary_diagnostic(
+            "warn",
+            "hydrate",
+            &boundary,
+            "missing_boundary_id",
+            "server markup missing data-krab-boundary-id; using DOM index fallback",
+            None,
+        );
+    }
+
+    let _ = element.set_attribute("data-krab-boundary", &boundary.island);
+    let _ = element.set_attribute("data-krab-boundary-id", &boundary.id);
+    let _ = element.set_attribute("data-krab-boundary-mismatches", "0");
+    let _ = element.set_attribute(BOUNDARY_STATE_ATTR, "hydrating");
+
+    let props_json = element
+        .get_attribute("data-props")
+        .unwrap_or_else(|| "{}".to_string());
+
+    let Some(factory) = factories.get(name.as_str()).copied() else {
+        let _ = element.set_attribute(BOUNDARY_STATE_ATTR, "missing-definition");
+        log_hydration_boundary_diagnostic(
+            "error",
+            "hydrate",
+            &boundary,
+            "missing_island_definition",
+            "no registered island definition found",
+            None,
+        );
+        return;
+    };
+
+    #[cfg(feature = "debug")]
+    console::log_1(&format!("Hydrating island: {name}").into());
+
+    // A panicking island factory **cannot** be contained on wasm32, and this
+    // deliberately does not pretend otherwise. `wasm32-unknown-unknown` is
+    // `panic = "abort"` (`rustc --print cfg` confirms it), so `catch_unwind`
+    // never returns `Err`: the panic hook runs, then `unreachable` traps the
+    // module and the whole hydration pass dies — every island later in document
+    // order is left at `data-krab-boundary-state="ssr"`, unhydrated and inert,
+    // with no diagnostic. The instance stays callable afterwards, so the page
+    // looks fine. `tests/panic_boundary_browser.rs` demonstrates all of this.
+    //
+    // A `catch_unwind` here previously implied a recovery that never happened.
+    // Restoring real per-island isolation requires a JS-side `try`/`catch`
+    // around a per-island entry point, since only the JS boundary can observe a
+    // wasm trap; that is tracked separately.
+    #[cfg(target_arch = "wasm32")]
+    let node = factory(props_json);
+
+    // Off wasm32 — host builds that pick up `web` through workspace feature
+    // unification — unwinding is real, so the boundary genuinely contains a
+    // panicking factory and the fallback below is reachable.
+    #[cfg(not(target_arch = "wasm32"))]
+    let Ok(node) = catch_unwind(AssertUnwindSafe(|| factory(props_json))) else {
+        log_hydration_boundary_diagnostic(
+            "error",
+            "hydrate",
+            &boundary,
+            "factory_panic",
+            "factory panic captured",
+            None,
+        );
+        let _ = element.set_attribute(BOUNDARY_STATE_ATTR, "error");
+        element.set_inner_html("<div role=\"alert\">Hydration fallback rendered.</div>");
+        return;
+    };
+
+    let node = krab_core::annotate_hydration_tree(node, &boundary.id);
+    let factory_state = boundary_state_from_factory_node(&node);
+    let stats = hydrate_node(WebNode::from(element.clone()), &node, &boundary);
+    let mismatch_count = stats.mismatch_count();
+
+    let _ = element.set_attribute("data-krab-boundary-mismatches", &mismatch_count.to_string());
+    let _ = element.set_attribute(
+        BOUNDARY_STATE_ATTR,
+        classify_boundary_state(factory_state, mismatch_count),
+    );
+
+    if mismatch_count > 0 {
+        log_hydration_boundary_diagnostic(
+            "warn",
+            "hydrate",
+            &boundary,
+            "boundary_patched",
+            &format!(
+                "patched DOM during hydration (replacements={}, appends={}, removals={}, reorders={}, text_patches={})",
+                stats.replacements,
+                stats.appends,
+                stats.removals,
+                stats.reorders,
+                stats.text_patches
+            ),
+            None,
+        );
+    }
+}
+
+/// Hydrate only the islands inside `root`. Skips boundaries already hydrated.
+///
+/// `root` itself is hydrated too when it carries `data-island`, so a caller
+/// holding a single island element does not have to reach for its parent.
+///
+/// "Already hydrated" means `data-krab-boundary-state` has moved off the `ssr`
+/// value the server stamps. Calling this twice over the same subtree is
+/// therefore a no-op the second time rather than a double binding of every
+/// handler. [`unmount`] clears the attribute, so `unmount` followed by
+/// `hydrate_within` is the supported way to ask for a genuine re-hydration.
+#[cfg(feature = "web")]
+pub fn hydrate_within(root: &web_sys::Element) {
+    // One map for the whole pass, not one scan per boundary.
+    let factories = island_factories();
+    let mut ordinal = 0u32;
+
+    if root.has_attribute("data-island") {
+        hydrate_island(root, ordinal, &factories);
+        ordinal += 1;
+    }
+
+    let islands = match root.query_selector_all("[data-island]") {
+        Ok(nodes) => nodes,
+        Err(err) => {
+            console::error_1(
+                &format!(
+                    "{{\"scope\":\"hydrate\",\"detail\":\"query_selector_all failed\",\"error\":\"{err:?}\"}}"
+                )
+                .into(),
+            );
+            return;
+        }
+    };
+
+    for index in 0..islands.length() {
+        let Some(node) = islands.item(index) else {
+            console::warn_1(&format!("Missing island element at index {index}").into());
+            continue;
+        };
+        let Ok(element) = node.dyn_into::<Element>() else {
+            console::warn_1(&format!("Island node at index {index} is not an Element").into());
+            continue;
+        };
+        hydrate_island(&element, ordinal, &factories);
+        ordinal += 1;
+    }
+}
+
+/// Release every runtime resource held by `root`'s subtree: event closures,
+/// dynamic-region registrations, and region effects. Does not remove `root`.
+///
+/// Call this before discarding a hydrated subtree. Dropping the DOM alone is
+/// not enough: the event closures are owned by this crate (they have to be —
+/// dropping one invalidates the JS function pointer behind a live listener),
+/// and a dynamic region's effect stays subscribed to its signals, re-rendering
+/// detached nodes for the life of the page.
+///
+/// It also clears `data-krab-boundary-state` from `root` and every boundary
+/// beneath it, so the subtree is eligible for [`hydrate_within`] again.
+///
+/// # Limitation
+///
+/// A dynamic region that has not yet re-rendered has no anchor comment in the
+/// DOM and so cannot be found by a subtree walk; its effect is released when
+/// its enclosing region re-renders or is removed. Regions that have rendered at
+/// least once — the ones that own DOM — are always released here.
+#[cfg(feature = "web")]
+pub fn unmount(root: &web_sys::Element) {
+    release_dom_node_resources(root.as_ref());
+
+    let _ = root.remove_attribute(BOUNDARY_STATE_ATTR);
+    let Ok(boundaries) = root.query_selector_all(&format!("[{BOUNDARY_STATE_ATTR}]")) else {
+        return;
+    };
+    for index in 0..boundaries.length() {
+        let Some(element) = boundaries
+            .item(index)
+            .and_then(|node| node.dyn_into::<Element>().ok())
+        else {
+            continue;
+        };
+        let _ = element.remove_attribute(BOUNDARY_STATE_ATTR);
+    }
+}
+
+/// Number of DOM elements currently holding retained event closures.
+#[cfg(feature = "web")]
+#[doc(hidden)]
+pub fn event_closure_count() -> usize {
+    EVENT_CLOSURES.with(|closures| closures.borrow().len())
+}
+
+/// Number of dynamic regions currently registered against a live anchor.
+#[cfg(feature = "web")]
+#[doc(hidden)]
+pub fn dynamic_region_count() -> usize {
+    DYNAMIC_REGIONS.with(|regions| regions.borrow().len())
+}
+
+/// Hydrate every island in the document.
+///
+/// Delegates to [`hydrate_within`] over the document element, so the two share
+/// one implementation and one idempotence rule: a boundary whose
+/// `data-krab-boundary-state` has moved off `ssr` is left alone.
 #[wasm_bindgen]
 pub fn hydrate() {
+    #[cfg(feature = "debug")]
     console::log_1(&"Hydrating Krab app...".into());
 
     #[cfg(feature = "web")]
@@ -371,132 +738,14 @@ pub fn hydrate() {
             console::error_1(&"{\"scope\":\"hydrate\",\"detail\":\"missing document\"}".into());
             return;
         };
-
-        // Find all elements with data-island attribute
-        let islands = match document.query_selector_all("[data-island]") {
-            Ok(nodes) => nodes,
-            Err(err) => {
-                console::error_1(
-                    &format!(
-                        "{{\"scope\":\"hydrate\",\"detail\":\"query_selector_all failed\",\"error\":\"{:?}\"}}",
-                        err
-                    )
-                    .into(),
-                );
-                return;
-            }
+        let Some(root) = document.document_element() else {
+            console::error_1(
+                &"{\"scope\":\"hydrate\",\"detail\":\"missing document element\"}".into(),
+            );
+            return;
         };
 
-        for i in 0..islands.length() {
-            let Some(element) = islands.item(i) else {
-                console::warn_1(&format!("Missing island element at index {}", i).into());
-                continue;
-            };
-            let Ok(html_element) = element.clone().dyn_into::<HtmlElement>() else {
-                console::warn_1(
-                    &format!("Island node at index {} is not an HtmlElement", i).into(),
-                );
-                continue;
-            };
-
-            let Some(name) = html_element.get_attribute("data-island") else {
-                console::warn_1(
-                    &format!("Island element at index {} missing data-island", i).into(),
-                );
-                continue;
-            };
-            let boundary_id_attr = html_element.get_attribute("data-krab-boundary-id");
-            let boundary = HydrationBoundary {
-                island: name.clone(),
-                id: boundary_id_attr
-                    .clone()
-                    .unwrap_or_else(|| format!("{name}:legacy-{i}")),
-            };
-            if boundary_id_attr.is_none() {
-                log_hydration_boundary_diagnostic(
-                    "warn",
-                    "hydrate",
-                    &boundary,
-                    "missing_boundary_id",
-                    "server markup missing data-krab-boundary-id; using DOM index fallback",
-                    None,
-                );
-            }
-            let _ = html_element.set_attribute("data-krab-boundary", &boundary.island);
-            let _ = html_element.set_attribute("data-krab-boundary-id", &boundary.id);
-            let _ = html_element.set_attribute("data-krab-boundary-mismatches", "0");
-            let _ = html_element.set_attribute("data-krab-boundary-state", "hydrating");
-            let props_json = html_element
-                .get_attribute("data-props")
-                .unwrap_or_else(|| "{}".to_string());
-
-            // Find matching island definition
-            let definition = inventory::iter::<IslandDefinition>
-                .into_iter()
-                .find(|def| def.name == name);
-
-            if let Some(def) = definition {
-                console::log_1(&format!("Hydrating island: {}", name).into());
-                match catch_unwind(AssertUnwindSafe(|| (def.factory)(props_json))) {
-                    Ok(node) => {
-                        let node = krab_core::annotate_hydration_tree(node, &boundary.id);
-                        let factory_state = boundary_state_from_factory_node(&node);
-                        let stats = hydrate_node(element.clone(), &node, &boundary);
-                        let mismatch_count = stats.mismatch_count();
-                        let _ = html_element.set_attribute(
-                            "data-krab-boundary-mismatches",
-                            &mismatch_count.to_string(),
-                        );
-                        let _ = html_element.set_attribute(
-                            "data-krab-boundary-state",
-                            classify_boundary_state(factory_state, mismatch_count),
-                        );
-                        if mismatch_count > 0 {
-                            log_hydration_boundary_diagnostic(
-                                "warn",
-                                "hydrate",
-                                &boundary,
-                                "boundary_patched",
-                                &format!(
-                                    "patched DOM during hydration (replacements={}, appends={}, removals={}, reorders={}, text_patches={})",
-                                    stats.replacements,
-                                    stats.appends,
-                                    stats.removals,
-                                    stats.reorders,
-                                    stats.text_patches
-                                ),
-                                None,
-                            );
-                        }
-                    }
-                    Err(_) => {
-                        log_hydration_boundary_diagnostic(
-                            "error",
-                            "hydrate",
-                            &boundary,
-                            "factory_panic",
-                            "factory panic captured",
-                            None,
-                        );
-                        let _ = html_element.set_attribute("data-krab-boundary-state", "error");
-                        html_element.set_inner_html(
-                            "<div role=\"alert\">Hydration fallback rendered.</div>",
-                        );
-                    }
-                }
-            } else {
-                let _ =
-                    html_element.set_attribute("data-krab-boundary-state", "missing-definition");
-                log_hydration_boundary_diagnostic(
-                    "error",
-                    "hydrate",
-                    &boundary,
-                    "missing_island_definition",
-                    "no registered island definition found",
-                    None,
-                );
-            }
-        }
+        hydrate_within(&root);
     }
 }
 
@@ -537,7 +786,7 @@ fn hydrate_children(
             "removing extra DOM node that was not present in the expected tree",
             Some(&path),
         );
-        remove_dom_node_closures(&extra_node);
+        release_dom_node_resources(&extra_node);
         if let Err(err) = parent.remove_child(&extra_node) {
             console::error_1(
                 &format!(
@@ -554,15 +803,15 @@ fn hydrate_children(
     stats
 }
 
-/// Replace `old` with a freshly built node for `v_node`, releasing `old`'s
-/// event closures first so they are not leaked.
+/// Replace `old` with a freshly built node for `v_node`, releasing everything
+/// `old`'s subtree retains first so it is not leaked.
 #[cfg(feature = "web")]
 fn replace_dom_node(parent: &WebNode, old: &WebNode, v_node: &Node, scope: &str) {
     let Some(new_node) = create_dom_node(v_node) else {
         return;
     };
 
-    remove_dom_node_closures(old);
+    release_dom_node_resources(old);
     if let Err(err) = parent.replace_child(&new_node, old) {
         console::error_1(
             &format!(
@@ -597,13 +846,10 @@ fn append_dom_node(parent: &WebNode, v_node: &Node, scope: &str) {
 /// "closure invoked after being dropped" on the next event.
 #[cfg(feature = "web")]
 fn detach_element_events(real_el: &Element) {
-    let Ok(id_val) = js_sys::Reflect::get(real_el.as_ref(), &JsValue::from_str("__krab_id")) else {
+    let Some(id) = node_expando_id(real_el.as_ref(), "__krab_id") else {
         return;
     };
-    let Some(id) = id_val.as_f64() else {
-        return;
-    };
-    let Some(pairs) = EVENT_CLOSURES.with(|v| v.borrow_mut().remove(&(id as u32))) else {
+    let Some(pairs) = EVENT_CLOSURES.with(|closures| closures.borrow_mut().remove(&id)) else {
         return;
     };
     for (name, closure) in &pairs {
@@ -616,8 +862,18 @@ fn detach_element_events(real_el: &Element) {
 /// Closures are stashed in `EVENT_CLOSURES` under a per-element `__krab_id`
 /// rather than `forget()`ed: dropping them would invalidate the JS function
 /// pointer, and forgetting them would leak on every re-render.
+///
+/// Any binding already on the element is detached first. Without that, a second
+/// hydration pass over the same element allocated a *fresh* `__krab_id` and
+/// overwrote the expando, orphaning the previous generation of closures in
+/// `EVENT_CLOSURES` while their JS listeners stayed bound — so every handler
+/// fired twice and neither generation could ever be released. Detaching here
+/// rather than at each call site makes "attach" mean "these are now the
+/// element's listeners", which is the only invariant the callers actually want.
 #[cfg(feature = "web")]
 fn attach_element_events(real_el: &Element, v_el: &krab_core::Element, scope: &str) {
+    detach_element_events(real_el);
+
     let mut node_closures = Vec::new();
 
     for event in &v_el.events {
@@ -831,13 +1087,17 @@ fn hydrate_recursive(
     boundary: &HydrationBoundary,
     path: &str,
 ) -> HydrationStats {
-    let real_node_opt = node_list.item(index);
-
     match v_node {
         Node::Element(v_el) => {
             hydrate_element(parent, node_list, index, v_node, v_el, boundary, path)
         }
-        Node::Text(text) => hydrate_text(parent, real_node_opt, v_node, text, boundary, path),
+        // `item` is resolved here rather than up front: it crosses the JS
+        // boundary, and this is the only arm that consumes it. The element arm
+        // does its own lookup (possibly at a realigned index), and the fragment
+        // and dynamic arms never touch the node at `index` directly.
+        Node::Text(text) => {
+            hydrate_text(parent, node_list.item(index), v_node, text, boundary, path)
+        }
         Node::Fragment(children) => {
             let mut consumed = 0;
             let mut stats = HydrationStats::default();
@@ -864,33 +1124,32 @@ fn hydrate_recursive(
                 // report every following sibling as a mismatch.
                 anchor: Rc::new(RefCell::new(None)),
                 empty_position: Rc::new(RefCell::new(None)),
+                effect: Rc::new(RefCell::new(None)),
             };
 
             // The initial hydration runs *inside* the effect's first run, so a
-            // Dynamic nested in the SSR content creates its own effect while
-            // this one is current - making it an owned child that is disposed
-            // when this region re-renders. Hydrating first and creating the
-            // effect afterwards left every nested region's effect in
-            // `ROOT_EFFECTS`: immortal, subscribed, and re-rendering detached
-            // DOM for the life of the page.
-            let stats_cell: Rc<RefCell<HydrationStats>> =
-                Rc::new(RefCell::new(HydrationStats::default()));
+            // Dynamic nested in the SSR content is set up while this one is
+            // current and can therefore be handed to it for disposal (see
+            // `own_region_effect_by_enclosing_effect`). Hydrating first and
+            // creating the effect afterwards left every nested region's effect
+            // in `ROOT_EFFECTS`: immortal, subscribed, and re-rendering
+            // detached DOM for the life of the page.
+            // `Cell`, not `RefCell`: `HydrationStats` is `Copy`, and reading it
+            // back as this arm's value must not leave a borrow guard alive
+            // longer than the cell it came from.
+            let stats_cell: Rc<Cell<HydrationStats>> =
+                Rc::new(Cell::new(HydrationStats::default()));
 
             let f = f.clone();
             let first_run = Rc::new(Cell::new(true));
-            let effect_cells = DynamicRegionCells {
-                rendered: cells.rendered.clone(),
-                current_vnode: cells.current_vnode.clone(),
-                anchor: cells.anchor.clone(),
-                empty_position: cells.empty_position.clone(),
-            };
+            let effect_cells = cells.clone();
             let parent = parent.clone();
             let node_list = node_list.clone();
             let boundary = boundary.clone();
             let path = path.to_string();
             let stats_for_effect = stats_cell.clone();
 
-            create_effect(move || {
+            let handle = create_effect_scoped(move || {
                 let new_v_node = f();
 
                 if first_run.get() {
@@ -923,32 +1182,70 @@ fn hydrate_recursive(
                         .map(|el| (el, node_list.item(index + stats.consumed)));
 
                     *effect_cells.current_vnode.borrow_mut() = Some(new_v_node);
-                    *stats_for_effect.borrow_mut() = stats;
+                    stats_for_effect.set(stats);
                     return;
                 }
 
                 update_dynamic_region(&effect_cells, new_v_node);
             });
 
-            // `create_effect` ran synchronously, so the stats are populated.
-            let stats = *stats_cell.borrow();
-            let _ = cells;
-            stats
+            // Stored so the region's effect dies with the region rather than
+            // outliving it in `ROOT_EFFECTS`. Safe to assign after the fact:
+            // the first run has already completed synchronously, and only
+            // teardown reads this slot.
+            *cells.effect.borrow_mut() = Some(handle);
+            own_region_effect_by_enclosing_effect(&cells);
+
+            // The effect ran synchronously, so the stats are populated.
+            stats_cell.get()
         }
     }
 }
 
+/// Read a `u32` expando written by [`attach_element_events`] or
+/// [`register_dynamic_region`]. One reader for both, so the two registries
+/// cannot drift apart in how they identify a node.
 #[cfg(feature = "web")]
-fn remove_dom_node_closures(node: &WebNode) {
-    if let Ok(id_val) = js_sys::Reflect::get(node.as_ref(), &JsValue::from_str("__krab_id")) {
-        if let Some(id_f64) = id_val.as_f64() {
-            EVENT_CLOSURES.with(|v| v.borrow_mut().remove(&(id_f64 as u32)));
-        }
+fn node_expando_id(target: &JsValue, key: &str) -> Option<u32> {
+    js_sys::Reflect::get(target, &JsValue::from_str(key))
+        .ok()
+        .and_then(|value| value.as_f64())
+        .map(|value| value as u32)
+}
+
+/// Release every runtime resource `node`'s subtree holds, without removing any
+/// of it: event listeners and their closures, and the registration and effect
+/// of any dynamic region anchored inside it.
+///
+/// One walk covers both registries. Previously this released `__krab_id`
+/// closures only, so a replaced or removed subtree left every `__krab_region`
+/// entry it contained in `DYNAMIC_REGIONS` forever — the map only ever shrank
+/// on the one path that happened to call `remove_region_content`.
+///
+/// Listeners go through [`detach_element_events`] rather than a bare map
+/// removal. For a subtree on its way out of the document the difference is
+/// invisible, but [`unmount`] deliberately *leaves* its subtree in place:
+/// dropping a closure whose listener is still bound makes the next event throw
+/// "closure invoked after being dropped".
+///
+/// A region *anchored* in this subtree has its rendered run in the subtree too
+/// (the run is the anchor's preceding siblings), so the caller's own DOM removal
+/// disposes of the nodes; unregistering is all that is needed here. An anchor
+/// whose content lies *outside* the discarded subtree — the anchor itself being
+/// replaced — is the separate job of [`remove_region_content`].
+#[cfg(feature = "web")]
+fn release_dom_node_resources(node: &WebNode) {
+    if let Some(element) = node.dyn_ref::<Element>() {
+        detach_element_events(element);
     }
+    if let Some(region) = take_dynamic_region(node) {
+        dispose_region_effect(&region);
+    }
+
     let child_nodes = node.child_nodes();
-    for i in 0..child_nodes.length() {
-        if let Some(child) = child_nodes.item(i) {
-            remove_dom_node_closures(&child);
+    for index in 0..child_nodes.length() {
+        if let Some(child) = child_nodes.item(index) {
+            release_dom_node_resources(&child);
         }
     }
 }
@@ -959,7 +1256,13 @@ fn remove_dom_node_closures(node: &WebNode) {
 /// two previously carried verbatim copies of the update logic, and the copies
 /// had already diverged (the hydration copy could not create its anchor for an
 /// initially-empty run, leaving the region permanently dead).
+///
+/// Every field is an `Rc` handle, so `Clone` shares state rather than copying
+/// it — that is the point. The struct was hand-cloned field by field at both
+/// construction sites, which meant adding a field silently produced two
+/// regions whose new state was *not* shared.
 #[cfg(feature = "web")]
+#[derive(Clone)]
 struct DynamicRegionCells {
     /// The tracked run: one node per flattened child, region anchors standing
     /// in for nested regions.
@@ -973,6 +1276,17 @@ struct DynamicRegionCells {
     /// element and the sibling the run precedes. Without this, an empty SSR
     /// render had no reference point and the region could never show anything.
     empty_position: Rc<RefCell<Option<EmptyRunPosition>>>,
+    /// The region's own effect, so it can be torn down when the region is.
+    ///
+    /// Filled in immediately after `create_effect_scoped` returns — the handle
+    /// cannot exist before the closure that captures these cells does.
+    ///
+    /// This closes an `Rc` cycle (handle → effect state → closure → these
+    /// cells → handle) that is broken by *taking* the handle out at disposal,
+    /// which is why [`dispose_region_effect`] takes rather than borrows. A
+    /// region that is never disposed keeps that cycle, exactly as a root effect
+    /// was kept alive forever before.
+    effect: Rc<RefCell<Option<EffectHandle>>>,
 }
 
 /// The parent element and the following sibling an empty run sits before.
@@ -1028,7 +1342,7 @@ fn update_dynamic_region(cells: &DynamicRegionCells, new_v_node: Node) {
                     return;
                 }
 
-                register_dynamic_region(&created, cells.rendered.clone());
+                register_dynamic_region(&created, cells);
                 *cells.anchor.borrow_mut() = Some(created.clone());
                 created
             }
@@ -1114,7 +1428,8 @@ fn patch_dom(
             // sibling, would otherwise fire the old render's handler over the
             // old captured data while displaying the new content.
             if !old_el.events.is_empty() || !new_el.events.is_empty() {
-                detach_element_events(el);
+                // `attach_element_events` detaches first, so this swaps the
+                // generation even when the new render has no listeners at all.
                 attach_element_events(el, new_el, "patch_dom");
             }
 
@@ -1260,7 +1575,7 @@ fn reconcile_range(
                     // A region anchor's content lives *beside* it: remove it
                     // first, or replacing the anchor strands the region's rows.
                     remove_region_content(el, &node);
-                    remove_dom_node_closures(&node);
+                    release_dom_node_resources(&node);
                     el.replace_child(&replacement, &node).ok()?;
                     existing[source] = Some(tracked);
                 }
@@ -1431,25 +1746,23 @@ fn create_dom_node(v_node: &Node) -> Option<WebNode> {
                 current_vnode: Rc::new(RefCell::new(None)),
                 anchor: Rc::new(RefCell::new(Some(anchor.clone()))),
                 empty_position: Rc::new(RefCell::new(None)),
+                effect: Rc::new(RefCell::new(None)),
             };
 
             // A parent tracking this region by its anchor uses the registry to
-            // remove the region's content when the region itself is removed.
-            register_dynamic_region(&anchor, cells.rendered.clone());
+            // remove the region's content and dispose its effect when the
+            // region itself is removed. Registering before the effect exists is
+            // fine: the registry holds a clone sharing the same effect slot.
+            register_dynamic_region(&anchor, &cells);
 
             let f = f.clone();
             let first_run = Rc::new(Cell::new(true));
             let initial_inserts: Rc<RefCell<Vec<WebNode>>> = Rc::new(RefCell::new(Vec::new()));
 
-            let effect_cells = DynamicRegionCells {
-                rendered: cells.rendered.clone(),
-                current_vnode: cells.current_vnode.clone(),
-                anchor: cells.anchor.clone(),
-                empty_position: cells.empty_position.clone(),
-            };
+            let effect_cells = cells.clone();
             let inserts_for_effect = initial_inserts.clone();
 
-            create_effect(move || {
+            let handle = create_effect_scoped(move || {
                 let new_v_node = f();
 
                 if first_run.get() {
@@ -1468,6 +1781,9 @@ fn create_dom_node(v_node: &Node) -> Option<WebNode> {
 
                 update_dynamic_region(&effect_cells, new_v_node);
             });
+
+            *cells.effect.borrow_mut() = Some(handle);
+            own_region_effect_by_enclosing_effect(&cells);
 
             // Everything this `Dynamic` owns, in order, with the anchor last.
             let container = document.create_document_fragment();
@@ -1514,9 +1830,13 @@ fn create_run_nodes(node: &Node) -> Vec<(WebNode, WebNode)> {
         .collect()
 }
 
-/// Register a dynamic region's rendered run under its anchor.
+/// Register a dynamic region under its anchor.
+///
+/// The map holds a *clone* of the cells, which shares every `Rc` with the live
+/// region — including the effect slot, so a handle stored after registration is
+/// still visible here.
 #[cfg(feature = "web")]
-fn register_dynamic_region(anchor: &WebNode, rendered: Rc<RefCell<Vec<WebNode>>>) {
+fn register_dynamic_region(anchor: &WebNode, cells: &DynamicRegionCells) {
     let id = NEXT_DOM_ID.with(|id| {
         let v = id.get();
         id.set(v + 1);
@@ -1527,36 +1847,80 @@ fn register_dynamic_region(anchor: &WebNode, rendered: Rc<RefCell<Vec<WebNode>>>
         &JsValue::from_str("__krab_region"),
         &JsValue::from_f64(id as f64),
     );
-    DYNAMIC_REGIONS.with(|regions| regions.borrow_mut().insert(id, rendered));
+    DYNAMIC_REGIONS.with(|regions| regions.borrow_mut().insert(id, cells.clone()));
 }
 
-/// If `node` is a region anchor, remove the region's rendered content (its
-/// sibling nodes) from `el`, recursively handling regions nested inside it.
-/// The anchor itself is left for the caller to remove or replace.
+/// Unregister the dynamic region anchored at `node`, returning its cells.
+#[cfg(feature = "web")]
+fn take_dynamic_region(node: &WebNode) -> Option<DynamicRegionCells> {
+    let id = node_expando_id(node.as_ref(), "__krab_region")?;
+    DYNAMIC_REGIONS.with(|regions| regions.borrow_mut().remove(&id))
+}
+
+/// Tear down a region's effect so it stops re-rendering nodes that are on their
+/// way out.
+///
+/// The handle is *taken* before disposal, not borrowed: that both makes the
+/// call idempotent and breaks the `Rc` cycle described on
+/// [`DynamicRegionCells::effect`], so the effect's memory is actually
+/// reclaimed. Disposal cascades — the effect owns the cleanups its own body
+/// registered, which include the handles of any region nested inside it.
+#[cfg(feature = "web")]
+fn dispose_region_effect(cells: &DynamicRegionCells) {
+    let handle = cells.effect.borrow_mut().take();
+    if let Some(handle) = handle {
+        handle.dispose();
+    }
+}
+
+/// Hand this region's effect to the effect currently running, if there is one.
+///
+/// [`create_effect_scoped`] deliberately never adopts a parent — its lifetime
+/// is the handle's — but a region built *during* another region's render must
+/// still die when that render is superseded. Registering the disposal as an
+/// `on_cleanup` on the enclosing effect restores exactly the ownership that
+/// plain `create_effect` gave for free, without giving up the handle. Outside an
+/// effect this is a no-op and the region lives until it is unmounted or its
+/// anchor is removed.
+#[cfg(feature = "web")]
+fn own_region_effect_by_enclosing_effect(cells: &DynamicRegionCells) {
+    let effect = cells.effect.clone();
+    on_cleanup(move || {
+        let handle = effect.borrow_mut().take();
+        if let Some(handle) = handle {
+            handle.dispose();
+        }
+    });
+}
+
+/// If `node` is a region anchor, tear the region down: dispose its effect and
+/// remove its rendered content (its sibling nodes) from `el`, recursively
+/// handling regions nested inside it. The anchor itself is left for the caller
+/// to remove or replace.
+///
+/// Unlike [`release_dom_node_resources`], this removes DOM — the region's run
+/// lives *beside* the anchor, so replacing the anchor alone would strand it.
 #[cfg(feature = "web")]
 fn remove_region_content(el: &Element, node: &WebNode) {
-    let Ok(id_val) = js_sys::Reflect::get(node.as_ref(), &JsValue::from_str("__krab_region"))
-    else {
+    let Some(region) = take_dynamic_region(node) else {
         return;
     };
-    let Some(id) = id_val.as_f64() else {
-        return;
-    };
-    let Some(rendered) = DYNAMIC_REGIONS.with(|regions| regions.borrow_mut().remove(&(id as u32)))
-    else {
-        return;
-    };
-    for inner in rendered.borrow().iter() {
+
+    // Before the DOM goes, so a signal write during removal cannot make the
+    // effect re-render against nodes that are half gone.
+    dispose_region_effect(&region);
+
+    for inner in region.rendered.borrow().iter() {
         remove_tracked_node(el, inner);
     }
 }
 
-/// Remove a tracked run entry: its listeners, its region content if it is a
-/// region anchor, and the node itself.
+/// Remove a tracked run entry: its region content and effect if it is a region
+/// anchor, everything its subtree retains, and the node itself.
 #[cfg(feature = "web")]
 fn remove_tracked_node(el: &Element, node: &WebNode) {
     remove_region_content(el, node);
-    remove_dom_node_closures(node);
+    release_dom_node_resources(node);
     let _ = el.remove_child(node);
 }
 

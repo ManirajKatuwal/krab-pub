@@ -1,3 +1,18 @@
+//! Render-time error boundary.
+//!
+//! # This works on the server only
+//!
+//! Recovery here depends on unwinding, so it is real for SSR and for any native
+//! build. This module is **not** feature-gated, so it also compiles into the
+//! `wasm32` browser bundle — where it is inert. `wasm32-unknown-unknown` is
+//! `panic = "abort"`, so [`catch_unwind`] never returns `Err`: a panicking
+//! child traps the module instead of rendering the fallback. Do not rely on a
+//! boundary to contain a panic in the browser.
+//!
+//! `krab_client`'s `tests/panic_boundary_browser.rs` demonstrates the browser
+//! behaviour, including that a panicking island leaves every island after it in
+//! document order unhydrated.
+
 use crate::{Attribute, Element, Node, Render};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 

@@ -21,7 +21,20 @@ hyper-util = { version = "0.1", features = ["full"] }
 bytes = "1.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 krab_core = { workspace = true, features = ["rest", "redis-store"] }
-krab_client = { workspace = true }
+# This is the *server* half of the island story: it renders `Counter`, `Toggle`
+# and `Likes` to HTML with `data-island` / `data-props` wrappers so the browser
+# bundle can find and hydrate them. `#[island]` selects that half on
+# `not(feature = "web")`, so the frontend must NOT get `krab_client`'s default
+# `web` feature — with it, the same call emits bare component markup and there
+# is nothing left for `hydrate()` to attach to.
+#
+# Caveat worth knowing: Cargo unifies features across a single invocation, so a
+# workspace-wide `cargo build --workspace` still compiles `krab_client` with
+# `web` (it is a workspace member and gets its own defaults) and this crate
+# links against that build. Package-scoped builds — `cargo build --bin
+# service_frontend`, which is what `Dockerfile.service` and the E2E gate run —
+# honour the opt-out and emit the wrappers.
+krab_client = { workspace = true, default-features = false, features = ["demo-islands"] }
 krab_macros = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -36,3 +49,12 @@ async-trait.workspace = true
 
 [dev-dependencies]
 serial_test = "3"
+
+[lints.rust]
+# This service is the demonstration consumer of `krab_client`'s bundled demo
+# islands, which are deprecated and removed in 0.5.0 (see
+# `crates/framework/krab_client/src/components.rs`). It uses them on purpose,
+# so the warning is noise here and would fail `clippy -D warnings`. Narrow this
+# to an `#[allow(deprecated)]` on the import once the service defines its own
+# islands — the crate-wide allow also hides unrelated deprecations.
+deprecated = "allow"

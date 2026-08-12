@@ -15,6 +15,10 @@
 //!   browser.
 //! - [`add_task`] is a `#[server]` function mounted at `/api/rpc/add_task`,
 //!   called from `TaskCounter`'s click handler.
+//! - [`krab_boot`] hydrates and then starts the **client router**, and
+//!   [`page_for`] renders two routes sharing one outlet, so moving between them
+//!   is an outlet swap rather than a document load — the islands and their
+//!   signal state survive it.
 //!
 //! The same source builds both halves: `cargo build` produces the server,
 //! `wasm-pack build --features web` produces the browser bundle.
@@ -173,16 +177,104 @@ pub fn TaskFilter(props: TaskFilterProps) -> Node {
 }
 
 // ---------------------------------------------------------------------------
+// Client entry point
+// ---------------------------------------------------------------------------
+
+/// Boot the browser half: hydrate the islands, then start the client router.
+///
+/// Exported to JavaScript, and called by the module script [`page_for`] emits.
+/// It is deliberately **not** `#[wasm_bindgen(start)]` — `krab_client` already
+/// owns the single start function a bundle may have, and a second one is a
+/// wasm-bindgen error rather than a runtime surprise.
+///
+/// Ordering matters: hydration must claim the server-rendered islands before the
+/// router can ever swap them out, and the router must be started after the
+/// outlet exists in the document.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn krab_boot() {
+    krab_client::hydrate();
+    krab_client::router::start();
+}
+
+/// The module script that calls [`krab_boot`].
+///
+/// Emitted as a text child of a `<script>` element, so it must survive
+/// `krab_core`'s text escaping unchanged: no `<`, `>`, or `&`. That rules out
+/// arrow functions and `&&`, which is why it reads the way it does.
+const BOOT_SCRIPT: &str = "import init, { krab_boot } from '/pkg/reference_app_islands_rpc.js';\n\
+     init().then(function () { krab_boot(); });";
+
+// ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
 
-/// Build the full page.
+/// The routes this example serves, as (path, nav label) pairs.
+///
+/// Two of them, because one route cannot demonstrate a router. Both render
+/// through [`page_for`], so both carry the outlet — a destination without one
+/// makes the router fall back to a full page load.
+pub const ROUTES: [(&str, &str); 2] = [("/", "Home"), ("/about", "About")];
+
+/// Build the full page for `route`.
 ///
 /// Every element here comes from `view!`, including the `<meta>` and `data-*`
 /// attributes. The reference `service_frontend` hand-writes its island markup as
 /// HTML string literals because `view!` could not express hyphenated attribute
 /// names; this page is the demonstration that it now can.
-pub fn page() -> Node {
+///
+/// `<main>` carries `data-krab-router-outlet`: its contents are what the router
+/// swaps, and the `<nav>` above it is what survives the swap. `tabindex="-1"` is
+/// declared rather than left to the router, so the attribute is in the
+/// server-rendered markup instead of appearing after the first navigation.
+pub fn page_for(route: &str) -> Node {
+    let title = match route {
+        "/about" => "About — Krab islands and RPC",
+        _ => "Krab — islands and RPC",
+    };
+
+    view! {
+        <html lang="en">
+            <head>
+                <meta charset="utf-8"/>
+                <meta name="viewport" content="width=device-width, initial-scale=1"/>
+                <title>{ title.to_string() }</title>
+            </head>
+            <body data-app="islands-rpc">
+                <nav class="site-nav" aria-label="primary">
+                    <a href="/" data-testid="nav-home">"Home"</a>
+                    <a href="/about" data-testid="nav-about">"About"</a>
+                </nav>
+                <main
+                    class="page"
+                    data-testid="page"
+                    data-krab-router-outlet=""
+                    tabindex="-1"
+                >
+                    { route_content(route) }
+                </main>
+                <script type="module">{ BOOT_SCRIPT.to_string() }</script>
+            </body>
+        </html>
+    }
+}
+
+/// The swappable part of the document: everything inside the outlet.
+fn route_content(route: &str) -> Node {
+    if route == "/about" {
+        return view! {
+            <section class="route about" data-testid="route-about">
+                <h1>"About this example"</h1>
+                <p class="intro">
+                    "Getting here did not reload the document. The client router "
+                    "fetched this page, took the contents of the outlet, and swapped "
+                    "them in — the nav above and the WASM module stayed exactly as "
+                    "they were."
+                </p>
+            </section>
+        };
+    }
+
     let counter = TaskCounter(TaskCounterProps {
         label: "Tasks added".to_string(),
         initial: 0,
@@ -194,34 +286,37 @@ pub fn page() -> Node {
     });
 
     view! {
-        <html lang="en">
-            <head>
-                <meta charset="utf-8"/>
-                <meta name="viewport" content="width=device-width, initial-scale=1"/>
-                <title>"Krab — islands and RPC"</title>
-            </head>
-            <body data-app="islands-rpc">
-                <main class="page" data-testid="page">
-                    <h1>"Islands and server functions"</h1>
-                    <p class="intro">
-                        "This page is server-rendered. The two components below hydrate in "
-                        "the browser, and the counter calls a server function over HTTP."
-                    </p>
-                    <section class="islands" aria-label="interactive components">
-                        {counter}
-                        {filter}
-                    </section>
-                </main>
-                <script type="module" src="/pkg/reference_app_islands_rpc.js"></script>
-            </body>
-        </html>
+        <section class="route home" data-testid="route-home">
+            <h1>"Islands and server functions"</h1>
+            <p class="intro">
+                "This page is server-rendered. The two components below hydrate in "
+                "the browser, and the counter calls a server function over HTTP."
+            </p>
+            <section class="islands" aria-label="interactive components">
+                {counter}
+                {filter}
+            </section>
+        </section>
     }
 }
 
-/// Render [`page`] to an HTML document string.
-pub fn render_page() -> String {
+/// Build the home page.
+///
+/// Retained as the zero-argument entry point the original example published;
+/// [`page_for`] is the general form.
+pub fn page() -> Node {
+    page_for("/")
+}
+
+/// Render [`page_for`] to an HTML document string.
+pub fn render_page_for(route: &str) -> String {
     use krab_core::Render;
-    format!("<!doctype html>{}", page().render())
+    format!("<!doctype html>{}", page_for(route).render())
+}
+
+/// Render the home page to an HTML document string.
+pub fn render_page() -> String {
+    render_page_for("/")
 }
 
 #[cfg(test)]
