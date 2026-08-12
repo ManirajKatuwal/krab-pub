@@ -162,8 +162,23 @@ dependencies and `ProtocolKind::parse("grpc")` returns `None`. See
 ### WASM client
 
 ```sh
-wasm-pack build crates/framework/krab_client --release --target web
+wasm-pack build crates/framework/krab_client --release --target web -- --features web
 ```
+
+`krab_client`'s features are `web` (the hydration runtime and the client
+router's browser half), `demo-islands` (the bundled `Counter`/`Toggle`/`Likes`,
+deprecated and removed in 0.5.0), and `debug` (verbose console tracing of the
+hydration walk). `web` and `demo-islands` are **defaults**, so the `--` suffix
+above is redundant — it is written out because this command shipped a stub for
+the entire 0.1–0.2 line, when `web` was opt-in and nothing asked for it. A build
+without `web` is not a smaller runtime, it is a `hydrate()` that logs one line
+and returns: ~15 KB instead of ~198 KB.
+
+Server-side consumers that want the non-`web` half of `#[island]` — the SSR
+wrapper markup — take `krab_client` with `default-features = false`. That is
+what `services/service_frontend` does. Note that a workspace-wide
+`cargo build --workspace` still unifies `web` on, because `krab_client` is also
+a member and gets its own defaults; package-scoped builds honour the opt-out.
 
 ---
 

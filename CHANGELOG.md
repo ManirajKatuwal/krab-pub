@@ -16,7 +16,72 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ## [Unreleased]
 
-Nothing yet — `0.3.0` is the current release.
+### Added
+
+- `krab_client` can hydrate and release a subtree rather than only the whole
+  document: `hydrate_within(root)` walks one element, and `unmount(root)`
+  detaches the listeners, dynamic regions, and effects hydration created under
+  it. Markup inserted after first paint — a modal, a lazily fetched panel — can
+  now be brought to life and torn down again without leaking into the page for
+  its remaining lifetime.
+- Client-side routing is reachable from the browser bundle as `start_router()`.
+  Same-origin link clicks and Back/Forward replace the contents of the element
+  marked `data-krab-router-outlet` and re-hydrate, instead of reloading the
+  document and discarding hydrated island state, scroll position, and the warm
+  WASM module. Modified and non-primary clicks, `target`, `download`,
+  cross-origin URLs, and an explicit `data-krab-router-ignore` are left to the
+  browser, and every failure — no outlet on either page, a failed fetch — falls
+  back to a full navigation. The router's logic shipped in 0.2.0 but was
+  unreachable: it sat behind a feature no documented build enabled.
+- Router navigations send an `x-krab-router: 1` request header, so a server can
+  distinguish an in-app navigation from a document request — for logging, or to
+  serve a lighter shell. Documented in
+  [`docs/reference/api.md`](docs/reference/api.md).
+
+### Deprecated
+
+- `krab_client`'s bundled demo islands — `Counter`, `Toggle`, `Likes` and their
+  props types — are deprecated and removed in 0.6.0, together with the new
+  `demo-islands` feature that now gates them (on by default until then). Each
+  `#[island]` is `inventory::submit`ed under its plain function name and
+  `inventory` links every submission in the final binary into one registry, so
+  these three names are claimed in every consumer's bundle. An application that
+  defines its own `Counter` island gets two entries under one name and
+  `hydrate()` resolves them with `find()` — first match wins, decided by link
+  order, with no diagnostic. Define islands with `#[island]` in your own crate;
+  `default-features = false` removes them today.
+### Fixed
+
+- The WASM bundle contains the hydration runtime. `krab_client`'s `web`
+  feature — which gates `hydrate()`, the reconciler, and the router's browser
+  half — had no default, and the three build paths that produce the bundle (the
+  WASM size gate, the documented `wasm-pack` command, and `krab build
+  --release`) all omitted it. Each produced a ~15 KB artifact whose `hydrate()`
+  logged one line and returned, in place of the ~198 KB runtime; pages loading
+  it saw no error and quietly ran their JavaScript fallback instead. `web` is
+  now a default feature, all three paths name it explicitly, and the size gate
+  fails if the artifact does not contain the runtime — size alone could not tell
+  a stub from a build, since the stub passed every threshold with room to spare.
+- `hydrate()` is idempotent. Calling it twice — which client-side navigation now
+  does on every page swap — previously re-registered every island's event
+  listeners, so a single click fired its handler once per call.
+- Hydration no longer retains DOM state for the life of the page. Event
+  closures, dynamic-region records, and the effects created for reactive regions
+  were kept alive after the nodes they belonged to were gone, so every
+  re-render, list update, and navigation added to a set that was never reduced.
+- Back and Forward work on any URL carrying a fragment. The router's
+  same-page-fragment guard compared the browser's current URL against itself —
+  `popstate` fires *after* the address bar has already moved — so every history
+  navigation to a URL containing `#` was classified as an in-page hash change
+  and silently dropped: no refetch, no content swap, and no error. The guard now
+  compares the destination against the URL the outlet's content actually came
+  from.
+- The router's outlet scanner no longer mistakes markup inside comments,
+  `<script>`/`<style>` bodies, or attribute values for real tags. A page whose
+  script mentioned `data-krab-router-outlet` could select the wrong element, and
+  a `</main>` inside a comment or script *within* the outlet truncated the
+  swapped content. Document titles carried across a navigation are now
+  entity-decoded and tolerate attributes on `<title>`.
 
 ---
 

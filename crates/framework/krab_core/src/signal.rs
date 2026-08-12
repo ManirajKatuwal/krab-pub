@@ -105,9 +105,9 @@ fn push_subscriber(list: &mut Vec<Subscriber>, subscriber: &Subscriber) {
 
 /// Restores [`CURRENT_SUBSCRIBER`] whether the scope exits normally or unwinds.
 ///
-/// The same reasoning as [`BatchGuard`]: island factories run under
-/// `catch_unwind` and `error_boundary` makes a panic recoverable, so execution
-/// continues past one. Without this, a panic inside an effect, memo
+/// The same reasoning as [`BatchGuard`]: on the server a panic is recoverable —
+/// [`error_boundary`](crate::error_boundary) catches a panicking render and
+/// keeps going — so execution really does continue past one. Without this, a panic inside an effect, memo
 /// computation, or `untrack` scope left the thread-local pointing at the
 /// panicked node — every later read subscribed a zombie, and every later
 /// `create_effect` was adopted by it and mass-disposed on its next run.
@@ -505,9 +505,12 @@ fn run_now(effects: Vec<Rc<EffectState>>) {
 /// Without this a panic inside a batch left the depth raised forever, and every
 /// later write on that thread queued into [`BATCHED_EFFECTS`] and was never
 /// flushed — the reactive system silently stopped working. That is not
-/// hypothetical: `krab_client` wraps island factories in `catch_unwind`, and
-/// `error_boundary` exists precisely to make a panic recoverable, so execution
-/// really does continue past one.
+/// hypothetical on the server: `error_boundary` exists precisely to make a
+/// panic recoverable, so execution really does continue past one.
+///
+/// In the browser it cannot happen, and the guard is belt-and-braces there:
+/// `wasm32-unknown-unknown` is `panic = "abort"`, so a panic traps the module
+/// and nothing resumes to observe a wedged depth.
 struct BatchGuard;
 
 impl BatchGuard {
@@ -631,10 +634,11 @@ fn schedule_async(#[allow(unused_variables)] effects: Vec<Rc<EffectState>>) {
 /// `Drop` during a panic risks a second panic, which aborts the process — so
 /// they are delivered by the next write instead.
 ///
-/// This matters because panics here are recoverable in practice:
-/// `krab_client` wraps island factories in `catch_unwind`, and
+/// This matters because panics here are recoverable on the server, where
 /// [`error_boundary`](crate::error_boundary) exists to keep rendering after
-/// one. An earlier version leaked the raised depth on unwind, which silently
+/// one. (In a `wasm32` browser build they are not: that target is
+/// `panic = "abort"`, so a panic traps the module rather than unwinding.)
+/// An earlier version leaked the raised depth on unwind, which silently
 /// stopped every subsequent effect on the thread from ever running.
 pub fn batch<T, F>(f: F) -> T
 where
@@ -1062,9 +1066,11 @@ where
 const MAX_FLUSH_DEPTH: u32 = 64;
 
 /// Clears an effect's `running` flag when the scope exits, normally or by
-/// unwinding. Island factories run under `catch_unwind` and `error_boundary`
-/// makes a panic recoverable, so execution continues past one — a wedged flag
-/// would make every later run of the effect refuse as a false cycle.
+/// unwinding. On the server `error_boundary` makes a panic recoverable, so
+/// execution continues past one — a wedged flag would make every later run of
+/// the effect refuse as a false cycle. On `wasm32` a panic aborts instead, so
+/// there is nothing left to wedge; the guard costs nothing and keeps one
+/// behaviour across both targets.
 struct RunningGuard<'a> {
     flag: &'a Cell<bool>,
 }
@@ -1733,9 +1739,10 @@ mod batch_unwind_tests {
     /// `BATCH_DEPTH` raised forever, after which every write on the thread
     /// queued and nothing ever ran again.
     ///
-    /// Not hypothetical — `krab_client` runs island factories inside
-    /// `catch_unwind`, and `error_boundary` exists to continue after a panic,
-    /// so execution really does reach the next write.
+    /// Not hypothetical on the server — `error_boundary` exists to continue
+    /// after a panic, so execution really does reach the next write. (A
+    /// `wasm32` browser build aborts on panic instead, so this guard is
+    /// belt-and-braces there rather than load-bearing.)
     #[test]
     fn a_panic_inside_a_batch_does_not_wedge_the_reactive_system() {
         let (value, set_value) = create_signal(0);

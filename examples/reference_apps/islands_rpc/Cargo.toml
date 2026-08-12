@@ -40,7 +40,11 @@ tracing-subscriber = { workspace = true }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 krab_core = { workspace = true, features = ["web"] }
 # `web` must be on: the hydration diagnostics the `#[island]` client half calls
-# are gated behind it.
+# are gated behind it. It is one of `krab_client`'s own defaults, but the
+# workspace entry turns defaults off (server-side members must not get `web`),
+# so it is named here rather than inherited. Not asking for `demo-islands` is
+# deliberate: those islands register `Counter`/`Toggle`/`Likes` in the same
+# `inventory` registry this app's own islands use.
 krab_client = { workspace = true, features = ["web"] }
 inventory = "0.3"
 wasm-bindgen = "0.2"

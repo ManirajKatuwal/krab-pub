@@ -41,9 +41,26 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
 
+      # `--features web` is redundant now that it is a default feature, and it
+      # stays anyway: this gate exists to measure the hydration runtime, and it
+      # spent its whole life measuring a 15 KB stub because the feature was
+      # opt-in and this step did not ask for it. Naming it makes the gate fail
+      # loudly if the default is ever changed back, instead of quietly passing.
       - name: Build WASM bundle
         working-directory: crates/framework/krab_client
-        run: wasm-pack build --release --target web --out-dir ../../../dist/pkg
+        run: wasm-pack build --release --target web --out-dir ../../../dist/pkg -- --features web
+
+      # The runtime is identified by a string only the real build contains. A
+      # stub is ~15 KB and passes every byte-size threshold below, so size alone
+      # cannot tell the two apart — this can.
+      - name: Verify the bundle contains the hydration runtime
+        run: |
+          WASM_FILE=$(ls dist/pkg/*.wasm | head -n1)
+          if ! grep -qa "Hydrating island" "$WASM_FILE"; then
+            echo "❌ $WASM_FILE has no hydration runtime — this is a stub build"
+            exit 1
+          fi
+          echo "✅ Hydration runtime present in $WASM_FILE"
 
       - name: Measure bundle size
         id: size

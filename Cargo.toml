@@ -42,7 +42,17 @@ categories = ["web-programming", "wasm", "development-tools"]
 # for why those must stay path-only.
 krab_core = { version = "0.3.0", path = "crates/framework/krab_core" }
 krab_macros = { version = "0.3.0", path = "crates/framework/krab_macros" }
-krab_client = { version = "0.3.0", path = "crates/framework/krab_client" }
+#
+# `krab_client` carries `default-features = false` here, and members opt back
+# in. Its defaults are `web` + `demo-islands`, and `web` decides which half of
+# `#[island]` compiles: the browser bundle needs it, a server-side renderer must
+# not have it (with `web` on, an island renders bare markup instead of the
+# `data-island` wrapper the bundle later hydrates). A member cannot express that
+# on its own — Cargo *ignores* `default-features = false` on an inherited
+# dependency unless the workspace entry sets it too, warning
+# "`default-features` is ignored for krab_client ... this could become a hard
+# error in the future" — so the opt-out has to live here.
+krab_client = { version = "0.3.0", path = "crates/framework/krab_client", default-features = false }
 
 axum = "=0.8.8"
 async-graphql = "=7.2.1"

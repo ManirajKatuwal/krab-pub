@@ -69,7 +69,30 @@ features = [
 wasm-bindgen-test = "0.3"
 
 [features]
+# `web` is ON by default. It gates the entire hydration runtime — `hydrate()`,
+# the reconciler, the client router's browser half — so a build without it
+# produces a bundle whose `hydrate()` logs one line and returns.
+#
+# It was previously opt-in with no default, and three documented build paths
+# (the wasm size gate, CLAUDE.md, `krab build --release`) omitted it. Every one
+# of them shipped a ~15 KB no-op instead of the ~198 KB runtime, and
+# `service_frontend` ran its JS fallback because the module it loaded did
+# nothing. Defaulting it on means the obvious command produces the working
+# artifact; a consumer that genuinely wants the inert native half of `#[island]`
+# — a server-side renderer — opts out with `default-features = false`.
+default = ["web", "demo-islands"]
+
 web = []
+
+# Verbose console tracing of the hydration walk. Off by default: the messages
+# are per-node and only useful when debugging a mismatch.
+debug = []
+
+# The bundled demo islands (`Counter`, `Toggle`, `Likes`). Deprecated — see the
+# note in `src/components.rs` — and scheduled for removal in 0.6.0. Still on by
+# default so existing consumers keep compiling; turn it off with
+# `default-features = false` (plus `features = ["web"]` if you want the runtime).
+demo-islands = []
 
 # rustc 1.97 emits bulk-memory and nontrapping-fptoint by default; the binaryen
 # wasm-pack bundles (version 117) rejects them unless told they exist. Without

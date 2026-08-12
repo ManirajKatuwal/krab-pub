@@ -5,8 +5,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
 use std::time::{Duration, SystemTime};
+
+use sha2::{Digest, Sha256};
 
 use crate::project_model::ProjectModel;
 use crate::release_ops::run_command_logged;
@@ -83,9 +85,18 @@ pub(super) fn watch_project(release: bool, poll_ms: u64, settle_ms: u64) -> Resu
     let mut baseline = collect_file_fingerprints(&project)?;
     build_project(release, &BuildTarget::All, false)?;
 
-    let mut child = spawn_frontend(&project, release)?;
+    // The frontend is owned by a guard from here on: every `?` below runs while
+    // a `cargo run` child is alive, and the guard is what keeps those exits from
+    // orphaning it.
+    let mut child = FrontendChildGuard::new(spawn_frontend(&project, release)?);
     let mut pending_change_since: Option<std::time::Instant> = None;
 
+    // Change detection is a stat poll, not an OS watch: it re-stats every file
+    // under the watch roots each interval, so cost grows with project size and a
+    // save is noticed up to `poll_ms` late. An event-driven watcher would need a
+    // filesystem-notification dependency (`notify`), and clean Ctrl-C shutdown a
+    // signal-handling one (`ctrlc`); adding either is a dependency decision under
+    // this repo's governance rules, so both are deliberately deferred.
     loop {
         std::thread::sleep(Duration::from_millis(poll_ms));
 
@@ -97,7 +108,7 @@ pub(super) fn watch_project(release: bool, poll_ms: u64, settle_ms: u64) -> Resu
                 "⚠️ {} exited ({status}). Restarting...",
                 project.frontend_bin
             );
-            child = spawn_frontend(&project, release)?;
+            child.replace(spawn_frontend(&project, release)?);
         }
 
         let next = collect_file_fingerprints(&project)?;
@@ -156,8 +167,7 @@ pub(super) fn watch_project(release: bool, poll_ms: u64, settle_ms: u64) -> Resu
             }
         } else if server_changed {
             println!("   > ⚡ Partial invalidation: Server/Full");
-            let _ = child.kill();
-            let _ = child.wait();
+            child.terminate();
 
             let target = if client_changed {
                 BuildTarget::All
@@ -170,7 +180,7 @@ pub(super) fn watch_project(release: bool, poll_ms: u64, settle_ms: u64) -> Resu
                 pending_change_since = None;
                 continue;
             }
-            child = spawn_frontend(&project, release)?;
+            child.replace(spawn_frontend(&project, release)?);
         } else if public_changed {
             println!("   > ⚡ Partial invalidation: Public assets only (No rebuild)");
             hot_patch_assets(&project)?;
@@ -204,53 +214,54 @@ pub(super) fn bootstrap_local_stack(release: bool, skip_build: bool) -> Result<(
     Ok(())
 }
 
+/// The `--json` shape of `krab env-check`.
+///
+/// `status` mirrors the exit status this run will produce, so a consumer does
+/// not have to re-derive the `--strict` rule: `passed` with no warnings,
+/// `warnings` when warnings were found but the run still exits zero, `failed`
+/// when `--strict` turns them into a non-zero exit.
+#[derive(Debug, Serialize)]
+struct EnvCheckReport<'a> {
+    command: &'static str,
+    status: &'static str,
+    warnings: &'a [String],
+}
+
 /// Validate the most common local/staging/prod environment combinations used by Krab services.
 ///
 /// This is intentionally a lightweight policy check for developer workflows; stricter runtime
 /// validation still lives in framework configuration loading.
-pub(super) fn validate_environment(strict: bool) -> Result<()> {
-    let mut warnings = Vec::new();
+///
+/// The rules themselves live in [`crate::env_policy`], shared with
+/// `krab doctor`. Only the presentation and the `--strict` exit rule are here.
+pub(super) fn validate_environment(strict: bool, json: bool) -> Result<()> {
+    let warnings = crate::env_policy::collect_environment_warnings();
+    let failed = strict && !warnings.is_empty();
 
-    let auth_mode = std::env::var("KRAB_AUTH_MODE").unwrap_or_else(|_| "jwt".to_string());
-    if auth_mode.eq_ignore_ascii_case("jwt") || auth_mode.eq_ignore_ascii_case("oidc") {
-        if std::env::var("KRAB_OIDC_ISSUER").is_err() {
-            warnings.push("KRAB_OIDC_ISSUER is required when KRAB_AUTH_MODE=jwt".to_string());
-        }
-        if std::env::var("KRAB_OIDC_AUDIENCE").is_err() {
-            warnings.push("KRAB_OIDC_AUDIENCE is required when KRAB_AUTH_MODE=jwt".to_string());
-        }
-    } else if auth_mode.eq_ignore_ascii_case("static") {
-        let env_name = std::env::var("KRAB_ENVIRONMENT").unwrap_or_else(|_| "dev".to_string());
-        if !env_name.eq_ignore_ascii_case("local") && !env_name.eq_ignore_ascii_case("dev") {
-            warnings.push(
-                "KRAB_AUTH_MODE=static is forbidden outside local/dev; use jwt or oidc".to_string(),
-            );
-        }
-    } else {
-        warnings.push(format!(
-            "Unsupported KRAB_AUTH_MODE='{}'; expected static|jwt|oidc",
-            auth_mode
-        ));
-    }
-
-    let env_name = std::env::var("KRAB_ENVIRONMENT").unwrap_or_else(|_| "dev".to_string());
-    if !["local", "dev", "staging", "prod"].contains(&env_name.as_str()) {
-        warnings.push(format!(
-            "KRAB_ENVIRONMENT should be one of local|dev|staging|prod, found: {}",
-            env_name
-        ));
-    }
-
-    if warnings.is_empty() {
+    if json {
+        let status = match (warnings.is_empty(), failed) {
+            (true, _) => "passed",
+            (false, true) => "failed",
+            (false, false) => "warnings",
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&EnvCheckReport {
+                command: "env-check",
+                status,
+                warnings: &warnings,
+            })?
+        );
+    } else if warnings.is_empty() {
         println!("✅ Environment validation passed");
-        return Ok(());
+    } else {
+        for warning in &warnings {
+            eprintln!("⚠️ {warning}");
+        }
     }
 
-    for warning in &warnings {
-        eprintln!("⚠️ {warning}");
-    }
-
-    if strict {
+    // `--json` changes only what is printed, never the exit status.
+    if failed {
         anyhow::bail!("Environment validation failed in strict mode");
     }
 
@@ -334,14 +345,35 @@ pub(super) fn generate_docs(out: &PathBuf) -> Result<()> {
         rows.push_str(&format!("| `{}` | {} |\n", cmd, desc));
     }
 
+    // The command the CLI actually runs, feature flags included. Documenting it
+    // without them is how three separate build paths spent two releases
+    // shipping an inert bundle.
+    let client_section = match (
+        project.client_package.as_deref(),
+        project.client_crate_dir.as_deref(),
+    ) {
+        (Some(package), Some(dir)) => format!(
+            "## Client/WASM Build\n\n- Client package: `{package}`\n- Crate directory: `{}`\n\n`krab build --client --release` runs:\n\n```sh\nwasm-pack build --release --target web --out-dir {}{}\n```\n\n`#[island]` compiles its hydrating half only under `feature = \"web\"`. A bundle built without it still loads and still exports `hydrate` — it just does nothing, at roughly a tenth of the size, with no error anywhere. The CLI passes the feature whenever the client crate's manifest declares it.\n\n",
+            dir.display(),
+            project.dist_dir.display(),
+            if client_web_feature(dir) {
+                " -- --features web"
+            } else {
+                ""
+            }
+        ),
+        _ => "## Client/WASM Build\n\nNo client/WASM package is configured in `[project]` of `krab.toml`, so `krab build` skips the client step.\n\n".to_string(),
+    };
+
     let content = format!(
-        "# Dev Workflow and Build Outputs\n\n## Project Model\n\n- Frontend bin: `{}`\n- Bootstrap bin: `{}`\n- Public dir: `{}`\n- Dist dir: `{}`\n- Watch roots: {:?}\n\n## CLI Commands\n\n| Command | Description |\n|---|---|\n{}\n## Asset Fingerprinting\n\nWhen a client/WASM package is configured, the CLI fingerprints browser assets and writes `{}/assets.json`.\n\n## Watch/HMR Workflow\n\n`krab dev --watch` (or `krab watch`) performs incremental change detection over the configured watch roots, rebuilds only the necessary targets, mirrors changed public assets, and writes a lightweight HMR signal file at `{}`.\n\n## Bootstrap Health Semantics\n\n`krab bootstrap` starts services in dependency order, waits on each startup readiness probe before proceeding, and applies restart policy backoff/attempt limits from `krab.toml`. Use `/ready` for readiness probes and `/health` for liveness checks. Service stdout/stderr are captured with stable `[service::stream]` prefixes and written to `internal/audit/orchestrator/` for artifact collection.\n",
+        "# Dev Workflow and Build Outputs\n\n## Project Model\n\n- Frontend bin: `{}`\n- Bootstrap bin: `{}`\n- Public dir: `{}`\n- Dist dir: `{}`\n- Watch roots: {:?}\n\n## CLI Commands\n\n| Command | Description |\n|---|---|\n{}\n{}## Asset Fingerprinting\n\nWhen a client/WASM package is configured, the CLI fingerprints browser assets and writes `{}/assets.json`.\n\n## Watch/HMR Workflow\n\n`krab dev --watch` (or `krab watch`) performs incremental change detection over the configured watch roots, rebuilds only the necessary targets, mirrors changed public assets, and writes a lightweight HMR signal file at `{}`.\n\n## Bootstrap Health Semantics\n\n`krab bootstrap` starts services in dependency order, waits on each startup readiness probe before proceeding, and applies restart policy backoff/attempt limits from `krab.toml`. Use `/ready` for readiness probes and `/health` for liveness checks. Service stdout/stderr are captured with stable `[service::stream]` prefixes and written to `internal/audit/orchestrator/` for artifact collection.\n",
         project.frontend_bin,
         project.bootstrap_bin,
         project.public_dir.display(),
         project.dist_dir.display(),
         project.watch_roots(),
         rows,
+        client_section,
         project.dist_dir.display(),
         project.hmr_signal_path.display()
     );
@@ -408,6 +440,12 @@ fn build_client_target(
         )
     })?;
 
+    // `#[island]` selects its hydrating half on `feature = "web"`. A client
+    // build that omits it produces a bundle whose `hydrate()` logs one line and
+    // returns — indistinguishable from a working one except by size, which is
+    // how it went unnoticed through the whole 0.1–0.2 line.
+    let web_feature = client_web_feature(client_crate_dir);
+
     if release {
         println!("   > Running optimized production wasm-pack pipeline...");
         let mut wasm_pack_cmd = Command::new("wasm-pack");
@@ -419,9 +457,18 @@ fn build_client_target(
             .arg("web")
             .arg("--out-dir")
             .arg(absolute_path(&project.dist_dir)?);
+        if web_feature {
+            // Everything after `--` goes to cargo, not to wasm-pack.
+            wasm_pack_cmd.arg("--").arg("--features").arg("web");
+        }
         run_command_logged(
             &format!(
-                "wasm-pack build --release --target web ({})",
+                "wasm-pack build --release --target web{} ({})",
+                if web_feature {
+                    " -- --features web"
+                } else {
+                    ""
+                },
                 client_package
             ),
             &mut wasm_pack_cmd,
@@ -480,11 +527,15 @@ fn build_client_target(
             .arg(client_package)
             .arg("--target")
             .arg("wasm32-unknown-unknown");
+        if web_feature {
+            client_cmd.arg("--features").arg("web");
+        }
 
         run_command_logged(
             &format!(
-                "cargo build -p {} --target wasm32-unknown-unknown",
-                client_package
+                "cargo build -p {} --target wasm32-unknown-unknown{}",
+                client_package,
+                if web_feature { " --features web" } else { "" }
             ),
             &mut client_cmd,
             diagnostics,
@@ -525,8 +576,83 @@ fn build_client_target(
     Ok(true)
 }
 
+/// Whether the client crate at `crate_dir` declares a `web` Cargo feature.
+///
+/// The browser half of `#[island]` — the hydrating implementation and its
+/// `inventory` registration — is gated on `feature = "web"`, so a client bundle
+/// built without it is inert. `krab_client` now enables `web` by default, but
+/// a crate that also puts wasm32-only dependencies behind the feature keeps it
+/// opt-in (`examples/reference_apps/islands_rpc` does exactly that, because
+/// enabling it for a native build would not compile).
+///
+/// The flag is passed only when the manifest declares the feature. Passing it
+/// unconditionally would turn `krab build --client` into a hard failure
+/// ("does not have the feature `web`") for every client crate that gates its
+/// browser half on something else, or on nothing at all.
+///
+/// An unreadable or unparseable manifest yields `false`: the build then runs
+/// exactly as it did before, and cargo reports the real problem.
+fn client_web_feature(crate_dir: &Path) -> bool {
+    #[derive(Deserialize)]
+    struct Manifest {
+        #[serde(default)]
+        features: BTreeMap<String, Vec<String>>,
+    }
+
+    let Ok(contents) = fs::read_to_string(crate_dir.join("Cargo.toml")) else {
+        return false;
+    };
+
+    toml::from_str::<Manifest>(&contents)
+        .map(|manifest| manifest.features.contains_key("web"))
+        .unwrap_or(false)
+}
+
+/// Owns the frontend process for the lifetime of the watch loop and kills it on drop.
+///
+/// The watch loop uses `?` at several points while the frontend is already
+/// running (fingerprint collection, the HMR signal write, `try_wait`, the
+/// in-loop respawn). Before this guard, every one of those early returns left an
+/// orphaned `cargo run` holding the listen port, so the next `krab dev` failed to
+/// bind with an error that pointed nowhere near the cause. `Drop` covers the
+/// panic path too, which no amount of explicit cleanup at the return sites would.
+struct FrontendChildGuard {
+    child: Child,
+}
+
+impl FrontendChildGuard {
+    fn new(child: Child) -> Self {
+        Self { child }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    /// Stop the process currently owned and take ownership of its replacement.
+    fn replace(&mut self, child: Child) {
+        self.terminate();
+        self.child = child;
+    }
+
+    /// Best-effort kill plus reap, so the port is released and no zombie is left.
+    ///
+    /// Both calls are allowed to fail: the child may already have exited, which
+    /// is the normal case on the restart-after-crash path.
+    fn terminate(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for FrontendChildGuard {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
 /// Spawn the frontend service process used by `krab dev` and the watch loop.
-fn spawn_frontend(project: &ProjectModel, release: bool) -> Result<std::process::Child> {
+fn spawn_frontend(project: &ProjectModel, release: bool) -> Result<Child> {
     let mut cmd = Command::new("cargo");
     cmd.arg("run").arg("--bin").arg(&project.frontend_bin);
     if release {
@@ -676,6 +802,12 @@ fn remove_empty_parent_dirs(mut current: Option<&Path>, stop_at: &Path) -> Resul
 }
 
 /// Produce a lightweight fingerprint map for files that influence frontend rebuild decisions.
+///
+/// `DefaultHasher` is correct *here* and deliberately not SHA-256: these values
+/// are ephemeral, never leave the process, and are only ever compared against
+/// other values produced by the same binary in the same run, so the instability
+/// that rules `DefaultHasher` out for [`asset_content_digest`] cannot bite. Do
+/// not unify the two — the constraints are opposite.
 fn collect_file_fingerprints(project: &ProjectModel) -> Result<HashMap<PathBuf, u64>> {
     let mut files = Vec::new();
     for root in project.watch_roots() {
@@ -744,9 +876,7 @@ fn fingerprint_assets(out_dir: &Path, artifact_stem: Option<&str>) -> Result<()>
         }
 
         let bytes = fs::read(&input).with_context(|| format!("Failed to read {:?}", input))?;
-        let mut hasher = DefaultHasher::new();
-        bytes.hash(&mut hasher);
-        let digest = format!("{:016x}", hasher.finish());
+        let digest = asset_content_digest(&bytes);
 
         let ext = input
             .extension()
@@ -772,6 +902,18 @@ fn fingerprint_assets(out_dir: &Path, artifact_stem: Option<&str>) -> Result<()>
     fs::write(out_dir.join("assets.json"), manifest).context("Failed to write assets.json")?;
 
     Ok(())
+}
+
+/// Content digest baked into a fingerprinted asset filename.
+///
+/// SHA-256, not `DefaultHasher`: this digest is persisted — it becomes a file
+/// name on disk, an entry in `assets.json`, and a cache key in every browser and
+/// CDN that has seen the asset. `DefaultHasher`'s output is documented as
+/// unstable across Rust releases, so building on a newer toolchain would rename
+/// every asset and invalidate every one of those caches for bytes that never
+/// changed. Same reasoning as krab_core's migration checksums.
+fn asset_content_digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Classify a changed path into client/server/public buckets for partial invalidation.
@@ -853,8 +995,47 @@ struct PublicAssetManifest {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_path_change, normalize_relative_path, ProjectModel};
+    use super::{
+        asset_content_digest, classify_path_change, client_web_feature, fingerprint_assets,
+        normalize_relative_path, FrontendChildGuard, ProjectModel,
+    };
+    use std::collections::BTreeMap;
+    use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    /// The bug this guards: a client bundle built without `web` still links and
+    /// still loads, it just does nothing. Detecting the feature from the
+    /// manifest is what stops `krab build --client` from shipping that.
+    #[test]
+    fn the_web_feature_is_detected_from_the_client_manifest() {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo_client\"\n\n[features]\nweb = []\n",
+        )
+        .expect("write manifest");
+        assert!(client_web_feature(dir.path()));
+
+        // A client crate that gates its browser half on something else must not
+        // be handed a feature it does not declare — cargo would refuse to build.
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo_client\"\n\n[features]\nbrowser = []\n",
+        )
+        .expect("write manifest");
+        assert!(!client_web_feature(dir.path()));
+    }
+
+    #[test]
+    fn a_missing_or_unparseable_manifest_adds_no_features() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert!(!client_web_feature(dir.path()));
+
+        std::fs::write(dir.path().join("Cargo.toml"), "this is not toml {{").expect("write");
+        assert!(!client_web_feature(dir.path()));
+    }
 
     fn demo_project() -> ProjectModel {
         ProjectModel {
@@ -897,5 +1078,130 @@ mod tests {
     fn normalize_relative_path_uses_forward_slashes() {
         let normalized = normalize_relative_path(Path::new("public/images/logo.svg"));
         assert_eq!(normalized, "public/images/logo.svg");
+    }
+
+    /// Pins the digest to hard-coded SHA-256 output.
+    ///
+    /// The whole point of moving off `DefaultHasher` is that the digest survives
+    /// a toolchain bump, and a test that only checked "some hex characters"
+    /// would have passed under the old hasher too. If this ever fails, the
+    /// fingerprint algorithm changed and every published asset URL changed with
+    /// it — that is a deliberate decision to make, not a test to relax.
+    #[test]
+    fn asset_digest_is_stable_sha256() {
+        assert_eq!(
+            asset_content_digest(b"krab-asset-fingerprint"),
+            "94ccafed55efc4f6c80e5aaaa93219d640900c0da474e4eb039372d77d62acf5"
+        );
+        assert_eq!(
+            asset_content_digest(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    /// The frontend parses `assets.json` at boot, so its shape is a contract.
+    ///
+    /// Guards the SHA-256 swap: the digest is wider than `DefaultHasher`'s was,
+    /// and truncating it to a different width or reordering the filename parts
+    /// would break asset resolution at runtime rather than at build time.
+    #[test]
+    fn fingerprint_assets_preserves_the_manifest_contract() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(dir.path().join("demo_client.js"), b"console.log(1);").expect("write js");
+        fs::write(dir.path().join("demo_client_bg.wasm"), b"\0asm\x01").expect("write wasm");
+
+        fingerprint_assets(dir.path(), Some("demo_client")).expect("fingerprint");
+
+        let raw = fs::read_to_string(dir.path().join("assets.json")).expect("read manifest");
+        let parsed: BTreeMap<String, BTreeMap<String, String>> =
+            serde_json::from_str(&raw).expect("manifest is valid JSON");
+        assert_eq!(parsed.len(), 2);
+
+        let entry = &parsed["demo_client.js"];
+        assert_eq!(entry["source"], "demo_client.js");
+
+        // `<stem>.<8 hex>.<ext>`, with the copied file actually on disk.
+        let fingerprinted = &entry["fingerprinted"];
+        let digest = fingerprinted
+            .strip_prefix("demo_client.")
+            .and_then(|rest| rest.strip_suffix(".js"))
+            .expect("fingerprinted name keeps stem and extension around the digest");
+        assert_eq!(digest.len(), 8);
+        assert_eq!(digest, &asset_content_digest(b"console.log(1);")[..8]);
+        assert!(dir.path().join(fingerprinted).exists());
+
+        assert_eq!(
+            parsed["demo_client_bg.wasm"]["source"],
+            "demo_client_bg.wasm"
+        );
+    }
+
+    /// A cheap long-lived process, portable across the platforms CI runs on.
+    fn spawn_sleeper() -> std::process::Child {
+        if cfg!(windows) {
+            // `ping` is the shortest always-present Windows sleep; the pings run
+            // a second apart, so 30 outlives any plausible test run.
+            Command::new("ping")
+                .args(["-n", "30", "127.0.0.1"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("failed to spawn ping")
+        } else {
+            Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("failed to spawn sleep")
+        }
+    }
+
+    /// Encodes the leak fixed here: `watch_project` returned through `?` while
+    /// the frontend was still running, orphaning a `cargo run` that kept the
+    /// listen port and made the next `krab dev` fail to bind.
+    ///
+    /// This drives `terminate` directly rather than observing a dropped guard:
+    /// `Drop` is a one-line delegation to it, and probing for a dead PID after
+    /// the handle is reaped is both platform-specific and racy against PID
+    /// reuse. The assertions below are the real signal — the child was alive,
+    /// and after the guard's cleanup it is not.
+    #[test]
+    fn frontend_guard_kills_a_live_child() {
+        let mut guard = FrontendChildGuard::new(spawn_sleeper());
+        assert!(
+            guard.try_wait().expect("try_wait").is_none(),
+            "sleeper should still be running before cleanup"
+        );
+
+        guard.terminate();
+
+        assert!(
+            guard.try_wait().expect("try_wait").is_some(),
+            "guard cleanup must leave the child terminated and reaped"
+        );
+    }
+
+    /// Restarting after a rebuild must hand ownership over, not stack processes.
+    ///
+    /// The predecessor is unobservable once `replace` has taken it — asserting
+    /// on a reaped PID would race with PID reuse — so what is checked here is
+    /// that the guard now owns the replacement, which is only reachable through
+    /// the `terminate` that `replace` runs first.
+    #[test]
+    fn frontend_guard_replace_hands_ownership_to_the_new_child() {
+        let first = spawn_sleeper();
+        let first_pid = first.id();
+        let mut guard = FrontendChildGuard::new(first);
+
+        let second = spawn_sleeper();
+        let second_pid = second.id();
+        assert_ne!(first_pid, second_pid);
+
+        guard.replace(second);
+
+        assert_eq!(guard.child.id(), second_pid);
+        assert!(
+            guard.try_wait().expect("try_wait").is_none(),
+            "the replacement must still be running"
+        );
+        guard.terminate();
     }
 }

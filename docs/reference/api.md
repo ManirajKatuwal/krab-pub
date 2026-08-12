@@ -264,7 +264,56 @@ Accepted response:
 }
 ```
 
-## 7. Versioning policy
+## 7. Browser runtime (`krab_client`)
+
+Two entry points are exported to JavaScript. A page loads the module, awaits
+`init()`, and calls them:
+
+| JS export | Description |
+|---|---|
+| `hydrate()` | Hydrate every `[data-island]` in the document. Idempotent — an already-hydrated boundary is skipped, not re-bound, so it is safe to call again after inserting markup. |
+| `start_router()` | Install the client-side router (see below). Idempotent. |
+
+```html
+<script type="module">
+  import init, { hydrate, start_router } from '/pkg/krab_client.js';
+  await init();
+  hydrate();
+  start_router();
+</script>
+```
+
+Rust islands additionally reach two scoped entry points, for markup that arrives
+after first paint:
+
+| Rust function | Description |
+|---|---|
+| `hydrate_within(root: &web_sys::Element)` | Hydrate only the `[data-island]` boundaries inside `root`. |
+| `unmount(root: &web_sys::Element)` | Release what hydration created under `root`: event listeners, dynamic regions, and effects. Call it before removing hydrated markup — dropping the DOM node alone leaves all three alive for the life of the page. |
+
+A bundle built without `krab_client`'s `web` feature exports the same names and
+does nothing. See [Hydration](../architecture/hydration.md#building-a-bundle-that-hydrates).
+
+### Client-side navigation requests
+
+When `start_router()` handles a link click or a Back/Forward, it fetches the
+destination with:
+
+| Header | Value | Meaning |
+|---|---|---|
+| `x-krab-router` | `1` | The request is an in-app navigation, not a document load. The response is parsed for `data-krab-router-outlet` and only that element's contents are used. |
+| `accept` | `text/html` | The router swaps HTML. |
+
+The header is advisory and the server is free to ignore it — a plain full-page
+response is handled correctly. A server that does observe it may use it to log
+navigations separately, or to return a lighter shell. Whatever it returns must
+still contain a `data-krab-router-outlet` element; without one the router falls
+back to a full browser navigation.
+
+Responses to router fetches are subject to the same auth, rate-limit, and error
+contract as any other `GET` on the route.
+
+## 8. Versioning policy
 
 - REST routes are versioned by path prefix: `/api/v1/...`
 - GraphQL versioning is schema-driven
