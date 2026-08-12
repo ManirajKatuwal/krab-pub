@@ -48,9 +48,15 @@ the server-first application that has to be *operated*.
 
 ## Installation
 
-All five crates are on [crates.io](https://crates.io/crates/krab_core) as of
-`0.2.0`. Release channels and versioning policy are in
+All five crates are on [crates.io](https://crates.io/crates/krab_core). The
+current release is `0.4.0`; release channels and versioning policy are in
 [RELEASE_POLICY.md](RELEASE_POLICY.md).
+
+> If you installed `0.2.0`, upgrade. The `krab_client` published at `0.2.0` was
+> built without its `web` feature, so its `hydrate()` logged one line and
+> returned — islands never came alive in the browser. `0.4.0` ships the real
+> runtime and makes `web` a default. `0.3.0` was tagged on GitHub but never
+> published to the registry, which is why crates.io goes `0.2.0` → `0.4.0`.
 
 Krab is five crates. Most applications need two:
 

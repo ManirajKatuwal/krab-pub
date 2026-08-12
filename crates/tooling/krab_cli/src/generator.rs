@@ -942,7 +942,7 @@ mod tests {
     /// Deprecated `krab_core` feature aliases: `grpc` -> `grpc-semantics` and
     /// `db` -> `db-postgres`. Both still resolve, which is precisely the hazard
     /// — their manifest comments read "Remove no earlier than 0.3.0" and the
-    /// workspace is at 0.3.0, so a project scaffolded against one is pinned to
+    /// workspace is past that, so a project scaffolded against one is pinned to
     /// a feature scheduled for deletion. `ServiceType::Grpc` emitted `grpc`
     /// until this was caught, and a declared-features check alone could not see
     /// it because the alias was declared.

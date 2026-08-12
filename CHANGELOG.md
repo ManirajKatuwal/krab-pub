@@ -16,6 +16,23 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ## [Unreleased]
 
+---
+
+## [0.4.0] — 2026-08-12
+
+The release that makes the published crates match the documented framework.
+Three audits land together: `krab_client` ships the real hydration runtime
+instead of the inert stub that 0.1 and 0.2 put on crates.io, `krab_macros` and
+`krab_orchestrator` get their first dedicated hardening pass, and `krab_cli`
+stops failing in the projects it scaffolds. It contains breaking changes (see
+**Changed**), so it takes the minor field per Cargo's pre-`1.0` semver rules.
+
+> `0.3.0` was tagged and released on GitHub but never published to crates.io.
+> The registry therefore moves `0.2.0` → `0.4.0`, and `0.4.0` carries the
+> `0.3.0` changes as well. Consumers upgrading from `0.2.0` should read both
+> this section and [`[0.3.0]`](#030--2026-08-12) — in particular the protocol
+> resolution and ISR cache changes, which are breaking.
+
 ### Added
 
 - `krab_client` can hydrate and release a subtree rather than only the whole

@@ -72,10 +72,15 @@ where to resume.
 
 ### Preconditions
 
-- `cargo publish --workspace --dry-run` exits 0. This is enforced on every push
-  by the `publish-dry-run` job in
-  [`ops-hardening.yaml`](.github/workflows/ops-hardening.yaml) and is a
-  promotion blocker, not an advisory check.
+- `cargo publish --workspace --dry-run` exits 0. This is a promotion blocker, not
+  an advisory check. The `publish-dry-run` job in
+  [`ops-hardening.yaml`](.github/workflows/ops-hardening.yaml) is wired to run it
+  on every push, but **GitHub Actions has never executed on this repository** —
+  every run fails at startup with zero jobs, an account-level billing condition.
+  Until that is resolved, the blocker is satisfied by a containerised run against
+  the same command surface, and the release checklist records which. "Verified in
+  a containerised run" and "enforced on push" are different claims; do not
+  conflate them in release evidence.
 - The `version` values in `[workspace.dependencies]` match
   `[workspace.package] version` in the root [`Cargo.toml`](Cargo.toml).
   `scripts/check_workspace_layout.py` enforces this.

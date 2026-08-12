@@ -1,7 +1,13 @@
 # Release checklist — 0.2.0
 
-Prepared, **not published.** Everything below up to "Publish" has been done and
-verified; the publish step is yours to run because it cannot be undone.
+**Published 2026-08-11.** All five crates reached crates.io at `0.2.0`. Kept as
+the reference template for later releases; the current one is
+[`release_0_4_0_checklist.md`](release_0_4_0_checklist.md).
+
+> One defect escaped this checklist: `krab_client` was published without its
+> `web` feature, so the crate on crates.io was an inert stub. The gap was that
+> nothing here verified the *published artifact's* feature set, only that the
+> build commands succeeded locally. The `0.4.0` checklist adds that check.
 
 ## Why 0.2.0 rather than 0.1.2
 
