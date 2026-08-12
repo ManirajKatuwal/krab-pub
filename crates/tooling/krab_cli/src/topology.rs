@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use serde::Serialize;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -6,9 +7,13 @@ use std::path::{Path, PathBuf};
 
 use crate::ServiceType;
 
-pub(crate) fn dispatch_topology_action(action: &crate::TopologyAction) -> Result<()> {
+pub(crate) fn dispatch_topology_action(
+    action: &crate::TopologyAction,
+    diagnostics: bool,
+    json: bool,
+) -> Result<()> {
     match action {
-        crate::TopologyAction::Doctor { diagnostics } => run_topology_doctor(*diagnostics),
+        crate::TopologyAction::Doctor => run_topology_doctor(diagnostics, json),
         crate::TopologyAction::Split {
             domain,
             protocols,
@@ -48,22 +53,105 @@ pub(crate) fn collect_rust_files_under(path: &Path, out: &mut Vec<PathBuf>) -> R
     Ok(())
 }
 
+/// Identifiers for the sub-checks that can be skipped when a project does not
+/// contain the artifact they inspect. Kept as constants so the diagnostics
+/// printer and `krab doctor` can ask "did this one actually run?" without
+/// string-matching prose.
+pub(crate) const CHECK_SERVICE_SOURCE_SCAN: &str = "service-source-scan";
+pub(crate) const CHECK_CONTRACT_PAYLOAD_DERIVES: &str = "contract-payload-derives";
+pub(crate) const CHECK_ORCHESTRATOR_SERVICE_CONFIG: &str = "orchestrator-service-config";
+
+/// A sub-check that did not run, and why.
+///
+/// Recorded rather than swallowed: a check that never executed must not be
+/// reported the same way as a check that executed and found nothing, or the
+/// output tells the reader their project is covered when it is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SkippedTopologyCheck {
+    pub(crate) check: &'static str,
+    pub(crate) reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TopologyDoctorReport {
     pub(crate) checked_rust_files: usize,
     pub(crate) contract_path: PathBuf,
     pub(crate) violations: Vec<String>,
+    /// Sub-checks that were not applicable to this project. Empty inside the
+    /// framework workspace, where every inspected path exists.
+    pub(crate) skipped: Vec<SkippedTopologyCheck>,
+}
+
+impl TopologyDoctorReport {
+    /// Whether the named sub-check actually executed.
+    pub(crate) fn ran(&self, check: &str) -> bool {
+        !self.skipped.iter().any(|entry| entry.check == check)
+    }
+}
+
+/// Resolve a repository-relative path against a project root.
+///
+/// The `.` (or empty) root deliberately yields the bare relative path rather
+/// than `./foo`, so running from the process CWD prints exactly the paths the
+/// report has always printed — diagnostics text and violation strings are read
+/// by humans and matched by CI logs.
+fn resolve_project_path(root: &Path, relative: &str) -> PathBuf {
+    if root.as_os_str().is_empty() || root == Path::new(".") {
+        PathBuf::from(relative)
+    } else {
+        root.join(relative)
+    }
 }
 
 pub(crate) fn topology_doctor_report() -> Result<TopologyDoctorReport> {
+    topology_doctor_report_at(Path::new("."))
+}
+
+/// Build the topology report for a project rooted at `root`.
+///
+/// Root-parameterised so the tests can point it at a `tempfile::TempDir`
+/// instead of mutating the process-global CWD.
+///
+/// Every path this touches (`services/`, the `krab_core` contract source,
+/// `krab.toml`) is specific to a Krab *framework* checkout. A project produced
+/// by `krab new` has none of them. Absence used to be a hard `Err`, which made
+/// `krab doctor` and `krab topology doctor` exit 1 with a bare "Failed reading
+/// crates/framework/krab_core/src/service_contract.rs" in every generated
+/// project — a framework-repo assumption presented to users as their bug. A
+/// missing artifact is now a recorded skip; an artifact that is present and
+/// wrong is still a violation.
+pub(crate) fn topology_doctor_report_at(root: &Path) -> Result<TopologyDoctorReport> {
     let mut violations: Vec<String> = Vec::new();
+    let mut skipped: Vec<SkippedTopologyCheck> = Vec::new();
+
+    let services_dir = resolve_project_path(root, "services");
     let mut rust_files = Vec::new();
-    collect_rust_files_under(Path::new("services"), &mut rust_files)?;
+    if services_dir.exists() {
+        collect_rust_files_under(&services_dir, &mut rust_files)?;
+    } else {
+        skipped.push(SkippedTopologyCheck {
+            check: CHECK_SERVICE_SOURCE_SCAN,
+            reason: format!(
+                "no `{}` directory; cross-service import and ServiceEndpoint scans not applicable",
+                services_dir.display()
+            ),
+        });
+    }
 
     for file in &rust_files {
         let owner = owning_service_name(file);
-        let raw = fs::read_to_string(file)
-            .with_context(|| format!("Failed reading Rust source {}", file.display()))?;
+        // A source file we listed but cannot read is a finding about this
+        // project, not a reason to abandon the whole report.
+        let raw = match fs::read_to_string(file) {
+            Ok(raw) => raw,
+            Err(err) => {
+                violations.push(format!(
+                    "{}: could not be read for boundary analysis: {err}",
+                    file.display()
+                ));
+                continue;
+            }
+        };
 
         for (line_idx, line) in raw.lines().enumerate() {
             if let Some(target) = parse_direct_service_import(line) {
@@ -85,20 +173,51 @@ pub(crate) fn topology_doctor_report() -> Result<TopologyDoctorReport> {
         collect_service_endpoint_block_violations(file, &raw, &mut violations);
     }
 
-    let contract_path = PathBuf::from("crates/framework/krab_core/src/service_contract.rs");
-    let contract_raw = fs::read_to_string(&contract_path)
-        .with_context(|| format!("Failed reading {}", contract_path.display()))?;
-    for issue in detect_contract_payload_violations(&contract_raw) {
-        violations.push(format!("{}: {issue}", contract_path.display()));
+    let contract_path =
+        resolve_project_path(root, "crates/framework/krab_core/src/service_contract.rs");
+    if contract_path.exists() {
+        match fs::read_to_string(&contract_path) {
+            Ok(contract_raw) => {
+                for issue in detect_contract_payload_violations(&contract_raw) {
+                    violations.push(format!("{}: {issue}", contract_path.display()));
+                }
+            }
+            Err(err) => violations.push(format!(
+                "{}: could not be read for contract payload analysis: {err}",
+                contract_path.display()
+            )),
+        }
+    } else {
+        skipped.push(SkippedTopologyCheck {
+            check: CHECK_CONTRACT_PAYLOAD_DERIVES,
+            reason: format!(
+                "`{}` is not present; this file only exists in a Krab framework checkout",
+                contract_path.display()
+            ),
+        });
     }
 
-    let service_config_path = PathBuf::from("krab.toml");
+    let service_config_path = resolve_project_path(root, "krab.toml");
     if service_config_path.exists() {
-        let service_config_raw = fs::read_to_string(&service_config_path)
-            .with_context(|| format!("Failed reading {}", service_config_path.display()))?;
-        for issue in detect_service_config_violations(&service_config_raw) {
-            violations.push(format!("{}: {issue}", service_config_path.display()));
+        match fs::read_to_string(&service_config_path) {
+            Ok(service_config_raw) => {
+                for issue in detect_service_config_violations(&service_config_raw) {
+                    violations.push(format!("{}: {issue}", service_config_path.display()));
+                }
+            }
+            Err(err) => violations.push(format!(
+                "{}: could not be read for orchestrator policy analysis: {err}",
+                service_config_path.display()
+            )),
         }
+    } else {
+        skipped.push(SkippedTopologyCheck {
+            check: CHECK_ORCHESTRATOR_SERVICE_CONFIG,
+            reason: format!(
+                "no `{}`; orchestrator health/restart policy not applicable",
+                service_config_path.display()
+            ),
+        });
     }
 
     // Also runs under `krab release check` (via doctor.rs). Safe there: with
@@ -113,6 +232,7 @@ pub(crate) fn topology_doctor_report() -> Result<TopologyDoctorReport> {
         checked_rust_files: rust_files.len(),
         contract_path,
         violations,
+        skipped,
     })
 }
 
@@ -129,27 +249,104 @@ fn runtime_topology_env_violation() -> Option<String> {
     }
 }
 
-fn run_topology_doctor(diagnostics: bool) -> Result<()> {
-    println!("🩺 Running topology doctor...");
+/// A sub-check that did not run, in `--json` form.
+#[derive(Debug, Serialize)]
+struct SkippedTopologyCheckJson<'a> {
+    check: &'a str,
+    reason: &'a str,
+}
+
+/// The `--json` shape of `krab topology doctor`.
+///
+/// `checked_rust_files` and `contract_path` are `null` when their sub-check did
+/// not run, mirroring the human output's rule that a skipped check is never
+/// reported as if it had produced a result.
+#[derive(Debug, Serialize)]
+struct TopologyDoctorJson<'a> {
+    success: bool,
+    checked_rust_files: Option<usize>,
+    contract_path: Option<String>,
+    violations: &'a [String],
+    skipped: Vec<SkippedTopologyCheckJson<'a>>,
+}
+
+fn run_topology_doctor(diagnostics: bool, json: bool) -> Result<()> {
+    if !json {
+        println!("🩺 Running topology doctor...");
+    }
 
     // Single source of truth: the same report `krab release check` consumes,
     // so the two paths cannot drift in which checks they run.
     let report = topology_doctor_report()?;
 
-    if diagnostics {
-        println!("   > checked Rust files: {}", report.checked_rust_files);
+    if json {
         println!(
-            "   > checked contract payload serialization derives in {}",
-            report.contract_path.display()
+            "{}",
+            serde_json::to_string_pretty(&TopologyDoctorJson {
+                success: report.violations.is_empty(),
+                checked_rust_files: report
+                    .ran(CHECK_SERVICE_SOURCE_SCAN)
+                    .then_some(report.checked_rust_files),
+                contract_path: report
+                    .ran(CHECK_CONTRACT_PAYLOAD_DERIVES)
+                    .then(|| report.contract_path.display().to_string()),
+                violations: &report.violations,
+                skipped: report
+                    .skipped
+                    .iter()
+                    .map(|entry| SkippedTopologyCheckJson {
+                        check: entry.check,
+                        reason: entry.reason.as_str(),
+                    })
+                    .collect(),
+            })?
         );
-        println!("   > checked orchestrator service health/restart policy in krab.toml");
+
+        // `--json` changes only what is printed, never the exit status.
+        if !report.violations.is_empty() {
+            anyhow::bail!("topology doctor failed");
+        }
+        return Ok(());
+    }
+
+    if diagnostics {
+        // Only claim a check ran when it ran. The skipped list below carries
+        // the rest, so nothing silently disappears from the output.
+        if report.ran(CHECK_SERVICE_SOURCE_SCAN) {
+            println!("   > checked Rust files: {}", report.checked_rust_files);
+        }
+        if report.ran(CHECK_CONTRACT_PAYLOAD_DERIVES) {
+            println!(
+                "   > checked contract payload serialization derives in {}",
+                report.contract_path.display()
+            );
+        }
+        if report.ran(CHECK_ORCHESTRATOR_SERVICE_CONFIG) {
+            println!("   > checked orchestrator service health/restart policy in krab.toml");
+        }
         println!(
             "   > checked runtime topology env (KRAB_RUNTIME_TOPOLOGY, KRAB_RUNTIME_ENDPOINTS_JSON) with strict parsing"
         );
+
+        if !report.skipped.is_empty() {
+            println!("   > skipped (not applicable to this project):");
+            for entry in &report.skipped {
+                println!("      - {}: {}", entry.check, entry.reason);
+            }
+        }
     }
 
     if report.violations.is_empty() {
-        println!("✅ topology doctor passed");
+        if report.skipped.is_empty() {
+            println!("✅ topology doctor passed");
+        } else {
+            // Never print an unqualified pass when part of the suite never
+            // ran — a skipped check is not a green check.
+            println!(
+                "✅ topology doctor passed ({} check(s) skipped as not applicable)",
+                report.skipped.len()
+            );
+        }
         return Ok(());
     }
 
@@ -572,12 +769,120 @@ fn detect_service_config_violations(raw: &str) -> Vec<String> {
 mod tests {
     use super::{
         detect_service_config_violations, parse_direct_service_import,
-        runtime_topology_env_violation, split_contract_conformance_test,
+        runtime_topology_env_violation, split_contract_conformance_test, topology_doctor_report_at,
+        CHECK_CONTRACT_PAYLOAD_DERIVES, CHECK_ORCHESTRATOR_SERVICE_CONFIG,
+        CHECK_SERVICE_SOURCE_SCAN,
     };
+    use std::fs;
+    use std::path::Path;
 
     fn clear_topology_env() {
         std::env::remove_var("KRAB_RUNTIME_TOPOLOGY");
         std::env::remove_var("KRAB_RUNTIME_ENDPOINTS_JSON");
+    }
+
+    fn write_contract_file(root: &Path, body: &str) {
+        let path = root.join("crates/framework/krab_core/src");
+        fs::create_dir_all(&path).expect("create contract dir");
+        fs::write(path.join("service_contract.rs"), body).expect("write contract file");
+    }
+
+    /// A project produced by `krab new` has no `services/`, no `krab.toml` in
+    /// the framework's shape, and certainly no `krab_core` source tree. This
+    /// used to return `Err("Failed reading
+    /// crates/framework/krab_core/src/service_contract.rs")`, which made
+    /// `krab doctor` and `krab topology doctor` exit 1 in every generated
+    /// project.
+    #[test]
+    #[serial_test::serial]
+    fn topology_report_skips_framework_only_paths_instead_of_erroring() {
+        clear_topology_env();
+        let root = tempfile::tempdir().expect("tempdir");
+
+        let report = topology_doctor_report_at(root.path())
+            .expect("a project without framework paths must still produce a report");
+
+        assert!(report.violations.is_empty(), "{:?}", report.violations);
+        assert_eq!(report.checked_rust_files, 0);
+
+        let skipped: Vec<&str> = report.skipped.iter().map(|entry| entry.check).collect();
+        assert!(skipped.contains(&CHECK_SERVICE_SOURCE_SCAN), "{skipped:?}");
+        assert!(
+            skipped.contains(&CHECK_CONTRACT_PAYLOAD_DERIVES),
+            "{skipped:?}"
+        );
+        assert!(
+            skipped.contains(&CHECK_ORCHESTRATOR_SERVICE_CONFIG),
+            "{skipped:?}"
+        );
+        assert!(!report.ran(CHECK_CONTRACT_PAYLOAD_DERIVES));
+    }
+
+    /// Tolerating an absent contract file must not tolerate a broken one: the
+    /// skip is about applicability, not about lowering the bar.
+    #[test]
+    #[serial_test::serial]
+    fn topology_report_still_flags_a_present_but_violating_contract_file() {
+        clear_topology_env();
+        let root = tempfile::tempdir().expect("tempdir");
+        write_contract_file(
+            root.path(),
+            "pub struct ContractPayload {\n    pub id: String,\n}\n",
+        );
+
+        let report = topology_doctor_report_at(root.path()).expect("report");
+
+        assert!(report.ran(CHECK_CONTRACT_PAYLOAD_DERIVES));
+        assert!(
+            report.violations.iter().any(|issue| issue
+                .contains("`ContractPayload` missing #[derive(Serialize, Deserialize)]")),
+            "{:?}",
+            report.violations
+        );
+    }
+
+    /// The same rule for the derives-are-present case: a readable, conforming
+    /// contract file is a real pass, not a skip.
+    #[test]
+    #[serial_test::serial]
+    fn topology_report_accepts_a_present_and_conforming_contract_file() {
+        clear_topology_env();
+        let root = tempfile::tempdir().expect("tempdir");
+        write_contract_file(
+            root.path(),
+            "#[derive(Debug, Serialize, Deserialize)]\npub struct ContractPayload {\n    pub id: String,\n}\n",
+        );
+
+        let report = topology_doctor_report_at(root.path()).expect("report");
+
+        assert!(report.ran(CHECK_CONTRACT_PAYLOAD_DERIVES));
+        assert!(report.violations.is_empty(), "{:?}", report.violations);
+    }
+
+    /// A present `krab.toml` is checked as before — absence is the only thing
+    /// that became a skip.
+    #[test]
+    #[serial_test::serial]
+    fn topology_report_still_flags_a_present_but_violating_krab_toml() {
+        clear_topology_env();
+        let root = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            root.path().join("krab.toml"),
+            "[services.frontend]\ncommand = \"cargo\"\n",
+        )
+        .expect("write krab.toml");
+
+        let report = topology_doctor_report_at(root.path()).expect("report");
+
+        assert!(report.ran(CHECK_ORCHESTRATOR_SERVICE_CONFIG));
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|issue| issue.contains("missing [services.frontend.healthcheck]")),
+            "{:?}",
+            report.violations
+        );
     }
 
     /// The generated test must never again assert something that cannot fail.

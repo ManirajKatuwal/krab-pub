@@ -37,6 +37,36 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
   distinguish an in-app navigation from a document request — for logging, or to
   serve a lighter shell. Documented in
   [`docs/reference/api.md`](docs/reference/api.md).
+- `krab completions <bash|zsh|fish|powershell|elvish>` writes a shell
+  completion script for the `krab` binary to stdout.
+- `--json` reaches the CI-facing commands that previously had no machine-readable
+  output: `krab doctor` (per-check name, level, details, plus the counts and the
+  `success` verdict computed under the same `--strict` rule as the exit code),
+  `krab topology doctor` (violations and skipped checks), `krab env-check`, and a
+  minimal `{command, status, error}` envelope for the `contract`, `db`, and
+  `security` gates. `--json` changes only what is printed, never the exit status.
+- `krab doctor` distinguishes a check that did not apply from one that passed.
+  Checks scoped to a Krab framework checkout report `SKIP` with the reason, and
+  skips are never fatal — including under `--strict`, because "not applicable" is
+  a fact about the project, not a defect.
+
+### Changed
+
+- `--diagnostics` and `--json` are global flags rather than per-subcommand ones
+  (they were redeclared on ten subcommands, and `--json` existed only on `release
+  check`/`certify`). Every existing invocation keeps working: clap accepts a
+  global flag before or after the subcommand.
+- `krab release certify --out` defaults to `internal/audit/release-certify/local`
+  instead of `release-evidence`, which created an untracked directory in the
+  repository root that no `.gitignore` rule covered. The certification index is
+  now written relative to `--out` rather than to a hardcoded
+  `internal/audit/release-certify/`, so running the command in a consumer's
+  project no longer creates a framework-specific tree inside it. CI is unaffected:
+  it passes `--out` explicitly.
+- The release evidence bundle creates only the four sections that receive
+  artifacts. `02-security`, `05-performance`, `06-observability` and
+  `07-deployment-rehearsal` were created empty on every run, reading as coverage
+  that did not exist.
 
 ### Deprecated
 
@@ -52,6 +82,57 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
   `default-features = false` removes them today.
 ### Fixed
 
+- `krab gen route|component|server-function` wires its output into the generated
+  project's module tree. It previously wrote a source file that nothing
+  declared, so the code was never compiled and the route silently did not
+  exist — `krab new my_app && krab gen route dashboard && cargo run` produced no
+  `/dashboard`. The route generator's contract was documented as
+  `service_frontend/build.rs` auto-discovery, which exists only inside the
+  framework workspace and never in a scaffolded project. `krab new` now emits
+  `// krab:modules` and `// krab:routes` markers, and `krab gen` inserts module
+  declarations and router registrations at them. Re-running is idempotent and
+  never overwrites a file you have edited; when the markers are absent the
+  command prints the wiring to add by hand rather than rewriting a `main.rs` it
+  did not generate.
+- Routes added by `krab gen route` to a `saas` project no longer bypass the
+  common HTTP layers. The merge now happens while the router still carries
+  `AppState`, so generated routes get the same telemetry, timeouts, and
+  middleware as the hand-written ones instead of silently skipping them.
+- `krab new` no longer creates empty `src/routes`, `src/api`, and `docs`
+  directories. Git does not track empty directories, so they vanished for anyone
+  who cloned a scaffolded project — and the generated Dockerfile's
+  `COPY public/ public/` then failed the container build. `public/` is pinned
+  with a `.gitkeep`; the directories the scaffolder never populated are gone.
+- `krab new` validates the project name before touching the filesystem, against
+  Cargo package rules, Rust keywords, and Windows device names, and suggests a
+  valid slug when it rejects one. `krab new "My App"` previously wrote an
+  unbuildable project whose failure surfaced only at `cargo run`.
+- Generated `.env.example` no longer sets `KRAB_SECRETS_SOURCE`, a variable no
+  Krab code reads and no reference page documents, and no longer ships
+  `change-me-in-production` as an inline secret for a configuration that
+  `staging` and `prod` reject at startup. It documents the
+  `NAME` → `NAME_FILE` → `NAME_VAULT_REF` resolution order and shows the `_FILE`
+  promotion path beside each secret. A test now parses the generated file and
+  asserts every variable against
+  [`docs/reference/environment.md`](docs/reference/environment.md).
+- The generated CI workflow no longer contains steps that cannot fail. The
+  `saas` template's `cargo test -- db_` step matched no tests and pointed
+  `DATABASE_URL` at a Postgres the workflow never started; it is removed rather
+  than made real, which would have left a starter whose `cargo test` fails on
+  any machine without a database. Every template now scaffolds a `/health` smoke
+  test, so `cargo test` in a new project asserts something.
+- The generated Dockerfile floats to `rust:1-slim-bookworm` and the generated
+  manifest declares `rust-version`. The image previously pinned `rust:1.77`
+  while the manifest floated its dependencies, so a dependency raising its MSRV
+  broke the container build with an error that looked nothing like the cause.
+- `krab new` runs `git init` in the project it scaffolds, with `--no-git` to opt
+  out. It wrote a `.gitignore` for a repository it never created. Initialisation
+  is skipped inside an existing work tree, no commit is created, and a missing
+  or failing `git` is a warning rather than a failed scaffold.
+- The `edge-ssr` template emits a real `docs/render_policy.md` describing the
+  render mode, ISR cache policy, and edge eligibility it actually configures.
+  The reference app READMEs had directed users to that file since they were
+  written; it had never been generated.
 - The WASM bundle contains the hydration runtime. `krab_client`'s `web`
   feature — which gates `hydrate()`, the reconciler, and the router's browser
   half — had no default, and the three build paths that produce the bundle (the
@@ -82,6 +163,68 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
   a `</main>` inside a comment or script *within* the outlet truncated the
   swapped content. Document titles carried across a navigation are now
   entity-decoded and tolerate attributes on `<title>`.
+- **`krab doctor` works outside the framework workspace.** It read
+  `crates/framework/krab_core/src/service_contract.rs` unconditionally, so in any
+  project scaffolded by `krab new` it printed `Error: Failed reading …` and exited
+  1 — and because one evaluator's error aborted the whole run, the three checks
+  that had already succeeded were discarded. The generated README tells users to
+  run exactly that command. Framework-only paths are now applicability checks,
+  and a failing evaluator becomes a `FAIL` entry in a report that still prints
+  every other check.
+- **`krab doctor --strict` passes on an untouched scaffold.** A generated
+  `krab.toml` declares `[project]` and no `[services.*]` — one binary, nothing
+  for the orchestrator to supervise — and the service-config check warned about
+  it, which `--strict` promoted to a failure. A brand-new project failed its own
+  gate before its author had written a line.
+- **`krab gen component|route|server-function` no longer destroys hand-written
+  files.** They wrote with no existence check, so re-running one silently
+  replaced an edited file with boilerplate while printing "created successfully".
+  An existing file is now kept, and the run reports that nothing was overwritten.
+- **Generated components and routes are part of the build.** The scaffold
+  declared no modules for them and the generator printed no instruction to add
+  any, so every file `krab gen` produced was dead code that `cargo build` never
+  saw. The scaffold now carries wiring markers and `krab gen` registers what it
+  generates.
+- `krab gen service --type grpc` requests `krab_core`'s canonical
+  `grpc-semantics` feature, and the `krab db *` gates request `db-postgres`.
+  Both previously named the deprecated `grpc`/`db` aliases, which are scheduled
+  for removal — generated projects were being pinned to a feature due to be
+  deleted. `--type rpc` now says that it enables the `rest` feature, rather than
+  leaving the user to discover it.
+- **The release evidence bundle contains evidence.** Steps ran with inherited
+  stdio and captured nothing, so `01-test-and-lint/clippy.txt` held three lines
+  restating the summary instead of the clippy output the bundle exists to
+  preserve. Command output is now captured into the artifact, and a failing
+  step's transcript is echoed so a local run stays debuggable.
+- Certification timestamps are RFC 3339 UTC rather than bare Unix epoch seconds
+  rendered as `timestamp: 1786…`.
+- The `secure_headers`, `csrf_strategy` and `telemetry_initialization` release
+  gates no longer pass on a mention inside a comment or a test file. They were
+  plain substring greps over every `.rs` file; one was being satisfied partly by
+  prose in a doc comment.
+- Fingerprinted asset filenames are derived from SHA-256 rather than
+  `DefaultHasher`, whose output is documented as unstable across Rust releases —
+  a toolchain bump silently renamed every asset and busted downstream caches.
+  This is the same reasoning `krab_core` already applies to migration checksums.
+- `krab dev --watch` no longer orphans its frontend process. Several error paths
+  returned while the spawned child was still alive, leaving a `cargo run` holding
+  the port so the next `krab dev` failed to bind.
+- `krab auth hash-password` prompts on stderr when stdin is a terminal. With no
+  `--password` it blocked on stdin with no output at all, which looks like a
+  hang. Piped input is unchanged.
+- The `content_site` reference-app README no longer tells readers to run `krab
+  release certify` before publishing — a governance command hardcoded to the
+  framework workspace's own services. The same correction was made for the `krab
+  new` README in 0.3.0 and missed this one.
+
+### Governance
+
+- `krab_cli` has an integration suite. It had ~88 unit tests and no `tests/`
+  directory, and every one of them passed while `krab doctor` was unusable in
+  every generated project — because each called an evaluator directly with a
+  hand-built root. The new tests run the real binary in a real `krab new`
+  project, covering the `new` → `doctor` round trip, generator idempotence and
+  no-clobber, generated-module wiring, and the deprecated-alias bans.
 
 ---
 

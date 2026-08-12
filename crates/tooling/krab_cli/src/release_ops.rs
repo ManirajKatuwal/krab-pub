@@ -121,7 +121,7 @@ pub(super) fn run_db_lifecycle_check(diagnostics: bool) -> Result<()> {
             .arg("--package")
             .arg("krab_core")
             .arg("--features")
-            .arg("db rest")
+            .arg("db-postgres rest")
             .arg("test_migration_lifecycle"),
         diagnostics,
     )
@@ -135,7 +135,7 @@ pub(super) fn run_db_rollback_check(diagnostics: bool) -> Result<()> {
             .arg("--package")
             .arg("krab_core")
             .arg("--features")
-            .arg("db rest")
+            .arg("db-postgres rest")
             .arg("test_migration_rollback"),
         diagnostics,
     )
@@ -149,7 +149,7 @@ pub(super) fn run_db_drift_check(diagnostics: bool) -> Result<()> {
             .arg("--package")
             .arg("krab_core")
             .arg("--features")
-            .arg("db rest")
+            .arg("db-postgres rest")
             .arg("test_drift_detection"),
         diagnostics,
     )
@@ -163,7 +163,7 @@ pub(super) fn run_db_rollback_rehearsal(out: &PathBuf, diagnostics: bool) -> Res
             .arg("--package")
             .arg("krab_core")
             .arg("--features")
-            .arg("db rest")
+            .arg("db-postgres rest")
             .arg("test_migration_rollback")
             .arg("--")
             .arg("--nocapture"),
@@ -173,7 +173,7 @@ pub(super) fn run_db_rollback_rehearsal(out: &PathBuf, diagnostics: bool) -> Res
     let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_else(|_| "local".to_string());
     let sha = std::env::var("GITHUB_SHA").unwrap_or_else(|_| "local".to_string());
     let git_ref = std::env::var("GITHUB_REF").unwrap_or_else(|_| "local".to_string());
-    let timestamp = chrono_like_utc_now();
+    let timestamp = rfc3339_utc_now();
 
     let mut evidence = String::new();
     evidence.push_str("rollback_rehearsal: ok\n");
@@ -343,7 +343,7 @@ fn collect_release_check_report(diagnostics: bool) -> ReleaseCheckReport {
     let _ = collect_rust_files_under(Path::new("services"), &mut files);
     let _ = collect_rust_files_under(Path::new("crates/framework"), &mut files);
     for file in &files {
-        if check_code_pattern_present(file.to_str().unwrap_or(""), "security_headers_middleware") {
+        if check_code_pattern_present(file, "security_headers_middleware") {
             headers_present = true;
             break;
         }
@@ -358,7 +358,7 @@ fn collect_release_check_report(diagnostics: bool) -> ReleaseCheckReport {
 
     let mut csrf_present = false;
     for file in &files {
-        if check_code_pattern_present(file.to_str().unwrap_or(""), "csrf_protection_middleware") {
+        if check_code_pattern_present(file, "csrf_protection_middleware") {
             csrf_present = true;
             break;
         }
@@ -373,10 +373,7 @@ fn collect_release_check_report(diagnostics: bool) -> ReleaseCheckReport {
 
     let mut telemetry_present = false;
     for file in &files {
-        if check_code_pattern_present(
-            file.to_str().unwrap_or(""),
-            "krab_core::telemetry::init_tracing",
-        ) {
+        if check_code_pattern_present(file, "krab_core::telemetry::init_tracing") {
             telemetry_present = true;
             break;
         }
@@ -413,7 +410,7 @@ fn collect_release_check_report(diagnostics: bool) -> ReleaseCheckReport {
 
 pub(super) fn run_release_certify(out: &Path, diagnostics: bool, json: bool) -> Result<()> {
     let bundle = create_release_evidence_bundle(out)?;
-    let timestamp = chrono_like_utc_now();
+    let timestamp = rfc3339_utc_now();
 
     let release_check = collect_release_check_report(diagnostics);
     write_json_artifact(&bundle.signoff.join("release-check.json"), &release_check)?;
@@ -526,37 +523,33 @@ pub(super) fn run_release_certify(out: &Path, diagnostics: bool, json: bool) -> 
     Ok(())
 }
 
+/// The subdirectories of a certification evidence bundle.
+///
+/// Only sections that actually receive an artifact are modelled here. Earlier
+/// revisions also created `02-security`, `05-performance`, `06-observability`
+/// and `07-deployment-rehearsal`, none of which was ever written to — an
+/// auditor opening the bundle saw four empty directories that read as coverage
+/// the certification run does not have. Creating a directory is a claim; make
+/// the claim only when there is a file to back it.
 struct ReleaseEvidenceBundle {
     test_and_lint: PathBuf,
-    security: PathBuf,
     compatibility: PathBuf,
     migrations: PathBuf,
-    performance: PathBuf,
-    observability: PathBuf,
-    deployment: PathBuf,
     signoff: PathBuf,
 }
 
 fn create_release_evidence_bundle(root: &Path) -> Result<ReleaseEvidenceBundle> {
     let bundle = ReleaseEvidenceBundle {
         test_and_lint: root.join("01-test-and-lint"),
-        security: root.join("02-security"),
         compatibility: root.join("03-contract-and-compatibility"),
         migrations: root.join("04-migrations-and-rollback"),
-        performance: root.join("05-performance"),
-        observability: root.join("06-observability"),
-        deployment: root.join("07-deployment-rehearsal"),
         signoff: root.join("08-signoff"),
     };
 
     for path in [
         &bundle.test_and_lint,
-        &bundle.security,
         &bundle.compatibility,
         &bundle.migrations,
-        &bundle.performance,
-        &bundle.observability,
-        &bundle.deployment,
         &bundle.signoff,
     ] {
         fs::create_dir_all(path)
@@ -566,14 +559,19 @@ fn create_release_evidence_bundle(root: &Path) -> Result<ReleaseEvidenceBundle> 
     Ok(bundle)
 }
 
+/// Run a subprocess gate and persist its real output as the artifact.
+///
+/// The output is captured rather than inherited so the bundle preserves the
+/// clippy/test/fmt transcript an auditor needs; a failing step is echoed to the
+/// console so a local run stays debuggable without opening the bundle.
 fn record_command_step(
     name: &'static str,
     artifact: &Path,
     diagnostics: bool,
     cmd: &mut Command,
 ) -> CertificationStepReport {
-    let result = run_command_logged(name, cmd, diagnostics);
-    record_step_result(name, artifact, result)
+    let (result, captured) = run_command_captured(name, cmd, diagnostics);
+    record_step_result(name, artifact, result, Some(&captured))
 }
 
 fn record_function_step<F>(
@@ -585,13 +583,19 @@ where
     F: FnOnce() -> Result<()>,
 {
     let result = action();
-    record_step_result(name, artifact, result)
+    // Honest accounting: these steps are in-process Rust functions that
+    // themselves shell out through `run_command_logged`, which inherits this
+    // process's stdio. Their child-process output therefore goes straight to
+    // the console and is not available to capture here. Passing `None` makes
+    // the artifact say so rather than imply a transcript it does not have.
+    record_step_result(name, artifact, result, None)
 }
 
 fn record_step_result(
     name: &'static str,
     artifact: &Path,
     result: Result<()>,
+    captured_output: Option<&str>,
 ) -> CertificationStepReport {
     let (status, error) = match result {
         Ok(()) => ("passed", None),
@@ -601,6 +605,25 @@ fn record_step_result(
     let mut body = format!("step: {name}\nstatus: {status}\n");
     if let Some(err) = &error {
         body.push_str(&format!("error: {err}\n"));
+    }
+    match captured_output {
+        Some(output) => {
+            body.push_str("\n--- captured output (stdout + stderr) ---\n");
+            if output.trim().is_empty() {
+                body.push_str("(command produced no output)\n");
+            } else {
+                body.push_str(output);
+                if !output.ends_with('\n') {
+                    body.push('\n');
+                }
+            }
+        }
+        None => body.push_str(
+            "\nnote: this step ran in-process and the cargo invocations it makes \
+             inherit this process's stdio, so their output was streamed to the \
+             console and could not be captured here. Only the outcome above is \
+             recorded for this step.\n",
+        ),
     }
     let _ = fs::write(artifact, body);
 
@@ -636,8 +659,27 @@ fn render_certification_summary_markdown(summary: &ReleaseCertificationReport) -
     out
 }
 
-fn certification_index_root() -> PathBuf {
-    PathBuf::from("internal/audit/release-certify")
+/// Where `latest.json` / `latest.md` are written, derived from the `--out` root.
+///
+/// This used to be a hardcoded `internal/audit/release-certify`, so a developer
+/// who installed the CLI from crates.io and ran `krab release certify` in their
+/// own project got a Krab-specific `internal/audit/` tree created inside it,
+/// wherever they had pointed `--out`.
+///
+/// Deriving the index from the bundle's parent was chosen over "skip the index
+/// when there is no `internal/` directory" because it keeps this repository's
+/// and CI's behaviour byte-for-byte identical while being correct everywhere
+/// else: `--out internal/audit/release-certify/run-<id>` (how
+/// `.github/workflows/ops-hardening.yaml` invokes it, and the shape of the
+/// default) still indexes at `internal/audit/release-certify/latest.json`, the
+/// exact path that workflow uploads. A downstream `--out ./evidence/run-1`
+/// indexes at `./evidence/latest.json` — beside the run it describes, and
+/// nowhere else. A root with no parent (`--out evidence`) indexes into itself.
+fn certification_index_root(out: &Path) -> PathBuf {
+    match out.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => out.to_path_buf(),
+    }
 }
 
 fn path_for_docs(path: &Path) -> String {
@@ -664,7 +706,7 @@ fn write_latest_certification_index(
     root: &Path,
     summary: &ReleaseCertificationReport,
 ) -> Result<()> {
-    let index_root = certification_index_root();
+    let index_root = certification_index_root(root);
     fs::create_dir_all(&index_root)
         .with_context(|| format!("Failed to create {}", index_root.display()))?;
     let index = build_release_certification_index(root, summary);
@@ -718,6 +760,57 @@ pub(super) fn run_command_logged(label: &str, cmd: &mut Command, diagnostics: bo
     Ok(())
 }
 
+/// Run a command capturing its stdout and stderr, returning both the outcome
+/// and the combined transcript.
+///
+/// Unlike [`run_command_logged`] this does not inherit stdio, because the
+/// transcript is the artifact a certification bundle exists to preserve. To
+/// keep a local run debuggable the transcript is echoed to the console whenever
+/// the command fails (or whenever `--diagnostics` is on); a passing step stays
+/// quiet, which is what a multi-gate certification run wants.
+fn run_command_captured(label: &str, cmd: &mut Command, diagnostics: bool) -> (Result<()>, String) {
+    if diagnostics {
+        println!("   > Running: {label}");
+    }
+    let started = std::time::Instant::now();
+    let output = match cmd.output() {
+        Ok(output) => output,
+        Err(err) => {
+            let message = format!("Failed to execute command: {label}: {err}");
+            return (Err(anyhow::anyhow!(message.clone())), message);
+        }
+    };
+
+    let mut transcript = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.is_empty() {
+        if !transcript.is_empty() && !transcript.ends_with('\n') {
+            transcript.push('\n');
+        }
+        transcript.push_str(&stderr);
+    }
+
+    if diagnostics {
+        println!(
+            "   > Finished: {label} (status: {}, elapsed: {}ms)",
+            output.status,
+            started.elapsed().as_millis()
+        );
+    }
+
+    if output.status.success() {
+        if diagnostics && !transcript.trim().is_empty() {
+            println!("{transcript}");
+        }
+        (Ok(()), transcript)
+    } else {
+        if !diagnostics && !transcript.trim().is_empty() {
+            println!("{transcript}");
+        }
+        (Err(anyhow::anyhow!("Command failed: {label}")), transcript)
+    }
+}
+
 fn ensure_cargo_subcommand_available(subcommand: &str, install_package: &str) -> Result<()> {
     let status = Command::new("cargo")
         .arg(subcommand)
@@ -736,19 +829,149 @@ fn ensure_cargo_subcommand_available(subcommand: &str, install_package: &str) ->
     );
 }
 
-fn check_code_pattern_present(path: &str, pattern: &str) -> bool {
-    if let Ok(content) = fs::read_to_string(path) {
-        content.contains(pattern)
-    } else {
-        false
+/// Whether a source file counts as a production source for gate purposes.
+///
+/// A release gate asks "does the shipped code do this?", so a hit inside an
+/// integration test, a benchmark, or an example is not evidence. Files under a
+/// `tests/`, `benches/` or `examples/` directory, and files named `*_test.rs` /
+/// `*_tests.rs` (the in-`src` test modules this workspace uses, e.g.
+/// `krab_core/src/db_tests.rs`), are excluded.
+fn is_production_source(path: &Path) -> bool {
+    let excluded_dir = path.components().any(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some("tests") | Some("benches") | Some("examples")
+        )
+    });
+    if excluded_dir {
+        return false;
+    }
+
+    match path.file_stem().and_then(|stem| stem.to_str()) {
+        Some(stem) => !(stem.ends_with("_test") || stem.ends_with("_tests")),
+        None => false,
     }
 }
 
-fn chrono_like_utc_now() -> String {
+/// Strip `//` line comments and `/* */` block comments from Rust source.
+///
+/// Deliberately not string-literal aware: a `//` inside a string literal ends
+/// the line early, which can only ever drop code from consideration, never add
+/// it. For a presence gate that bias is the safe one — it risks a false
+/// negative (a loud, investigable failure) instead of a false positive (a gate
+/// that silently passes on a mention in prose).
+fn strip_rust_comments(source: &str) -> String {
+    let mut out = String::new();
+    let mut in_block = false;
+
+    for line in source.lines() {
+        let mut rest = line;
+        loop {
+            if in_block {
+                match rest.find("*/") {
+                    Some(idx) => {
+                        in_block = false;
+                        rest = &rest[idx + 2..];
+                    }
+                    None => {
+                        rest = "";
+                        break;
+                    }
+                }
+            } else {
+                let line_comment = rest.find("//");
+                let block_comment = rest.find("/*");
+                match (line_comment, block_comment) {
+                    (Some(l), Some(b)) if l < b => {
+                        out.push_str(&rest[..l]);
+                        rest = "";
+                        break;
+                    }
+                    (_, Some(b)) => {
+                        out.push_str(&rest[..b]);
+                        in_block = true;
+                        rest = &rest[b + 2..];
+                    }
+                    (Some(l), None) => {
+                        out.push_str(&rest[..l]);
+                        rest = "";
+                        break;
+                    }
+                    (None, None) => break,
+                }
+            }
+        }
+        out.push_str(rest);
+        out.push('\n');
+    }
+
+    out
+}
+
+/// Whether `pattern` appears in executable code in a production source file.
+///
+/// This used to be a bare `content.contains(pattern)` over every `.rs` file,
+/// which meant a mention in a doc comment satisfied a release gate — the
+/// `csrf_strategy` gate was in fact being answered by prose in
+/// `krab_core/src/csrf.rs`, not by the middleware being wired up. Comments and
+/// non-production sources are now excluded.
+fn check_code_pattern_present(path: &Path, pattern: &str) -> bool {
+    if !is_production_source(path) {
+        return false;
+    }
+
+    match fs::read_to_string(path) {
+        Ok(content) => strip_rust_comments(&content).contains(pattern),
+        Err(_) => false,
+    }
+}
+
+/// Days elapsed since 1970-01-01 converted to a proleptic Gregorian date.
+///
+/// Howard Hinnant's `civil_from_days`, which is exact for the whole range this
+/// can produce and needs no calendar tables. Kept in std rather than adding a
+/// `chrono`/`time` dependency for one timestamp.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = (z - era * 146_097) as u64; // [0, 146096]
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365; // [0, 399]
+    let year = year_of_era as i64 + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100); // [0, 365]
+    let mp = (5 * day_of_year + 2) / 153; // [0, 11], March-based
+    let day = (day_of_year - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+
+    (year + i64::from(month <= 2), month, day)
+}
+
+/// Render Unix epoch seconds as an RFC 3339 UTC timestamp.
+///
+/// The predecessor of this function was named `chrono_like_utc_now` but emitted
+/// bare epoch seconds, so `latest.md` rendered `- timestamp: 1786...` while
+/// every fixture in this module used ISO-8601 — nothing connected the two.
+fn rfc3339_utc_from_unix_secs(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let seconds_of_day = secs % 86_400;
+    let (year, month, day) = civil_from_days(days);
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year,
+        month,
+        day,
+        seconds_of_day / 3600,
+        (seconds_of_day % 3600) / 60,
+        seconds_of_day % 60
+    )
+}
+
+fn rfc3339_utc_now() -> String {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or(Duration::from_secs(0));
-    format!("{}", now.as_secs())
+    rfc3339_utc_from_unix_secs(now.as_secs())
 }
 
 fn run_split_topology_gateway_conflict_check() -> Result<()> {
@@ -804,13 +1027,24 @@ fn run_protocol_version_compatibility_check() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_release_certification_index, collect_secrets_policy_check, finish_release_check,
-        render_release_certification_index_markdown, CertificationStepReport, EnvVarGuard,
-        ReleaseCertificationReport, ReleaseCheckReport,
+        build_release_certification_index, certification_index_root, check_code_pattern_present,
+        collect_secrets_policy_check, create_release_evidence_bundle, finish_release_check,
+        is_production_source, record_command_step, record_function_step,
+        render_release_certification_index_markdown, rfc3339_utc_from_unix_secs, rfc3339_utc_now,
+        strip_rust_comments, CertificationStepReport, EnvVarGuard, ReleaseCertificationReport,
+        ReleaseCheckReport,
     };
     use serial_test::serial;
     use std::collections::BTreeMap;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    /// Absolute path to a file in the workspace, from this crate's manifest dir.
+    fn workspace_path(relative: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .join(relative)
+    }
 
     #[test]
     fn failed_release_check_report_exits_nonzero_regardless_of_output_mode() {
@@ -934,5 +1168,300 @@ mod tests {
         assert!(markdown.contains("Latest Release Certification Evidence"));
         assert!(markdown.contains("internal/audit/release-certify/run-77/08-signoff/summary.json"));
         assert!(markdown.contains("internal/audit/release-certify/run-77/08-signoff/summary.md"));
+    }
+
+    /// `chrono_like_utc_now` returned bare epoch seconds, so `latest.md`
+    /// rendered `- timestamp: 1786...` while every fixture in this module used
+    /// ISO-8601 — the mismatch was invisible because nothing tested the
+    /// formatter. These are the known-good conversions.
+    #[test]
+    fn rfc3339_formatting_matches_known_epochs() {
+        for (secs, expected) in [
+            (0_u64, "1970-01-01T00:00:00Z"),
+            // Time-of-day carry: one hour, one minute and one second in.
+            (3661, "1970-01-01T01:01:01Z"),
+            (86_399, "1970-01-01T23:59:59Z"),
+            (86_400, "1970-01-02T00:00:00Z"),
+            // Leap day of a leap century (2000 is divisible by 400).
+            (951_782_400, "2000-02-29T00:00:00Z"),
+            (951_868_800, "2000-03-01T00:00:00Z"),
+            // Year boundary, straddled to the second.
+            (1_735_689_599, "2024-12-31T23:59:59Z"),
+            (1_735_689_600, "2025-01-01T00:00:00Z"),
+            // Leap day of a leap year that is not a century.
+            (1_709_164_800, "2024-02-29T00:00:00Z"),
+            // 2100 is divisible by 4 but not by 400, so it has no 29 February.
+            (4_107_456_000, "2100-02-28T00:00:00Z"),
+            (4_107_542_400, "2100-03-01T00:00:00Z"),
+        ] {
+            assert_eq!(
+                rfc3339_utc_from_unix_secs(secs),
+                expected,
+                "epoch {secs} should render as {expected}"
+            );
+        }
+    }
+
+    /// The regression itself: the timestamp stamped into `summary.json` and
+    /// `latest.md` must be a timestamp, not a number.
+    #[test]
+    fn rfc3339_now_is_not_bare_epoch_seconds() {
+        let now = rfc3339_utc_now();
+        assert_eq!(now.len(), 20, "expected YYYY-MM-DDTHH:MM:SSZ, got {now}");
+        assert!(now.ends_with('Z'), "{now} should be UTC-qualified");
+        assert!(now.contains('T'), "{now} should separate date and time");
+        assert!(
+            now.parse::<u64>().is_err(),
+            "{now} parsed as an integer, so it is still epoch seconds"
+        );
+    }
+
+    #[test]
+    fn comments_are_stripped_before_pattern_matching() {
+        let stripped = strip_rust_comments(
+            "/// doc mentions security_headers_middleware\n\
+             let x = 1; // trailing mentions csrf_protection_middleware\n\
+             /* block mentions init_tracing */ let y = 2;\n\
+             let z = 3;\n",
+        );
+
+        assert!(!stripped.contains("security_headers_middleware"));
+        assert!(!stripped.contains("csrf_protection_middleware"));
+        assert!(!stripped.contains("init_tracing"));
+        assert!(stripped.contains("let x = 1;"));
+        assert!(stripped.contains("let y = 2;"));
+        assert!(stripped.contains("let z = 3;"));
+    }
+
+    #[test]
+    fn multi_line_block_comments_are_stripped() {
+        let stripped = strip_rust_comments(
+            "let a = 1;\n\
+             /*\n\
+             security_headers_middleware\n\
+             */\n\
+             let b = 2;\n",
+        );
+
+        assert!(!stripped.contains("security_headers_middleware"));
+        assert!(stripped.contains("let a = 1;"));
+        assert!(stripped.contains("let b = 2;"));
+    }
+
+    /// The gate answered "is CSRF wired up?" with a doc comment. A mention in
+    /// prose must not satisfy it; a real reference must.
+    #[test]
+    fn pattern_gate_ignores_comments_and_accepts_real_usage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let commented = dir.path().join("commented.rs");
+        std::fs::write(
+            &commented,
+            "/// Set by `csrf_protection_middleware`, which lives elsewhere.\n\
+             pub const NAME: &str = \"csrf\";\n",
+        )
+        .expect("write");
+        assert!(
+            !check_code_pattern_present(&commented, "csrf_protection_middleware"),
+            "a doc-comment mention must not satisfy a release gate"
+        );
+
+        let real = dir.path().join("real.rs");
+        std::fs::write(
+            &real,
+            "use krab_core::http_security::csrf_protection_middleware;\n\
+             let app = router.layer(from_fn(csrf_protection_middleware));\n",
+        )
+        .expect("write");
+        assert!(
+            check_code_pattern_present(&real, "csrf_protection_middleware"),
+            "a real reference must still satisfy the gate"
+        );
+    }
+
+    #[test]
+    fn pattern_gate_skips_non_production_sources() {
+        assert!(is_production_source(Path::new("services/svc/src/main.rs")));
+        assert!(is_production_source(Path::new(
+            "crates/framework/krab_core/src/http.rs"
+        )));
+        assert!(!is_production_source(Path::new(
+            "crates/framework/krab_core/tests/http_tests.rs"
+        )));
+        assert!(!is_production_source(Path::new("benches/render.rs")));
+        assert!(!is_production_source(Path::new(
+            "examples/reference_apps/islands_rpc/src/lib.rs"
+        )));
+        // In-`src` test modules, the convention this workspace uses
+        // (`krab_core/src/db_tests.rs`, `src/api_tests.rs`).
+        assert!(!is_production_source(Path::new(
+            "crates/framework/krab_core/src/db_tests.rs"
+        )));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tests_dir = dir.path().join("tests");
+        std::fs::create_dir_all(&tests_dir).expect("mkdir");
+        let in_tests = tests_dir.join("smoke.rs");
+        std::fs::write(&in_tests, "fn t() { security_headers_middleware(); }\n").expect("write");
+        assert!(!check_code_pattern_present(
+            &in_tests,
+            "security_headers_middleware"
+        ));
+    }
+
+    /// The tightened predicate must still find the three things the
+    /// `secure_headers`, `csrf_strategy` and `telemetry_initialization` gates
+    /// look for, in the real tree. If a refactor moves them, this fails here
+    /// rather than turning `krab release check` red for a mysterious reason.
+    #[test]
+    fn release_gate_patterns_are_still_found_in_this_repository() {
+        let http = workspace_path("crates/framework/krab_core/src/http.rs");
+        assert!(http.exists(), "{} should exist", http.display());
+        assert!(
+            check_code_pattern_present(&http, "security_headers_middleware"),
+            "secure_headers gate lost its evidence in http.rs"
+        );
+        assert!(
+            check_code_pattern_present(&http, "csrf_protection_middleware"),
+            "csrf_strategy gate lost its evidence in http.rs"
+        );
+
+        let auth_main = workspace_path("services/service_auth/src/main.rs");
+        assert!(auth_main.exists(), "{} should exist", auth_main.display());
+        assert!(
+            check_code_pattern_present(&auth_main, "krab_core::telemetry::init_tracing"),
+            "telemetry_initialization gate lost its evidence in service_auth"
+        );
+
+        // And the false positive that used to answer the csrf gate: csrf.rs
+        // mentions the middleware only in a doc comment.
+        let csrf = workspace_path("crates/framework/krab_core/src/csrf.rs");
+        assert!(csrf.exists(), "{} should exist", csrf.display());
+        assert!(
+            !check_code_pattern_present(&csrf, "csrf_protection_middleware"),
+            "csrf.rs mentions the middleware only in prose; it must not count"
+        );
+    }
+
+    /// The bundle used to create eight directories and write to four, so
+    /// `02-security`, `05-performance`, `06-observability` and
+    /// `07-deployment-rehearsal` shipped empty — coverage the run does not have.
+    #[test]
+    fn evidence_bundle_creates_only_sections_that_receive_artifacts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("run-1");
+        create_release_evidence_bundle(&root).expect("bundle");
+
+        for present in [
+            "01-test-and-lint",
+            "03-contract-and-compatibility",
+            "04-migrations-and-rollback",
+            "08-signoff",
+        ] {
+            assert!(root.join(present).is_dir(), "{present} should exist");
+        }
+        for absent in [
+            "02-security",
+            "05-performance",
+            "06-observability",
+            "07-deployment-rehearsal",
+        ] {
+            assert!(
+                !root.join(absent).exists(),
+                "{absent} is never written to and must not be created"
+            );
+        }
+    }
+
+    /// Every artifact file used to contain three lines restating the summary.
+    /// The bundle is consumed by `.github/workflows/release-attestation.yaml`,
+    /// so the command transcript is the entire point of it.
+    #[test]
+    fn command_step_artifact_contains_captured_output() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let artifact = dir.path().join("cargo-version.txt");
+
+        let step = record_command_step(
+            "cargo-version",
+            &artifact,
+            false,
+            Command::new("cargo").arg("--version"),
+        );
+
+        assert_eq!(step.status, "passed");
+        let body = std::fs::read_to_string(&artifact).expect("artifact should exist");
+        assert!(body.contains("step: cargo-version"));
+        assert!(body.contains("status: passed"));
+        assert!(body.contains("--- captured output (stdout + stderr) ---"));
+        assert!(
+            body.contains("cargo "),
+            "artifact should hold the real command output, got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn failed_command_step_artifact_captures_stderr() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let artifact = dir.path().join("bad.txt");
+
+        let step = record_command_step(
+            "bad-subcommand",
+            &artifact,
+            false,
+            Command::new("cargo").arg("krab-no-such-subcommand-xyz"),
+        );
+
+        assert_eq!(step.status, "failed");
+        let body = std::fs::read_to_string(&artifact).expect("artifact should exist");
+        assert!(body.contains("status: failed"));
+        assert!(body.contains("error: Command failed: bad-subcommand"));
+        assert!(
+            body.contains("krab-no-such-subcommand-xyz"),
+            "stderr from the failing command should be preserved, got:\n{body}"
+        );
+    }
+
+    /// In-process steps shell out with inherited stdio, so their transcript is
+    /// genuinely unavailable. The artifact must say so rather than imply the
+    /// output was captured.
+    #[test]
+    fn function_step_artifact_is_explicit_about_uncaptured_output() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let artifact = dir.path().join("fn-step.txt");
+
+        let step = record_function_step("in-process", &artifact, || Ok(()));
+
+        assert_eq!(step.status, "passed");
+        let body = std::fs::read_to_string(&artifact).expect("artifact should exist");
+        assert!(body.contains("status: passed"));
+        assert!(body.contains("could not be captured here"));
+        assert!(!body.contains("--- captured output"));
+    }
+
+    /// The index root was hardcoded to `internal/audit/release-certify`
+    /// regardless of `--out`, so running certify in a downstream project
+    /// created a Krab-specific `internal/audit/` tree inside it.
+    #[test]
+    fn index_root_derives_from_the_output_root() {
+        // How CI invokes it, and the shape of the default: unchanged behaviour.
+        assert_eq!(
+            certification_index_root(Path::new("internal/audit/release-certify/run-42")),
+            PathBuf::from("internal/audit/release-certify")
+        );
+        assert_eq!(
+            certification_index_root(Path::new("internal/audit/release-certify/local")),
+            PathBuf::from("internal/audit/release-certify")
+        );
+        // A downstream project indexes beside its own bundle, not in an
+        // invented `internal/` tree.
+        assert_eq!(
+            certification_index_root(Path::new("evidence/run-1")),
+            PathBuf::from("evidence")
+        );
+        // A root with no parent indexes into itself.
+        assert_eq!(
+            certification_index_root(Path::new("evidence")),
+            PathBuf::from("evidence")
+        );
     }
 }
