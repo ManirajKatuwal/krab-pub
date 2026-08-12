@@ -19,6 +19,29 @@ Use `/ready` for startup and dependency readiness. Use `/health` for process liv
 
 The orchestrator starts services in dependency order and waits for readiness before moving to dependents. Failed readiness is a failed startup, not a background warning.
 
+A readiness probe stops early if the child process exits: a service that dies during startup is reported with its exit status rather than as a probe timeout.
+
+## Restart Policy
+
+`[services.<name>.restart_policy]` governs what happens when a service exits on its own.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `on_exit` | `true` | Restart the service when it exits |
+| `backoff_ms` | `500` | Delay before each restart attempt |
+| `max_attempts` | `5` | Restart attempts allowed within one unstable period |
+| `stability_window_ms` | `60000` | Uptime after which earlier crashes stop counting against `max_attempts` |
+
+`max_attempts` bounds a crash loop, not a service's lifetime failures. Once a service has stayed up for `stability_window_ms`, its budget resets, so a service that fails once a month is not permanently given up on after `max_attempts` months.
+
+Restarts are scheduled rather than slept through: one service waiting out its backoff does not delay supervision of the others, or the response to Ctrl-C.
+
+## Ordering
+
+Startup order is the topological order of `depends_on` and `startup_dependencies`, resolved deterministically — a cycle or an unknown dependency is a startup error, not a warning.
+
+Shutdown and watch-triggered restarts use the same graph in reverse, so a dependency outlives everything that talks to it and comes back before its dependents do.
+
 ## Boundary Semantics
 
 Services should communicate through contracts and adapters, not direct imports from another service crate. `krab topology doctor` checks for direct cross-service imports and validates shared contract payload serialization derives.

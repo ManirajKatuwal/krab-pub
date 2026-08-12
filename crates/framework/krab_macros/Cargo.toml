@@ -32,3 +32,6 @@ serde_json = { workspace = true }
 # `#[server]` expands to code referencing `axum` directly, so any crate using it
 # needs axum in scope. Present here so the doc examples are actually compiled.
 axum = { workspace = true }
+# Drives the `#[server]` expansion tests: the generated handler and dispatch
+# shim are `async fn`s, so exercising them needs a runtime.
+tokio = { workspace = true, features = ["macros", "rt"] }

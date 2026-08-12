@@ -57,6 +57,82 @@ fn readme_counter_example_renders_on_the_server() {
     assert!(html.contains("7"));
 }
 
+// ── Props that are deliberately not `Clone` ─────────────────────────────────
+//
+// The server half used to render as `inner(props.clone())`, which put a `Clone`
+// bound on every island's props type even though `to_string` above it only
+// borrowed. This island fails to compile if that clone ever comes back.
+
+#[derive(Serialize, Deserialize)]
+struct NoCloneProps {
+    label: String,
+}
+
+#[island]
+fn NoCloneIsland(props: NoCloneProps) -> krab_core::Node {
+    Node::Text(props.label)
+}
+
+#[test]
+fn island_props_do_not_have_to_be_clone() {
+    let html = NoCloneIsland(NoCloneProps {
+        label: "moved".to_string(),
+    })
+    .render();
+
+    assert!(html.contains("data-island=\"NoCloneIsland\""));
+    assert!(html.contains("data-krab-boundary-state=\"ssr\""));
+    assert!(html.contains("moved"));
+}
+
+// ── Props that cannot be serialized ─────────────────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+struct UnserializableProps {
+    // `serde_json` refuses a map whose keys are not strings, so this fails to
+    // encode as soon as it holds an entry.
+    lookup: std::collections::HashMap<(i32, i32), String>,
+}
+
+#[island]
+fn Unserializable(props: UnserializableProps) -> krab_core::Node {
+    Node::Text(format!("{} entries", props.lookup.len()))
+}
+
+#[test]
+fn a_props_encode_failure_is_reported_as_its_own_boundary_state() {
+    let mut lookup = std::collections::HashMap::new();
+    lookup.insert((1, 2), "value".to_string());
+
+    let html = Unserializable(UnserializableProps { lookup }).render();
+
+    // Not `state="ssr"` with an empty `data-props`, which is what
+    // `unwrap_or_default()` produced: that surfaced in the browser as a client
+    // decode error for a failure that happened on the server.
+    assert!(
+        html.contains("data-krab-boundary-state=\"props-encode-error\""),
+        "expected the encode failure to be marked, got: {html}"
+    );
+    assert!(html.contains("data-props=\"\""));
+    // The SSR markup is still rendered; only hydration is lost.
+    assert!(html.contains("1 entries"));
+}
+
+#[test]
+fn a_props_encode_failure_keeps_the_serde_message_out_of_the_markup() {
+    let mut lookup = std::collections::HashMap::new();
+    lookup.insert((3, 4), "value".to_string());
+
+    let html = Unserializable(UnserializableProps { lookup }).render();
+
+    // The message is derived from application data and this string is served to
+    // every visitor.
+    assert!(
+        !html.contains("key must be a string"),
+        "serde detail leaked into SSR output: {html}"
+    );
+}
+
 #[test]
 fn island_server_wrapper_emits_boundary_metadata() {
     let html = Greeting(GreetingProps {

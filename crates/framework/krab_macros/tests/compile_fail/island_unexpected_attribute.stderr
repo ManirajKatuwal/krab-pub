@@ -1,0 +1,6 @@
+error: #[island] takes no arguments.
+         Write `#[island]` on its own; hydration behaviour is not configurable per island.
+  --> tests/compile_fail/island_unexpected_attribute.rs:12:10
+   |
+12 | #[island(lazy)]
+   |          ^^^^

@@ -170,103 +170,60 @@ pub fn server(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { #fn_name(#(#call_args),*).await }
     };
 
-    let server_impl = if is_stream {
+    // How the handler turns the inner call into a response. The only thing that
+    // actually differs between the two protocol shapes; argument decoding and
+    // the dispatch shim are shared below.
+    let respond = if is_stream {
         quote! {
-            #[cfg(not(target_arch = "wasm32"))]
-            #(#attrs)*
-            #vis async fn #fn_name(#fn_inputs) #output
-                #block
-
-            #[cfg(not(target_arch = "wasm32"))]
-            #vis async fn #handler_fn_name(
-                axum::Json(__raw_args): axum::Json<serde_json::Value>,
-            ) -> axum::response::Response {
-                use axum::response::IntoResponse;
-                let __args = match serde_json::from_value::<#args_struct_name>(__raw_args.clone()) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let msg = format!("Validation failed for '{}': {}. Payload: {}", stringify!(#fn_name), e, __raw_args);
-                        return krab_core::server_fn::ServerFnError::validation(msg).into_response();
-                    }
-                };
-                let stream = #call_expr;
-                axum::response::sse::Sse::new(stream).into_response()
-            }
-
-            #[cfg(not(target_arch = "wasm32"))]
-            #[doc(hidden)]
-            #vis fn #dispatch_handler_name(
-                args: serde_json::Value,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = axum::response::Response> + Send>> {
-                use axum::response::IntoResponse;
-                Box::pin(async move {
-                    let __args = match serde_json::from_value::<#args_struct_name>(args.clone()) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let msg = format!("Validation failed for '{}': {}. Payload: {}", stringify!(#fn_name), e, args);
-                            return krab_core::server_fn::ServerFnError::validation(msg).into_response();
-                        }
-                    };
-                    let stream = #call_expr;
-                    axum::response::sse::Sse::new(stream).into_response()
-                })
-            }
+            let stream = #call_expr;
+            axum::response::sse::Sse::new(stream).into_response()
         }
     } else {
         quote! {
-            #[cfg(not(target_arch = "wasm32"))]
-            #(#attrs)*
-            #vis async fn #fn_name(#fn_inputs) #output
-                #block
-
-            #[cfg(not(target_arch = "wasm32"))]
-            #vis async fn #handler_fn_name(
-                axum::Json(__raw_args): axum::Json<serde_json::Value>,
-            ) -> axum::response::Response {
-                use axum::response::IntoResponse;
-                let __args = match serde_json::from_value::<#args_struct_name>(__raw_args.clone()) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let msg = format!("Validation failed for '{}': {}. Payload: {}", stringify!(#fn_name), e, __raw_args);
-                        return krab_core::server_fn::ServerFnError::validation(msg).into_response();
+            match #call_expr {
+                Ok(result) => {
+                    match serde_json::to_value(result) {
+                        Ok(json) => (axum::http::StatusCode::OK, axum::Json(json)).into_response(),
+                        Err(e) => krab_core::server_fn::ServerFnError::new(e.to_string()).into_response(),
                     }
-                };
-                match #call_expr {
-                    Ok(result) => {
-                        match serde_json::to_value(result) {
-                            Ok(json) => (axum::http::StatusCode::OK, axum::Json(json)).into_response(),
-                            Err(e) => krab_core::server_fn::ServerFnError::new(e.to_string()).into_response(),
-                        }
-                    }
-                    Err(err) => err.into_response(),
                 }
+                Err(err) => err.into_response(),
             }
+        }
+    };
 
-            #[cfg(not(target_arch = "wasm32"))]
-            #[doc(hidden)]
-            #vis fn #dispatch_handler_name(
-                args: serde_json::Value,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = axum::response::Response> + Send>> {
-                use axum::response::IntoResponse;
-                Box::pin(async move {
-                    let __args = match serde_json::from_value::<#args_struct_name>(args.clone()) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let msg = format!("Validation failed for '{}': {}. Payload: {}", stringify!(#fn_name), e, args);
-                            return krab_core::server_fn::ServerFnError::validation(msg).into_response();
-                        }
-                    };
-                    match #call_expr {
-                        Ok(result) => {
-                            match serde_json::to_value(result) {
-                                Ok(json) => (axum::http::StatusCode::OK, axum::Json(json)).into_response(),
-                                Err(e) => krab_core::server_fn::ServerFnError::new(e.to_string()).into_response(),
-                            }
-                        }
-                        Err(err) => err.into_response(),
-                    }
-                })
-            }
+    let server_impl = quote! {
+        #[cfg(not(target_arch = "wasm32"))]
+        #(#attrs)*
+        #vis async fn #fn_name(#fn_inputs) #output
+            #block
+
+        #[cfg(not(target_arch = "wasm32"))]
+        #vis async fn #handler_fn_name(
+            axum::Json(__raw_args): axum::Json<serde_json::Value>,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let __args = match serde_json::from_value::<#args_struct_name>(__raw_args.clone()) {
+                Ok(v) => v,
+                Err(e) => {
+                    let msg = format!("Validation failed for '{}': {}. Payload: {}", stringify!(#fn_name), e, __raw_args);
+                    return krab_core::server_fn::ServerFnError::validation(msg).into_response();
+                }
+            };
+            #respond
+        }
+
+        // The dispatch shim exists to give `collect_server_fns!` one uniform
+        // signature to call. It delegates to the handler rather than repeating
+        // it: argument decoding and response mapping used to be written out
+        // once per (handler, dispatch) × (stream, non-stream) — four copies of
+        // the same logic, where a fix to one silently missed the others.
+        #[cfg(not(target_arch = "wasm32"))]
+        #[doc(hidden)]
+        #vis fn #dispatch_handler_name(
+            args: serde_json::Value,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = axum::response::Response> + Send>> {
+            Box::pin(#handler_fn_name(axum::Json(args)))
         }
     };
 
@@ -329,6 +286,29 @@ fn validate_server_attr(attr_str: &str, input_fn: &ItemFn) -> syn::Result<()> {
         return Err(syn::Error::new_spanned(
             &input_fn.sig.ident,
             "#[server] only supports no arguments or `stream` as an option",
+        ));
+    }
+
+    // The expansion re-emits the function from its pieces — `#vis async fn
+    // #fn_name(#fn_inputs) #output #block` — which silently drops
+    // `sig.generics`. A generic server function therefore expanded into a body
+    // referencing undeclared type parameters, and the user saw "cannot find
+    // type `T` in this scope" pointing into generated code. Reject it here
+    // instead, the way `#[island]` already does.
+    if !input_fn.sig.generics.params.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &input_fn.sig.generics,
+            "#[server] functions cannot be generic.\n  \
+             The generated handler deserializes one concrete argument struct and registers a single\n  \
+             `ServerFn` implementation, so every argument type must be known at expansion time.\n  \
+             Use concrete types, or an enum covering the cases you need.",
+        ));
+    }
+
+    if let Some(where_clause) = &input_fn.sig.generics.where_clause {
+        return Err(syn::Error::new_spanned(
+            where_clause,
+            "#[server] functions cannot carry a `where` clause; it is not reproduced in the generated handler.",
         ));
     }
 
@@ -417,8 +397,68 @@ fn to_snake_case(s: &str) -> String {
     out
 }
 
+/// Marks a component function as a hydration island.
+///
+/// An island is the unit of interactivity in a Krab page: the server renders it
+/// to HTML like any other component, and the browser re-runs just that subtree
+/// against the markup already on the page.
+///
+/// The macro expands to two halves selected by **the calling crate's** `web`
+/// feature — not `krab_client`'s:
+///
+/// - without `web`: the SSR half, wrapping the rendered tree in a `<div>`
+///   carrying `data-island`, the serialized `data-props`, and the
+///   `data-krab-boundary*` markers the client walks.
+/// - with `web`: the browser half, which calls the component directly and
+///   registers a hydration factory through `inventory` so `hydrate()` can find
+///   it by name.
+///
+/// A crate that never enables `web` therefore gets a server-only island, and
+/// its WASM bundle registers no hydrators. See
+/// `docs/guides/troubleshooting.md` for the symptoms that produces.
+///
+/// ## Requirements
+///
+/// - Exactly one argument, a props struct bound to a plain identifier.
+/// - The props type must implement `Serialize` (server half) and
+///   `Deserialize` (browser half).
+/// - The function must return `krab_core::Node`.
+/// - No generic parameters: hydration resolves components by name at runtime,
+///   which needs one concrete registration per island.
+/// - The expansion references `krab_core`, `krab_client`, `serde_json`, and
+///   `inventory` by path, so the calling crate needs all four as direct
+///   dependencies.
+///
+/// ## Example
+///
+/// ```ignore
+/// use krab_macros::island;
+/// use serde::{Deserialize, Serialize};
+///
+/// #[derive(Serialize, Deserialize)]
+/// pub struct CounterProps {
+///     pub start: i32,
+/// }
+///
+/// #[island]
+/// fn Counter(props: CounterProps) -> krab_core::Node {
+///     view! { <button>{props.start.to_string()}</button> }
+/// }
+/// ```
 #[proc_macro_attribute]
-pub fn island(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn island(attr: TokenStream, item: TokenStream) -> TokenStream {
+    // Previously ignored outright, so `#[island(lazy)]` — or a typo'd option a
+    // user expected to mean something — compiled and did nothing at all.
+    if !attr.is_empty() {
+        return syn::Error::new_spanned(
+            proc_macro2::TokenStream::from(attr),
+            "#[island] takes no arguments.\n  \
+             Write `#[island]` on its own; hydration behaviour is not configurable per island.",
+        )
+        .to_compile_error()
+        .into();
+    }
+
     let mut input_fn = parse_macro_input!(item as ItemFn);
     let fn_name = &input_fn.sig.ident;
     let vis = &input_fn.vis;
@@ -489,11 +529,25 @@ pub fn island(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let server_impl = quote! {
         #[cfg(not(feature = "web"))]
         #vis fn #original_fn_name(#inputs) -> krab_core::Node {
-            // Serialize props
-            let props_json = serde_json::to_string(&#props_arg_name).unwrap_or_default();
+            // A props value that will not serialize cannot hydrate. This used
+            // to be `unwrap_or_default()`, which emitted `data-props=""` — the
+            // browser then reported a *client* decode failure for a problem
+            // that happened on the server, and the two were indistinguishable
+            // in the boundary state. They are now distinct.
+            //
+            // The serde message is deliberately kept out of the markup: it is
+            // derived from application data, and this string is served to every
+            // visitor.
+            let (props_json, boundary_state) = match serde_json::to_string(&#props_arg_name) {
+                Ok(json) => (json, "ssr"),
+                Err(_) => (String::new(), "props-encode-error"),
+            };
             let boundary_id = krab_core::next_hydration_boundary_id(stringify!(#original_fn_name));
+            // `props` is moved, not cloned: `to_string` above only borrowed it,
+            // and nothing reads it afterwards. Cloning here put a `Clone` bound
+            // on every island's props type for no reason.
             let children =
-                krab_core::annotate_hydration_tree(#inner_fn_name(#props_arg_name.clone()), &boundary_id);
+                krab_core::annotate_hydration_tree(#inner_fn_name(#props_arg_name), &boundary_id);
 
             // Wrap in div
             krab_core::Node::Element(krab_core::Element {
@@ -503,7 +557,7 @@ pub fn island(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     krab_core::Attribute { name: "data-props".to_string(), value: props_json },
                     krab_core::Attribute { name: "data-krab-boundary".to_string(), value: stringify!(#original_fn_name).to_string() },
                     krab_core::Attribute { name: "data-krab-boundary-id".to_string(), value: boundary_id },
-                    krab_core::Attribute { name: "data-krab-boundary-state".to_string(), value: "ssr".to_string() },
+                    krab_core::Attribute { name: "data-krab-boundary-state".to_string(), value: boundary_state.to_string() },
                 ],
                 children: vec![children],
                 events: vec![],
@@ -585,6 +639,44 @@ pub fn island(_attr: TokenStream, item: TokenStream) -> TokenStream {
     TokenStream::from(output)
 }
 
+/// Builds a `krab_core::Node` tree from HTML-like syntax.
+///
+/// ```ignore
+/// view! {
+///     <div class="card" data-testid="greeting">
+///         <label r#for="name">"Name"</label>
+///         <input type="text" value={current.get()}/>
+///         <button on:click={move |_| count.set(count.get() + 1)}>
+///             {count.get().to_string()}
+///         </button>
+///     </div>
+/// }
+/// ```
+///
+/// ## What the syntax accepts
+///
+/// - **Elements**, with children or self-closed (`<img src="a.png"/>`).
+///   Hyphenated and namespaced names work (`<my-widget>`, `xlink:href`), as do
+///   Rust keywords used as HTML names (`type`, `for`).
+/// - **Attributes** as a string literal or a `{expression}`. Values are
+///   converted with `to_string()`.
+/// - **Event listeners** as `on:click={closure}`. These compile only under the
+///   calling crate's `web` feature.
+/// - **Text** as a string literal. A bare literal of any other kind is not
+///   accepted — write `{42.to_string()}`, not `42`.
+/// - **Expressions** in braces, converted through `krab_core::IntoNode`.
+/// - **Fragments**, `<>...</>`, for a list of siblings with no wrapper element.
+/// - **Control flow**: `<Show when={...} fallback={...}>` and
+///   `<For each={...} key={...} view={...}/>`, which expand to
+///   `krab_core::control_flow` calls rather than to markup. `key` on `<For>` is
+///   mandatory; see [ADR 0008](https://github.com/ManirajKatuwal/krab-pub/blob/main/docs/adr/0008-view-control-flow.md).
+///
+/// ## What it does not
+///
+/// There is no component composition: a capitalised tag other than `Show` or
+/// `For` is rejected rather than emitted as literal markup a browser would
+/// ignore. Call the function and interpolate its node instead. See
+/// [ADR 0006](https://github.com/ManirajKatuwal/krab-pub/blob/main/docs/adr/0006-view-component-composition.md).
 #[proc_macro]
 pub fn view(input: TokenStream) -> TokenStream {
     let node = parse_macro_input!(input as Node);
@@ -705,6 +797,42 @@ fn parse_html_name(input: ParseStream) -> Result<(String, Span)> {
 fn strip_raw(ident: &Ident) -> String {
     let text = ident.to_string();
     text.strip_prefix("r#").unwrap_or(&text).to_string()
+}
+
+/// Parse child nodes up to the matching `</...>`.
+///
+/// The `is_empty` check is what makes an unclosed tag diagnosable. Without it
+/// the loop hands an exhausted stream to [`Node::parse`], whose first act is to
+/// reject an empty stream with "view! macro body is empty" — so
+/// `view! { <div>"hi" }` reported that its body was empty, pointing at the
+/// whole macro, rather than naming the tag that was never closed.
+///
+/// The loop condition is also the De Morgan dual of what it replaced
+/// (`!peek(<) || !peek2(/)`), which is why the two copies of this loop each
+/// carried a `break` on the negation of their own condition — unreachable in
+/// both.
+fn parse_children(
+    input: ParseStream,
+    open_tag: &str,
+    close_tag: &str,
+    open_span: Span,
+) -> Result<Vec<Node>> {
+    let mut children = Vec::new();
+    while !(input.peek(Token![<]) && input.peek2(Token![/])) {
+        if input.is_empty() {
+            return Err(syn::Error::new(
+                open_span,
+                format!(
+                    "unclosed `{open_tag}`: reached the end of the `view!` body without a matching `{close_tag}`.\n  \
+                     Every element needs a closing tag, or `/>` if it has no children:\n    \
+                     view! {{ {open_tag}\"text\"{close_tag} }}\n    \
+                     view! {{ <img src=\"a.png\"/> }}"
+                ),
+            ));
+        }
+        children.push(input.parse()?);
+    }
+    Ok(children)
 }
 
 impl Element {
@@ -838,15 +966,10 @@ impl Parse for Node {
         if input.peek(Token![<]) {
             if input.peek2(Token![>]) {
                 // Fragment <>...</>
+                let open_span = input.span();
                 input.parse::<Token![<]>()?;
                 input.parse::<Token![>]>()?;
-                let mut children = Vec::new();
-                while !input.peek(Token![<]) || !input.peek2(Token![/]) {
-                    if input.peek(Token![<]) && input.peek2(Token![/]) {
-                        break;
-                    }
-                    children.push(input.parse()?);
-                }
+                let children = parse_children(input, "<>", "</>", open_span)?;
                 input.parse::<Token![<]>()?;
                 input.parse::<Token![/]>()?;
                 input.parse::<Token![>]>()?;
@@ -983,13 +1106,12 @@ impl Parse for Element {
 
         input.parse::<Token![>]>()?;
 
-        let mut children = Vec::new();
-        while !input.peek(Token![<]) || !input.peek2(Token![/]) {
-            if input.peek(Token![<]) && input.peek2(Token![/]) {
-                break;
-            }
-            children.push(input.parse()?);
-        }
+        let children = parse_children(
+            input,
+            &format!("<{name}>"),
+            &format!("</{name}>"),
+            name_span,
+        )?;
 
         input.parse::<Token![<]>()?;
         input.parse::<Token![/]>()?;

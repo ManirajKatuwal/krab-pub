@@ -93,16 +93,32 @@ pub(super) fn build_event_watch_runtime(paths: &[String]) -> Result<Option<Event
     }))
 }
 
+/// Walk `path`, collecting every file beneath it.
+///
+/// Per-entry IO errors are logged and skipped rather than propagated. Scanning
+/// a source tree races with whatever is writing to it — a `cargo build` or an
+/// editor can remove a file between `read_dir` and the entry read — and a
+/// fingerprint that fails on that turns a routine race into a supervisor
+/// shutdown. A genuinely unreadable root still surfaces, via `read_dir` on the
+/// top-level call.
 fn collect_recursive(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
 
     for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                warn!(path = %path.display(), error = %err, "watch_scan_entry_skipped");
+                continue;
+            }
+        };
         let p = entry.path();
         if p.is_dir() {
-            collect_recursive(&p, out)?;
+            if let Err(err) = collect_recursive(&p, out) {
+                warn!(path = %p.display(), error = %err, "watch_scan_subtree_skipped");
+            }
         } else {
             out.push(p);
         }

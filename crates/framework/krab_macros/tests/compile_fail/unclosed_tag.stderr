@@ -1,0 +1,8 @@
+error: unclosed `<div>`: reached the end of the `view!` body without a matching `</div>`.
+         Every element needs a closing tag, or `/>` if it has no children:
+           view! { <div>"text"</div> }
+           view! { <img src="a.png"/> }
+  --> tests/compile_fail/unclosed_tag.rs:10:22
+   |
+10 |     let _ = view! { <div>"hello" }.render();
+   |                      ^^^
