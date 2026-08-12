@@ -1,0 +1,8 @@
+error: #[server] functions cannot be generic.
+         The generated handler deserializes one concrete argument struct and registers a single
+         `ServerFn` implementation, so every argument type must be known at expansion time.
+         Use concrete types, or an enum covering the cases you need.
+  --> tests/compile_fail/server_generic.rs:22:19
+   |
+22 | pub async fn store<T: Serialize + Send>(value: T) -> Result<Wrapper, ServerFnError> {
+   |                   ^^^^^^^^^^^^^^^^^^^^^

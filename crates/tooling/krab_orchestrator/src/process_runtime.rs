@@ -103,82 +103,250 @@ async fn response_body_excerpt(response: reqwest::Response) -> Option<String> {
     }
 }
 
-/// Poll running children for unexpected exits and apply restart policy when configured.
-pub(super) async fn supervise_exited_children(
+/// Per-service restart bookkeeping.
+///
+/// Kept in its own map rather than alongside the child handle because it has
+/// to outlive the child: a crashed service holds no handle while it waits out
+/// its backoff, and its attempt count must survive that gap.
+#[derive(Debug)]
+pub(super) struct ServiceSupervision {
+    /// Restarts attempted since the last time the service ran cleanly for a
+    /// full stability window.
+    attempts: u32,
+    /// When the current (or most recent) child was spawned.
+    started_at: Instant,
+    /// Set while a crashed service waits out its restart backoff. `None` means
+    /// the service is running, or its budget is spent and it has been given up
+    /// on.
+    retry_at: Option<Instant>,
+}
+
+impl ServiceSupervision {
+    pub(super) fn started_now() -> Self {
+        Self {
+            attempts: 0,
+            started_at: Instant::now(),
+            retry_at: None,
+        }
+    }
+
+    fn mark_started(&mut self) {
+        self.started_at = Instant::now();
+        self.retry_at = None;
+    }
+}
+
+/// Reap exited children and start the ones whose backoff has elapsed.
+pub(super) async fn supervise_children(
+    config: &KrabConfig,
+    startup_order: &[String],
+    children: &mut HashMap<String, tokio::process::Child>,
+    supervision: &mut HashMap<String, ServiceSupervision>,
+) {
+    reap_exited_children(config, children, supervision);
+    spawn_due_restarts(config, startup_order, children, supervision).await;
+}
+
+/// Notice children that have exited and schedule their restarts.
+///
+/// Synchronous on purpose. `try_wait` never blocks, and keeping the backoff out
+/// of this function is what stops one crashed service from stalling
+/// supervision — and Ctrl-C handling — for every other service.
+fn reap_exited_children(
     config: &KrabConfig,
     children: &mut HashMap<String, tokio::process::Child>,
-    restart_attempts: &mut HashMap<String, u32>,
+    supervision: &mut HashMap<String, ServiceSupervision>,
 ) {
+    let now = Instant::now();
     let names: Vec<String> = children.keys().cloned().collect();
+
     for name in names {
         let Some(child) = children.get_mut(&name) else {
             continue;
         };
 
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                warn!(service = %name, status = %status, code = ?status.code(), "service_exited");
-                let service = match config.services.get(&name) {
-                    Some(service) => service,
-                    None => continue,
-                };
-
-                if !service.effective_restart_on_exit() {
-                    continue;
-                }
-
-                let attempts = restart_attempts.get(&name).copied().unwrap_or(0);
-                if attempts >= service.effective_max_restart_attempts() {
-                    error!(
-                        service = %name,
-                        attempts,
-                        max_attempts = service.effective_max_restart_attempts(),
-                        "service_restart_limit_reached"
-                    );
-                    continue;
-                }
-
-                tokio::time::sleep(Duration::from_millis(
-                    service.effective_restart_backoff_ms(),
-                ))
-                .await;
-                match spawn_service_and_wait_ready(&name, service, "automatic restart").await {
-                    Ok(new_child) => {
-                        children.insert(name.clone(), new_child);
-                        let next_attempt = attempts + 1;
-                        restart_attempts.insert(name.clone(), next_attempt);
-                        info!(service = %name, attempt = next_attempt, "service_auto_restarted");
-                    }
-                    Err(err) => {
-                        restart_attempts.insert(name.clone(), attempts + 1);
-                        error!(service = %name, error = %err, "service_auto_restart_failed");
-                    }
-                }
-            }
-            Ok(None) => {}
+        let status = match child.try_wait() {
+            Ok(Some(status)) => status,
+            Ok(None) => continue,
             Err(err) => {
                 error!(service = %name, error = %err, "service_try_wait_failed");
+                continue;
+            }
+        };
+
+        // Drop the handle as soon as the child is reaped. Tokio caches the exit
+        // status (`FusedChild::Done`), so a handle left in this map reports the
+        // same exit on every later tick: a service that policy declines to
+        // restart used to re-log its own death twice a second, forever.
+        children.remove(&name);
+        warn!(service = %name, status = %status, code = ?status.code(), "service_exited");
+
+        let Some(service) = config.services.get(&name) else {
+            continue;
+        };
+        let entry = supervision
+            .entry(name.clone())
+            .or_insert_with(ServiceSupervision::started_now);
+
+        // A service that stayed up for a full stability window before dying is
+        // not in a crash loop, so it gets its budget back. Without this the
+        // counter only ever grew, and a service that crashed once a week was
+        // permanently dead after `max_attempts` weeks.
+        let uptime = now.saturating_duration_since(entry.started_at);
+        let stability_window = service.effective_restart_stability_window();
+        if entry.attempts > 0 && uptime >= stability_window {
+            info!(
+                service = %name,
+                uptime_ms = uptime.as_millis() as u64,
+                stability_window_ms = stability_window.as_millis() as u64,
+                previous_attempts = entry.attempts,
+                "service_restart_budget_reset"
+            );
+            entry.attempts = 0;
+        }
+
+        if !service.effective_restart_on_exit() {
+            entry.retry_at = None;
+            info!(service = %name, "service_not_restarted_by_policy");
+            continue;
+        }
+
+        let max_attempts = service.effective_max_restart_attempts();
+        if entry.attempts >= max_attempts {
+            entry.retry_at = None;
+            error!(
+                service = %name,
+                attempts = entry.attempts,
+                max_attempts,
+                stability_window_ms = stability_window.as_millis() as u64,
+                "service_restart_limit_reached"
+            );
+            continue;
+        }
+
+        let backoff = Duration::from_millis(service.effective_restart_backoff_ms());
+        entry.retry_at = Some(now + backoff);
+        info!(
+            service = %name,
+            attempt = entry.attempts + 1,
+            max_attempts,
+            backoff_ms = backoff.as_millis() as u64,
+            "service_restart_scheduled"
+        );
+    }
+}
+
+/// Start services whose restart backoff has elapsed, in dependency order.
+async fn spawn_due_restarts(
+    config: &KrabConfig,
+    startup_order: &[String],
+    children: &mut HashMap<String, tokio::process::Child>,
+    supervision: &mut HashMap<String, ServiceSupervision>,
+) {
+    let now = Instant::now();
+    let due: Vec<String> = startup_order
+        .iter()
+        .filter(|name| !children.contains_key(*name))
+        .filter(|name| {
+            supervision
+                .get(*name)
+                .and_then(|state| state.retry_at)
+                .is_some_and(|at| at <= now)
+        })
+        .cloned()
+        .collect();
+
+    for name in due {
+        let Some(service) = config.services.get(&name) else {
+            continue;
+        };
+
+        let attempt = {
+            let Some(entry) = supervision.get_mut(&name) else {
+                continue;
+            };
+            entry.attempts += 1;
+            entry.retry_at = None;
+            entry.attempts
+        };
+
+        let max_attempts = service.effective_max_restart_attempts();
+        match spawn_service_and_wait_ready(&name, service, "automatic restart").await {
+            Ok(child) => {
+                children.insert(name.clone(), child);
+                if let Some(entry) = supervision.get_mut(&name) {
+                    entry.mark_started();
+                }
+                info!(service = %name, attempt, max_attempts, "service_auto_restarted");
+            }
+            Err(err) => {
+                error!(service = %name, error = %err, attempt, max_attempts, "service_auto_restart_failed");
+                // A failed restart consumes an attempt like any other. Re-arm
+                // the backoff so the next tick retries, until the budget runs
+                // out — the spawn path has no child to reap, so this is the
+                // only place that can notice the budget is spent.
+                let Some(entry) = supervision.get_mut(&name) else {
+                    continue;
+                };
+                if attempt < max_attempts {
+                    entry.retry_at = Some(
+                        Instant::now()
+                            + Duration::from_millis(service.effective_restart_backoff_ms()),
+                    );
+                } else {
+                    entry.retry_at = None;
+                    error!(
+                        service = %name,
+                        attempts = attempt,
+                        max_attempts,
+                        "service_restart_limit_reached"
+                    );
+                }
             }
         }
     }
 }
 
+fn shutdown_timeout_for(config: &KrabConfig, name: &str) -> Duration {
+    Duration::from_millis(
+        config
+            .services
+            .get(name)
+            .map(|svc| svc.shutdown_timeout_ms)
+            .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_MS),
+    )
+}
+
 /// Shut down all currently running supervised children using per-service shutdown budgets.
+///
+/// Stops in reverse dependency order so a dependency outlives everything that
+/// talks to it.
 pub(super) async fn shutdown_children(
     config: &KrabConfig,
+    startup_order: &[String],
     children: &mut HashMap<String, tokio::process::Child>,
 ) {
-    let names: Vec<String> = children.keys().cloned().collect();
+    let mut names: Vec<String> = startup_order
+        .iter()
+        .rev()
+        .filter(|name| children.contains_key(*name))
+        .cloned()
+        .collect();
+    // Anything running that the startup order does not mention still has to be
+    // stopped; order among those does not matter, only determinism does.
+    let mut orphans: Vec<String> = children
+        .keys()
+        .filter(|name| !startup_order.contains(name))
+        .cloned()
+        .collect();
+    orphans.sort();
+    names.extend(orphans);
+
     for name in names {
         let Some(child) = children.get_mut(&name) else {
             continue;
         };
-        let timeout_ms = config
-            .services
-            .get(&name)
-            .map(|svc| svc.shutdown_timeout_ms)
-            .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_MS);
-        terminate_child(name.as_str(), child, Duration::from_millis(timeout_ms)).await;
+        terminate_child(name.as_str(), child, shutdown_timeout_for(config, &name)).await;
     }
     children.clear();
 }
@@ -186,34 +354,42 @@ pub(super) async fn shutdown_children(
 /// Restart only services marked as watch-enabled after source changes are detected.
 pub(super) async fn restart_watched_services(
     config: &KrabConfig,
+    startup_order: &[String],
     children: &mut HashMap<String, tokio::process::Child>,
-    restart_attempts: &mut HashMap<String, u32>,
+    supervision: &mut HashMap<String, ServiceSupervision>,
 ) {
-    let watched_names: Vec<String> = config
-        .services
+    // Driven by the resolved startup order rather than by iterating
+    // `config.services`, which is a `HashMap`: restarts used to land in
+    // arbitrary order, so the frontend could come back before the auth service
+    // it depends on.
+    let watched: Vec<String> = startup_order
         .iter()
-        .filter_map(|(name, service)| {
-            if service.watch {
-                Some(name.clone())
-            } else {
-                None
-            }
+        .filter(|name| {
+            config
+                .services
+                .get(*name)
+                .is_some_and(|service| service.watch)
         })
+        .cloned()
         .collect();
 
-    for name in &watched_names {
+    if watched.is_empty() {
+        warn!("watch_restart_requested_but_no_service_sets_watch_true");
+        return;
+    }
+
+    for name in watched.iter().rev() {
         let Some(child) = children.get_mut(name) else {
             continue;
         };
-        let timeout_ms = config
-            .services
-            .get(name)
-            .map(|svc| svc.shutdown_timeout_ms)
-            .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_MS);
-        terminate_child(name.as_str(), child, Duration::from_millis(timeout_ms)).await;
+        terminate_child(name.as_str(), child, shutdown_timeout_for(config, name)).await;
+        // Drop the handle even though a fresh one usually replaces it below: if
+        // the respawn fails, a reaped handle left here would be re-reported as
+        // a new exit on every supervision tick.
+        children.remove(name);
     }
 
-    for name in watched_names {
+    for name in watched {
         let Some(service) = config.services.get(&name) else {
             continue;
         };
@@ -221,7 +397,7 @@ pub(super) async fn restart_watched_services(
         match spawn_service_and_wait_ready(&name, service, "watch restart").await {
             Ok(child) => {
                 children.insert(name.clone(), child);
-                restart_attempts.insert(name.clone(), 0);
+                supervision.insert(name.clone(), ServiceSupervision::started_now());
                 info!(service = %name, "service_restarted");
             }
             Err(err) => {
@@ -237,6 +413,14 @@ pub(super) async fn terminate_child(
     child: &mut tokio::process::Child,
     timeout: Duration,
 ) {
+    // Nothing to signal or wait for if the process is already gone — without
+    // this, tearing down a service that died during its readiness probe burned
+    // the full shutdown budget waiting on a corpse.
+    if let Ok(Some(status)) = child.try_wait() {
+        info!(service = %name, status = %status, code = ?status.code(), "service_already_exited");
+        return;
+    }
+
     #[cfg(unix)]
     {
         use nix::sys::signal::{kill, Signal};
@@ -297,7 +481,12 @@ pub(super) async fn spawn_service(
     cmd.args(&service.args)
         .envs(&service.env)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Backstop for the paths that never reach `shutdown_children`: if the
+        // orchestrator panics or is killed outright, the runtime still reaps
+        // its children instead of leaving every service running and its port
+        // bound.
+        .kill_on_drop(true);
     if let Some(cwd) = &service.cwd {
         cmd.current_dir(cwd);
     }
@@ -341,7 +530,7 @@ pub(super) async fn spawn_service_and_wait_ready(
     stage: &'static str,
 ) -> Result<tokio::process::Child> {
     let mut child = spawn_service(name, service).await?;
-    if let Err(err) = wait_for_service_health(name, service).await {
+    if let Err(err) = wait_for_service_health(name, service, &mut child).await {
         terminate_child(
             name,
             &mut child,
@@ -360,7 +549,17 @@ pub(super) async fn spawn_service_and_wait_ready(
 ///
 /// A small circuit breaker is used to prevent hammering unavailable services during
 /// bootstrap or automatic restart flows.
-pub(super) async fn wait_for_service_health(name: &str, service: &ServiceDefinition) -> Result<()> {
+///
+/// The child handle is checked between attempts: a service that exits on
+/// startup — a bad port binding, a missing migration, a config panic — used to
+/// burn the whole retry budget probing a process that had already been dead for
+/// seconds, and then report a generic connection error rather than the exit
+/// status that actually explains it.
+pub(super) async fn wait_for_service_health(
+    name: &str,
+    service: &ServiceDefinition,
+    child: &mut tokio::process::Child,
+) -> Result<()> {
     let Some(url) = service.effective_healthcheck_url() else {
         return Ok(());
     };
@@ -388,6 +587,21 @@ pub(super) async fn wait_for_service_health(name: &str, service: &ServiceDefinit
 
     for attempt in 1..=retries {
         diagnostics.attempts = attempt;
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                anyhow::bail!(
+                    "service '{name}' exited with {status} (code={code:?}) before its readiness probe at {url} succeeded, on attempt {attempt}/{retries} after {elapsed_ms} ms",
+                    code = status.code(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                );
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(service = %name, error = %err, "service_try_wait_failed_during_readiness");
+            }
+        }
+
         let elapsed_ms = started.elapsed().as_millis() as u64;
         if elapsed_ms > startup_deadline_ms {
             diagnostics.last_error = Some(format!(

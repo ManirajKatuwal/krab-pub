@@ -1,10 +1,23 @@
 use config::Config;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::time::Duration;
 
 pub(super) const DEFAULT_POLL_MS: u64 = 1000;
 pub(super) const DEFAULT_SETTLE_MS: u64 = 500;
 pub(super) const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 5000;
+
+/// Floor for the polling-fallback interval.
+///
+/// `poll_ms = 0` used to mean "sleep for zero milliseconds, then walk every
+/// watched source tree again" — a hot loop that pins a core and hammers the
+/// filesystem. `settle_ms` already had a floor; this gives `poll_ms` one too.
+pub(super) const MIN_POLL_MS: u64 = 50;
+
+/// Floor for the post-event settle window, for the same reason as
+/// [`MIN_POLL_MS`]: a zero settle restarts services on the first write of a
+/// multi-file save instead of coalescing the burst.
+pub(super) const MIN_SETTLE_MS: u64 = 50;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct KrabConfig {
@@ -54,6 +67,15 @@ pub(super) struct RestartPolicyConfig {
     pub(super) backoff_ms: u64,
     #[serde(default = "default_max_restart_attempts")]
     pub(super) max_attempts: u32,
+    /// How long a service must stay up before its earlier crashes stop
+    /// counting against `max_attempts`.
+    ///
+    /// Without this the attempt counter only ever grows, so a service that
+    /// crashes once a week is permanently dead after `max_attempts` weeks —
+    /// the budget is meant to stop a crash loop, not to cap a process's
+    /// lifetime failures.
+    #[serde(default = "default_restart_stability_window_ms")]
+    pub(super) stability_window_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +99,20 @@ pub(super) struct WatchConfig {
     pub(super) settle_ms: u64,
     #[serde(default)]
     pub(super) paths: Vec<String>,
+}
+
+impl WatchConfig {
+    /// Polling-fallback interval, floored so a `poll_ms = 0` config cannot turn
+    /// the fallback loop into a filesystem-scanning spin.
+    pub(super) fn effective_poll_interval(&self) -> Duration {
+        Duration::from_millis(self.poll_ms.max(MIN_POLL_MS))
+    }
+
+    /// Quiet period after the last filesystem event before services restart,
+    /// floored so a burst of editor writes still coalesces into one restart.
+    pub(super) fn effective_settle(&self) -> Duration {
+        Duration::from_millis(self.settle_ms.max(MIN_SETTLE_MS))
+    }
 }
 
 pub(super) fn load_krab_config() -> anyhow::Result<KrabConfig> {
@@ -104,6 +140,10 @@ fn default_restart_backoff_ms() -> u64 {
 
 fn default_max_restart_attempts() -> u32 {
     5
+}
+
+fn default_restart_stability_window_ms() -> u64 {
+    60_000
 }
 
 fn default_healthcheck_timeout_ms() -> u64 {
@@ -142,6 +182,15 @@ impl ServiceDefinition {
             .as_ref()
             .map(|p| p.max_attempts)
             .unwrap_or(self.max_restart_attempts)
+    }
+
+    pub(super) fn effective_restart_stability_window(&self) -> Duration {
+        Duration::from_millis(
+            self.restart_policy
+                .as_ref()
+                .map(|p| p.stability_window_ms)
+                .unwrap_or_else(default_restart_stability_window_ms),
+        )
     }
 
     pub(super) fn effective_healthcheck_url(&self) -> Option<&str> {
@@ -186,8 +235,12 @@ impl ServiceDefinition {
 
 #[cfg(test)]
 mod tests {
-    use super::{HealthProbeConfig, ServiceDefinition};
+    use super::{
+        HealthProbeConfig, RestartPolicyConfig, ServiceDefinition, WatchConfig, DEFAULT_POLL_MS,
+        DEFAULT_SETTLE_MS,
+    };
     use std::collections::HashMap;
+    use std::time::Duration;
 
     fn sample_service() -> ServiceDefinition {
         ServiceDefinition {
@@ -233,5 +286,57 @@ mod tests {
         });
 
         assert_eq!(service.effective_startup_deadline_ms(), 2700);
+    }
+
+    #[test]
+    fn restart_stability_window_defaults_when_policy_omits_it() {
+        let service = sample_service();
+
+        assert_eq!(
+            service.effective_restart_stability_window(),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn restart_stability_window_honours_explicit_policy() {
+        let mut service = sample_service();
+        service.restart_policy = Some(RestartPolicyConfig {
+            on_exit: true,
+            backoff_ms: 700,
+            max_attempts: 8,
+            stability_window_ms: 5_000,
+        });
+
+        assert_eq!(
+            service.effective_restart_stability_window(),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn zero_poll_and_settle_are_floored_instead_of_spinning() {
+        let watch = WatchConfig {
+            enabled: true,
+            poll_ms: 0,
+            settle_ms: 0,
+            paths: vec![],
+        };
+
+        assert_eq!(watch.effective_poll_interval(), Duration::from_millis(50));
+        assert_eq!(watch.effective_settle(), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn configured_poll_and_settle_above_the_floor_are_preserved() {
+        let watch = WatchConfig {
+            enabled: true,
+            poll_ms: DEFAULT_POLL_MS,
+            settle_ms: DEFAULT_SETTLE_MS,
+            paths: vec![],
+        };
+
+        assert_eq!(watch.effective_poll_interval(), Duration::from_millis(1000));
+        assert_eq!(watch.effective_settle(), Duration::from_millis(500));
     }
 }

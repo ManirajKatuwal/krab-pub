@@ -37,6 +37,26 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
   distinguish an in-app navigation from a document request — for logging, or to
   serve a lighter shell. Documented in
   [`docs/reference/api.md`](docs/reference/api.md).
+- Rustdoc for `#[island]` and `view!`, which were public API with none.
+- `#[server]` expansion tests. The macro previously had only compile-fail
+  coverage and a doctest, so nothing exercised the generated handler, the
+  dispatch shim, the args struct, or the `ServerFn` marker.
+- Tests for `resolve_startup_order`, which had none: dependency ordering,
+  determinism, cycles, self-cycles, and unknown dependencies.
+- Compile-fail cases for an unclosed element, an unclosed fragment, a generic
+  `#[server]` function, and `#[island]` with an argument.
+
+### Changed
+
+- `#[server]`'s dispatch shim delegates to the generated handler instead of
+  repeating it. Argument decoding and response mapping were written out once per
+  (handler, dispatch) × (stream, non-stream) — four copies of the same logic.
+  No behaviour change; the shim's signature and the `ServerFn` contract are
+  unchanged.
+- New optional `restart_policy.stability_window_ms` per service in `krab.toml`,
+  defaulting to 60000.
+- `krab_orchestrator` sets `kill_on_drop` on spawned services, so a panicking or
+  killed orchestrator no longer leaves every service running with its port bound.
 
 ### Deprecated
 
@@ -82,6 +102,58 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
   a `</main>` inside a comment or script *within* the outlet truncated the
   swapped content. Document titles carried across a navigation are now
   entity-decoded and tolerate attributes on `<title>`.
+- **`krab_orchestrator` exits non-zero when `krab.toml` is missing or
+  malformed.** The load error was logged and then discarded, so a failed start
+  returned exit code 0 — CI, `krab bootstrap`, and any process supervisor above
+  the orchestrator all read it as a clean run.
+- **A service that exits and is not restarted no longer floods the log.** Its
+  handle stayed in the supervised-children map after being reaped, and Tokio
+  caches a reaped child's exit status, so every 500 ms tick re-reported the same
+  exit: `service_exited` and `service_restart_limit_reached` repeated twice a
+  second, indefinitely. Reaped handles are now removed.
+- **The restart budget is no longer permanent.** `max_attempts` counted every
+  restart for the lifetime of the orchestrator, so a service that crashed once a
+  day was permanently dead after `max_attempts` days. A service that stays up for
+  a stability window (`restart_policy.stability_window_ms`, default 60 s) now
+  gets its budget back.
+- **A crashed service no longer stalls supervision of every other service.** The
+  restart backoff was an inline `sleep` inside the supervision loop, which also
+  made Ctrl-C unresponsive for its duration. Restarts are now scheduled against a
+  deadline and the loop keeps ticking.
+- **A transient filesystem-scan error no longer kills the orchestrator and
+  orphans its children.** `watch_fingerprint` propagated `read_dir` errors out of
+  the supervisor without a shutdown pass, so a file removed mid-scan by a
+  concurrent build left every service running with no supervisor. Per-entry
+  errors are logged and skipped, and a failed scan skips the cycle.
+- **Watch restarts follow dependency order.** They iterated `config.services`, a
+  `HashMap`, so the frontend could come back before the auth service it depends
+  on. Services now stop in reverse dependency order and start in forward order,
+  matching initial startup. Shutdown is likewise ordered.
+- **`watch.poll_ms = 0` no longer spins.** It slept for zero milliseconds and
+  rescanned every watched source tree, pinning a core. Both `poll_ms` and
+  `settle_ms` are floored at 50 ms.
+- **A readiness probe stops as soon as the child exits.** A service that died on
+  startup — bad port binding, failed migration, config panic — burned its entire
+  retry budget probing a dead process and then reported a generic connection
+  error. The failure now names the exit status.
+- **`view!` reports an unclosed tag as an unclosed tag.** `view! { <div>"hi" }`
+  reported `view! macro body is empty`, pointing at the whole macro, because the
+  exhausted token stream reached the node parser's empty-input check.
+- **`#[island]` props no longer have to be `Clone`.** The server half rendered
+  `inner(props.clone())` although the serialization above it only borrowed.
+- **`#[island]` rejects arguments instead of ignoring them.** The attribute
+  token stream was discarded, so `#[island(lazy)]` — or any misspelt option —
+  compiled and silently did nothing.
+- **A props value that fails to serialize is marked as such.** `#[island]` used
+  `unwrap_or_default()`, emitting `data-props=""`, which the browser then
+  reported as a *client* decode failure. The boundary now carries
+  `data-krab-boundary-state="props-encode-error"`, distinct from a client-side
+  decode error. The serde message is deliberately not placed in the markup.
+- **`#[server]` rejects generic functions and `where` clauses.** The expansion
+  rebuilds the function from its signature pieces and never re-emitted
+  `sig.generics`, so a generic server function expanded into a body referencing
+  undeclared type parameters and failed with `cannot find type` against generated
+  code.
 
 ---
 
