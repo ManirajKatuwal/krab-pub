@@ -285,6 +285,10 @@ pub async fn enforce_migration_governance(
         "release_environments": cfg.release_environments,
     });
 
+    // Record-then-deny: the audit row is written FIRST so a "deny" verdict is
+    // durably attributable even though the function then errors. Previously
+    // `allow_apply = false` only changed the decision string and the function
+    // still returned `Ok(())`, leaving enforcement entirely to the caller.
     sqlx::query(
         "INSERT INTO krab_migration_policy_audit (service_name, environment, policy_name, decision, detail)
          VALUES ($1, $2, $3, $4, $5)",
@@ -296,6 +300,15 @@ pub async fn enforce_migration_governance(
     .bind(detail)
     .execute(pool)
     .await?;
+
+    if !cfg.allow_apply {
+        anyhow::bail!(
+            "migration governance policy denies apply for service '{}' in environment '{}': \
+             DB_MIGRATION_ALLOW_APPLY is false (decision recorded in krab_migration_policy_audit)",
+            cfg.service_name,
+            cfg.environment
+        );
+    }
 
     Ok(())
 }
@@ -422,37 +435,82 @@ impl DbConfig {
     /// returned, never swallowed: a broken secret source must fail startup
     /// rather than silently connect to the localhost default.
     pub fn from_env(default_url: &str) -> Result<Self> {
-        fn parse_u32(name: &str, default: u32) -> u32 {
-            std::env::var(name)
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(default)
+        /// A set-but-unparseable value is an **error naming the variable**,
+        /// never a silent fall-back to the default: a typo'd
+        /// `DB_MAX_CONNECTIONS=1O` must fail startup, not quietly run with 10.
+        fn parse_u32(name: &str, default: u32) -> Result<u32> {
+            match std::env::var(name) {
+                Ok(raw) => raw.trim().parse::<u32>().map_err(|err| {
+                    anyhow::anyhow!(
+                        "invalid value for {name}: '{raw}' is not an unsigned integer ({err})"
+                    )
+                }),
+                Err(std::env::VarError::NotPresent) => Ok(default),
+                Err(std::env::VarError::NotUnicode(_)) => Err(anyhow::anyhow!(
+                    "invalid value for {name}: not valid unicode"
+                )),
+            }
         }
 
         let mut cfg = Self::default();
         cfg.url = crate::config::read_env_or_file("DATABASE_URL")
             .context("failed to resolve DATABASE_URL from its configured secret source")?
             .unwrap_or_else(|| default_url.to_string());
-        cfg.max_connections = parse_u32("DB_MAX_CONNECTIONS", cfg.max_connections);
-        cfg.min_connections = parse_u32("DB_MIN_CONNECTIONS", cfg.min_connections);
-        cfg.connect_retries = parse_u32("DB_CONNECT_RETRIES", cfg.connect_retries);
+        cfg.max_connections = parse_u32("DB_MAX_CONNECTIONS", cfg.max_connections)?;
+        cfg.min_connections = parse_u32("DB_MIN_CONNECTIONS", cfg.min_connections)?;
+        cfg.connect_retries = parse_u32("DB_CONNECT_RETRIES", cfg.connect_retries)?;
         cfg.connect_retry_delay = Duration::from_millis(parse_u32(
             "DB_CONNECT_RETRY_DELAY_MS",
             cfg.connect_retry_delay.as_millis() as u32,
-        ) as u64);
+        )? as u64);
         cfg.acquire_timeout = Duration::from_secs(parse_u32(
             "DB_ACQUIRE_TIMEOUT_SECS",
             cfg.acquire_timeout.as_secs() as u32,
-        ) as u64);
+        )? as u64);
         cfg.max_lifetime = Duration::from_secs(parse_u32(
             "DB_MAX_LIFETIME_SECS",
             cfg.max_lifetime.as_secs() as u32,
-        ) as u64);
+        )? as u64);
         cfg.idle_timeout = Duration::from_secs(parse_u32(
             "DB_IDLE_TIMEOUT_SECS",
             cfg.idle_timeout.as_secs() as u32,
-        ) as u64);
+        )? as u64);
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Reject configurations that parse but cannot work: a zero-connection
+    /// pool, a minimum above the maximum, or zero timeouts that make every
+    /// acquire (or the retry backoff) degenerate.
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.max_connections >= 1,
+            "DB_MAX_CONNECTIONS must be at least 1 (got {})",
+            self.max_connections
+        );
+        anyhow::ensure!(
+            self.min_connections <= self.max_connections,
+            "DB_MIN_CONNECTIONS ({}) must not exceed DB_MAX_CONNECTIONS ({})",
+            self.min_connections,
+            self.max_connections
+        );
+        anyhow::ensure!(
+            !self.acquire_timeout.is_zero(),
+            "DB_ACQUIRE_TIMEOUT_SECS must be non-zero"
+        );
+        anyhow::ensure!(
+            !self.max_lifetime.is_zero(),
+            "DB_MAX_LIFETIME_SECS must be non-zero"
+        );
+        anyhow::ensure!(
+            !self.idle_timeout.is_zero(),
+            "DB_IDLE_TIMEOUT_SECS must be non-zero"
+        );
+        anyhow::ensure!(
+            !self.connect_retry_delay.is_zero(),
+            "DB_CONNECT_RETRY_DELAY_MS must be non-zero"
+        );
+        Ok(())
     }
 }
 
@@ -462,6 +520,29 @@ pub async fn connect(database_url: &str) -> Result<DbPool> {
         ..DbConfig::default()
     })
     .await
+}
+
+/// Classify a connection-phase `sqlx` error as transient (worth retrying)
+/// or permanent (fail fast, skip the backoff schedule).
+///
+/// Transient: network-level I/O failures (connection refused/reset, DNS
+/// hiccups) and pool timeouts — the "database still booting" class the retry
+/// schedule exists for. Database-reported errors default to transient too
+/// (e.g. SQLSTATE `57P03` `cannot_connect_now` during server startup).
+///
+/// Permanent: TLS and configuration errors, and database errors carrying an
+/// auth-class SQLSTATE (`28xxx`: `invalid_authorization_specification`,
+/// `invalid_password`). Retrying a bad password burns the whole exponential
+/// backoff and can trip server-side lockouts without ever succeeding.
+pub(crate) fn is_transient_connect_error(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut => true,
+        sqlx::Error::Tls(_) | sqlx::Error::Configuration(_) => false,
+        sqlx::Error::Database(db_error) => {
+            !db_error.code().is_some_and(|code| code.starts_with("28"))
+        }
+        _ => true,
+    }
 }
 
 pub async fn connect_with_config(cfg: &DbConfig) -> Result<DbPool> {
@@ -480,6 +561,12 @@ pub async fn connect_with_config(cfg: &DbConfig) -> Result<DbPool> {
 
         match result {
             Ok(pool) => return Ok(pool),
+            Err(e) if !is_transient_connect_error(&e) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "non-transient database connection error for '{}'; failing fast without retry",
+                    redact_db_url(&cfg.url)
+                )));
+            }
             Err(e) => {
                 attempt += 1;
                 if attempt >= cfg.connect_retries {
@@ -497,6 +584,12 @@ pub async fn connect_with_config(cfg: &DbConfig) -> Result<DbPool> {
                 attempt.hash(&mut hasher);
                 let jitter_ms = hasher.finish() % 250;
 
+                warn!(
+                    attempt,
+                    backoff_ms,
+                    error = %e,
+                    "db_connect_transient_error_will_retry"
+                );
                 sleep(Duration::from_millis(backoff_ms.saturating_add(jitter_ms))).await;
             }
         }
@@ -589,6 +682,31 @@ async fn upgrade_legacy_checksum_row(pool: &DbPool, version: i64, sql: &str) -> 
     Ok(())
 }
 
+/// Promotion ladder, lowest to highest stage. Environments are compared by
+/// their position on this ladder; a name that is not on it is a
+/// misconfiguration, never silently the lowest stage.
+const PROMOTION_LADDER: [&str; 4] = ["local", "dev", "staging", "prod"];
+
+/// Resolve an environment name to its ladder position, case-insensitively.
+///
+/// Unknown names are an **error naming the environment and the ladder**.
+/// They used to map to `unwrap_or(0)` — index 0 = `local` — so a recorded
+/// environment of `"production"` (instead of `"prod"`) made every target look
+/// like a forward promotion and silently defeated backwards-promotion
+/// detection.
+pub(crate) fn promotion_stage_index(environment: &str) -> Result<usize> {
+    let normalized = environment.trim().to_ascii_lowercase();
+    PROMOTION_LADDER
+        .iter()
+        .position(|&stage| stage == normalized)
+        .with_context(|| {
+            format!(
+                "unknown environment '{environment}' in migration promotion policy; \
+                 known promotion ladder is {PROMOTION_LADDER:?}"
+            )
+        })
+}
+
 pub async fn enforce_promotion_policy(pool: &DbPool, cfg: &PromotionConfig) -> Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS krab_migration_environment (environment TEXT PRIMARY KEY, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())",
@@ -596,8 +714,11 @@ pub async fn enforce_promotion_policy(pool: &DbPool, cfg: &PromotionConfig) -> R
     .execute(pool)
     .await?;
 
-    // Determine target environment from config
-    let target_env = cfg.environment.as_str();
+    // Normalize before ladder lookup and storage so "Prod" and "prod" are the
+    // same stage; validate the target even on a fresh database.
+    let target_env = cfg.environment.trim().to_ascii_lowercase();
+    let target_idx = promotion_stage_index(&target_env)
+        .context("migration promotion policy rejected the target environment")?;
 
     let rows = sqlx::query_scalar::<_, String>(
         "SELECT environment FROM krab_migration_environment ORDER BY updated_at DESC LIMIT 1",
@@ -605,11 +726,11 @@ pub async fn enforce_promotion_policy(pool: &DbPool, cfg: &PromotionConfig) -> R
     .fetch_optional(pool)
     .await?;
 
-    if let Some(previous) = rows {
+    if let Some(previous_raw) = rows {
         // Enforce promotion order: local -> dev -> staging -> prod
-        let order = ["local", "dev", "staging", "prod"];
-        let prev_idx = order.iter().position(|&e| e == previous).unwrap_or(0);
-        let target_idx = order.iter().position(|&e| e == target_env).unwrap_or(0);
+        let previous = previous_raw.trim().to_ascii_lowercase();
+        let prev_idx = promotion_stage_index(&previous)
+            .context("migration promotion policy rejected the recorded environment")?;
 
         if target_idx < prev_idx {
             anyhow::bail!(
@@ -727,7 +848,9 @@ pub async fn rollback_to_version(
         })?;
 
         let mut tx = pool.begin().await?;
-        sqlx::query(rollback_sql).execute(&mut *tx).await?;
+        // Simple-query protocol: rollback bodies may hold several statements,
+        // exactly like forward migration bodies.
+        sqlx::raw_sql(rollback_sql).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM krab_migrations WHERE version = $1")
             .bind(migration.version)
             .execute(&mut *tx)
@@ -796,16 +919,21 @@ pub async fn run_versioned_migrations(
     // Two replicas booting through a rolling deploy both reach this function;
     // without cross-process serialization both observe version N as unapplied
     // and both execute its DDL — one commits, the other crashes on the
-    // `krab_migrations` primary key. Hold a session-level advisory lock on a
-    // dedicated connection for the whole run so exactly one migrator proceeds
-    // at a time; the loser waits, then skips the now-applied versions.
-    let mut lock_conn = pool
-        .acquire()
+    // `krab_migrations` primary key. Hold a session-level advisory lock for
+    // the whole run so exactly one migrator proceeds at a time; the loser
+    // waits, then skips the now-applied versions.
+    //
+    // The lock lives on a DEDICATED connection opened outside the pool. It
+    // used to be checked out of the pool itself, which deadlocked any pool
+    // with a single connection (`DB_MAX_CONNECTIONS=1`, or the test harness):
+    // the lock held the only slot while every migration statement waited for
+    // a second one, until `PoolTimedOut` after the acquire timeout.
+    let mut lock_conn = sqlx::postgres::PgConnection::connect_with(pool.connect_options().as_ref())
         .await
-        .context("failed to acquire a connection for the migration advisory lock")?;
+        .context("failed to open a dedicated connection for the migration advisory lock")?;
     sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(MIGRATION_ADVISORY_LOCK_KEY)
-        .execute(&mut *lock_conn)
+        .execute(&mut lock_conn)
         .await
         .context("failed to take the migration advisory lock")?;
 
@@ -814,14 +942,14 @@ pub async fn run_versioned_migrations(
     let unlocked: std::result::Result<bool, sqlx::Error> =
         sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
             .bind(MIGRATION_ADVISORY_LOCK_KEY)
-            .fetch_one(&mut *lock_conn)
+            .fetch_one(&mut lock_conn)
             .await;
     if !matches!(unlocked, Ok(true)) {
-        // Advisory locks belong to the session, and pooled sessions are
-        // reused: a connection returned while still holding the lock would
-        // block every future migrator. Close it so Postgres releases the lock.
-        let _ = lock_conn.detach().close().await;
+        warn!("db_migration_advisory_unlock_failed_closing_session");
     }
+    // Close the dedicated session either way; advisory locks are
+    // session-scoped, so a closed session cannot block future migrators.
+    let _ = lock_conn.close().await;
 
     result
 }
@@ -883,7 +1011,11 @@ async fn run_versioned_migrations_locked(
         }
 
         let mut tx = pool.begin().await?;
-        let apply_result = sqlx::query(migration.sql).execute(&mut *tx).await;
+        // `raw_sql` uses the simple-query protocol, so a migration body made
+        // of several statements ("CREATE TABLE ...; CREATE INDEX ...;")
+        // executes as written. `sqlx::query` prepares a single statement and
+        // rejects multi-statement SQL at runtime.
+        let apply_result = sqlx::raw_sql(migration.sql).execute(&mut *tx).await;
 
         if let Err(error) = apply_result {
             let _ = tx.rollback().await;
@@ -1006,6 +1138,16 @@ mod db_config_tests {
     use super::DbConfig;
     use serial_test::serial;
 
+    const POOL_ENV_VARS: [&str; 7] = [
+        "DB_MAX_CONNECTIONS",
+        "DB_MIN_CONNECTIONS",
+        "DB_CONNECT_RETRIES",
+        "DB_CONNECT_RETRY_DELAY_MS",
+        "DB_ACQUIRE_TIMEOUT_SECS",
+        "DB_MAX_LIFETIME_SECS",
+        "DB_IDLE_TIMEOUT_SECS",
+    ];
+
     fn clear_db_url_env() {
         for key in [
             "DATABASE_URL",
@@ -1016,9 +1158,50 @@ mod db_config_tests {
         }
     }
 
+    fn clear_pool_env() {
+        for key in POOL_ENV_VARS {
+            std::env::remove_var(key);
+        }
+    }
+
+    /// Restores the captured variables when dropped (even on panic), so a
+    /// test that clears `DATABASE_URL` cannot poison later tests in the same
+    /// binary — the live-database tests read `DATABASE_URL` from the ambient
+    /// environment.
+    struct EnvSnapshot(Vec<(&'static str, Option<String>)>);
+
+    impl EnvSnapshot {
+        fn capture() -> Self {
+            let mut saved = Vec::new();
+            for key in [
+                "DATABASE_URL",
+                "DATABASE_URL_FILE",
+                "DATABASE_URL_VAULT_REF",
+            ] {
+                saved.push((key, std::env::var(key).ok()));
+            }
+            for key in POOL_ENV_VARS {
+                saved.push((key, std::env::var(key).ok()));
+            }
+            Self(saved)
+        }
+    }
+
+    impl Drop for EnvSnapshot {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     #[test]
     #[serial]
     fn missing_database_url_still_falls_back_to_default_in_dev() {
+        let _env = EnvSnapshot::capture();
         clear_db_url_env();
 
         let cfg = DbConfig::from_env("postgres://localhost:5432/dev_default")
@@ -1029,6 +1212,7 @@ mod db_config_tests {
     #[test]
     #[serial]
     fn broken_database_url_file_fails_instead_of_defaulting() {
+        let _env = EnvSnapshot::capture();
         clear_db_url_env();
         std::env::set_var(
             "DATABASE_URL_FILE",
@@ -1049,6 +1233,7 @@ mod db_config_tests {
     #[test]
     #[serial]
     fn unresolved_database_url_vault_ref_fails_instead_of_defaulting() {
+        let _env = EnvSnapshot::capture();
         clear_db_url_env();
         std::env::set_var("DATABASE_URL_VAULT_REF", "vault://kv/krab/database-url");
 
@@ -1061,5 +1246,269 @@ mod db_config_tests {
         );
 
         std::env::remove_var("DATABASE_URL_VAULT_REF");
+    }
+
+    #[test]
+    #[serial]
+    fn garbage_pool_value_errors_naming_the_variable() {
+        let _env = EnvSnapshot::capture();
+        clear_db_url_env();
+        clear_pool_env();
+        std::env::set_var("DB_MAX_CONNECTIONS", "banana");
+
+        let err = DbConfig::from_env("postgres://localhost:5432/dev_default")
+            .expect_err("an unparseable DB_MAX_CONNECTIONS must be an error, not the default");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("DB_MAX_CONNECTIONS"),
+            "error should name the failing variable: {message}"
+        );
+        assert!(
+            message.contains("banana"),
+            "error should include the rejected value: {message}"
+        );
+
+        clear_pool_env();
+    }
+
+    #[test]
+    #[serial]
+    fn zero_max_connections_is_rejected() {
+        let _env = EnvSnapshot::capture();
+        clear_db_url_env();
+        clear_pool_env();
+        std::env::set_var("DB_MAX_CONNECTIONS", "0");
+
+        let err = DbConfig::from_env("postgres://localhost:5432/dev_default")
+            .expect_err("a zero-connection pool must be rejected");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("DB_MAX_CONNECTIONS"),
+            "error should name the failing variable: {message}"
+        );
+
+        clear_pool_env();
+    }
+
+    #[test]
+    #[serial]
+    fn min_connections_above_max_is_rejected() {
+        let _env = EnvSnapshot::capture();
+        clear_db_url_env();
+        clear_pool_env();
+        std::env::set_var("DB_MAX_CONNECTIONS", "2");
+        std::env::set_var("DB_MIN_CONNECTIONS", "8");
+
+        let err = DbConfig::from_env("postgres://localhost:5432/dev_default")
+            .expect_err("min above max must be rejected");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("DB_MIN_CONNECTIONS") && message.contains("DB_MAX_CONNECTIONS"),
+            "error should name both variables: {message}"
+        );
+
+        clear_pool_env();
+    }
+
+    #[test]
+    #[serial]
+    fn zero_timeouts_and_retry_delay_are_rejected() {
+        let _env = EnvSnapshot::capture();
+        clear_db_url_env();
+        for var in [
+            "DB_ACQUIRE_TIMEOUT_SECS",
+            "DB_MAX_LIFETIME_SECS",
+            "DB_IDLE_TIMEOUT_SECS",
+            "DB_CONNECT_RETRY_DELAY_MS",
+        ] {
+            clear_pool_env();
+            std::env::set_var(var, "0");
+
+            let err = match DbConfig::from_env("postgres://localhost:5432/dev_default") {
+                Ok(_) => panic!("{var}=0 must be rejected"),
+                Err(e) => e,
+            };
+            let message = format!("{err:#}");
+            assert!(message.contains(var), "error should name {var}: {message}");
+        }
+        clear_pool_env();
+    }
+
+    #[test]
+    #[serial]
+    fn valid_pool_values_parse_and_validate() {
+        let _env = EnvSnapshot::capture();
+        clear_db_url_env();
+        clear_pool_env();
+        std::env::set_var("DB_MAX_CONNECTIONS", "20");
+        std::env::set_var("DB_MIN_CONNECTIONS", "2");
+        std::env::set_var("DB_CONNECT_RETRIES", "3");
+        std::env::set_var("DB_CONNECT_RETRY_DELAY_MS", "100");
+        std::env::set_var("DB_ACQUIRE_TIMEOUT_SECS", "7");
+
+        let cfg = DbConfig::from_env("postgres://localhost:5432/dev_default")
+            .expect("valid values must parse");
+        assert_eq!(cfg.max_connections, 20);
+        assert_eq!(cfg.min_connections, 2);
+        assert_eq!(cfg.connect_retries, 3);
+        assert_eq!(cfg.connect_retry_delay.as_millis(), 100);
+        assert_eq!(cfg.acquire_timeout.as_secs(), 7);
+
+        clear_pool_env();
+    }
+}
+
+#[cfg(test)]
+mod connect_error_classification_tests {
+    use super::{connect_with_config, is_transient_connect_error, DbConfig};
+    use std::borrow::Cow;
+    use std::time::Duration;
+
+    /// Minimal `DatabaseError` carrying an arbitrary SQLSTATE, so the
+    /// classifier is testable without a live server.
+    #[derive(Debug)]
+    struct FakeDbError(Option<&'static str>);
+
+    impl std::fmt::Display for FakeDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "fake database error")
+        }
+    }
+
+    impl std::error::Error for FakeDbError {}
+
+    impl sqlx::error::DatabaseError for FakeDbError {
+        fn message(&self) -> &str {
+            "fake database error"
+        }
+
+        fn code(&self) -> Option<Cow<'_, str>> {
+            self.0.map(Cow::Borrowed)
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn db_error(code: Option<&'static str>) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(FakeDbError(code)))
+    }
+
+    #[test]
+    fn io_and_pool_timeout_errors_are_transient() {
+        let refused = sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        ));
+        assert!(is_transient_connect_error(&refused));
+        assert!(is_transient_connect_error(&sqlx::Error::PoolTimedOut));
+    }
+
+    #[test]
+    fn auth_class_sqlstate_fails_fast() {
+        // 28P01 invalid_password, 28000 invalid_authorization_specification.
+        assert!(!is_transient_connect_error(&db_error(Some("28P01"))));
+        assert!(!is_transient_connect_error(&db_error(Some("28000"))));
+    }
+
+    #[test]
+    fn non_auth_database_errors_stay_transient() {
+        // 57P03 cannot_connect_now: the server is still starting up — the
+        // exact case the retry schedule exists for.
+        assert!(is_transient_connect_error(&db_error(Some("57P03"))));
+        assert!(is_transient_connect_error(&db_error(None)));
+    }
+
+    #[test]
+    fn configuration_and_tls_errors_fail_fast() {
+        assert!(!is_transient_connect_error(&sqlx::Error::Configuration(
+            "bad option".into()
+        )));
+        assert!(!is_transient_connect_error(&sqlx::Error::Tls(
+            "handshake failed".into()
+        )));
+    }
+
+    #[tokio::test]
+    async fn connect_fails_fast_on_configuration_error_without_burning_retries() {
+        // An unparseable URL surfaces as a Configuration error. With a
+        // multi-second retry schedule configured, only the fail-fast branch
+        // returns immediately — and only that branch carries this context.
+        let cfg = DbConfig {
+            url: "definitely-not-a-database-url".to_string(),
+            connect_retries: 10,
+            connect_retry_delay: Duration::from_secs(5),
+            ..DbConfig::default()
+        };
+
+        let err = connect_with_config(&cfg)
+            .await
+            .expect_err("an unparseable database URL must fail");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("failing fast without retry"),
+            "expected the non-transient fail-fast path, got: {message}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod promotion_ladder_tests {
+    use super::promotion_stage_index;
+
+    #[test]
+    fn known_environments_resolve_case_insensitively() {
+        assert_eq!(promotion_stage_index("local").unwrap(), 0);
+        assert_eq!(promotion_stage_index("dev").unwrap(), 1);
+        assert_eq!(promotion_stage_index("Staging").unwrap(), 2);
+        assert_eq!(promotion_stage_index(" PROD ").unwrap(), 3);
+    }
+
+    #[test]
+    fn unknown_environment_errors_naming_it_and_the_ladder() {
+        let err = promotion_stage_index("production")
+            .expect_err("'production' is not on the ladder and must not resolve to 'local'");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("production"),
+            "error should name the unknown environment: {message}"
+        );
+        for stage in ["local", "dev", "staging", "prod"] {
+            assert!(
+                message.contains(stage),
+                "error should list the known ladder stage '{stage}': {message}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod governance_config_tests {
+    use super::MigrationGovernanceConfig;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn db_migration_allow_apply_false_maps_to_deny() {
+        std::env::set_var("DB_MIGRATION_ALLOW_APPLY", "false");
+        let denied = MigrationGovernanceConfig::from_env();
+        std::env::remove_var("DB_MIGRATION_ALLOW_APPLY");
+        assert!(!denied.allow_apply);
+
+        let allowed = MigrationGovernanceConfig::from_env();
+        assert!(allowed.allow_apply, "the default must remain allow");
     }
 }

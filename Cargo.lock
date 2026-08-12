@@ -1658,7 +1658,7 @@ dependencies = [
 
 [[package]]
 name = "krab_cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1672,7 +1672,7 @@ dependencies = [
 
 [[package]]
 name = "krab_client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "inventory",
  "js-sys",
@@ -1688,7 +1688,7 @@ dependencies = [
 
 [[package]]
 name = "krab_core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1721,7 +1721,7 @@ dependencies = [
 
 [[package]]
 name = "krab_macros"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "krab_core",
@@ -1735,7 +1735,7 @@ dependencies = [
 
 [[package]]
 name = "krab_orchestrator"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "config",
@@ -2531,7 +2531,7 @@ dependencies = [
 
 [[package]]
 name = "reference_app_islands_rpc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2871,7 +2871,7 @@ dependencies = [
 
 [[package]]
 name = "service_auth"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2890,7 +2890,7 @@ dependencies = [
 
 [[package]]
 name = "service_frontend"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2917,7 +2917,7 @@ dependencies = [
 
 [[package]]
 name = "service_users"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-graphql",
@@ -2937,7 +2937,7 @@ dependencies = [
 
 [[package]]
 name = "service_users_split"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-graphql",

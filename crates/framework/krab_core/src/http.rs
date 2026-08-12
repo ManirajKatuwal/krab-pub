@@ -6,18 +6,21 @@ use axum::http::{HeaderName, HeaderValue, Request};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
+use tower::limit::ConcurrencyLimitLayer;
 use tower_http::compression::CompressionLayer;
 use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
 
 use tracing::warn;
 
 use crate::http_auth::{auth_middleware, service_auth_middleware};
 pub use crate::http_auth::{
-    authorize_with_jwt, authorize_with_static_bearer, enforce_claim_policy, has_admin_entitlement,
-    is_internal_service_path, jwt_algorithm_allowed, jwt_leeway_secs, load_jwt_providers,
-    load_rotation_keys, load_route_policies, require_kid, roles_from_claims, scopes_from_claims,
-    select_key, tenant_from_claims, tenant_from_path, validate_provider_claims, AuthContext,
-    JwtClaims, JwtProviderConfig, RoutePolicy,
+    authorize_with_jwt, authorize_with_jwt_cached, authorize_with_static_bearer,
+    enforce_claim_policy, has_admin_entitlement, is_internal_service_path, jwt_algorithm_allowed,
+    jwt_leeway_secs, load_jwt_providers, load_rotation_keys, load_route_policies, require_kid,
+    roles_from_claims, scopes_from_claims, select_key, tenant_from_claims, tenant_from_path,
+    validate_provider_claims, AuthContext, JwtClaims, JwtProviderConfig, JwtVerifierCache,
+    RoutePolicy,
 };
 pub use crate::http_error::{ApiError, ErrorCategory};
 pub use crate::http_headers::{
@@ -57,18 +60,62 @@ pub(crate) fn parse_csv_set(input: &str) -> Vec<String> {
         .collect()
 }
 
+/// Parse a `u64` env knob leniently but loudly: unset uses the default, a
+/// malformed value warns and uses the default.
+pub(crate) fn u64_env_lenient(name: &str, default: u64) -> u64 {
+    match std::env::var(name) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(value) => value,
+            Err(_) => {
+                warn!(
+                    env_var = %name,
+                    value = %raw,
+                    default,
+                    "env_value_invalid_using_default"
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
 pub fn apply_common_http_layers<S>(router: Router<S>, state: S) -> Router<S>
 where
     S: Clone + Send + Sync + 'static + HasRuntimeState,
 {
     // Layer ordering note: axum/tower layers wrap bottom-up, so the LAST
     // `.layer(..)` in this chain is the OUTERMOST middleware and runs FIRST
-    // for a request. `auth_middleware` must therefore be layered AFTER
-    // `service_auth_middleware` here: `service_auth_middleware` reads the
-    // `AuthContext` extension that `auth_middleware` inserts, so on the
-    // request path auth must run first. It used to be the other way around,
-    // which made every `/internal` request a 403 — the scope check ran before
-    // any AuthContext could exist.
+    // for a request. Ordering constraints that matter:
+    //
+    // - `auth_middleware` must run BEFORE `service_auth_middleware` and
+    //   `protocol_resolution_middleware` on the request path: both read the
+    //   `AuthContext` extension that auth inserts. Protocol resolution used
+    //   to be outermost, which meant it never saw an AuthContext and tenant
+    //   protocol policy keyed off the client-supplied tenant header.
+    // - `metrics_middleware` / `tracing_middleware` stay OUTSIDE auth so
+    //   auth rejections are still counted; they learn the resolved protocol
+    //   from the response extension that protocol resolution mirrors back.
+    // - The timeout and concurrency layers are the FIRST layers, i.e. the
+    //   INNERMOST: their generated responses (408 / queued shed) flow back
+    //   out through the security-headers layer and the rest of the stack.
+    let request_timeout_secs = u64_env_lenient("KRAB_HTTP_REQUEST_TIMEOUT_SECS", 30);
+    let max_concurrency = u64_env_lenient("KRAB_HTTP_MAX_CONCURRENCY", 1024);
+
+    let mut router = router;
+    if max_concurrency > 0 {
+        router = router.layer(ConcurrencyLimitLayer::new(max_concurrency as usize));
+    }
+    if request_timeout_secs > 0 {
+        // Outside the concurrency limit so time spent waiting for a permit
+        // counts against the deadline. tower-http's TimeoutLayer maps the
+        // elapsed deadline to a 408 response, keeping the service infallible.
+        router = router.layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(request_timeout_secs),
+        ));
+    }
+
     router
         .layer(middleware::from_fn(security_headers_middleware))
         .layer(middleware::from_fn(api_version_header_middleware))
@@ -81,6 +128,10 @@ where
         .layer(middleware::from_fn_with_state(
             state.clone(),
             csrf_protection_middleware::<S>,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            protocol_resolution_middleware::<S>,
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -103,12 +154,8 @@ where
             request_id_middleware::<S>,
         ))
         .layer(middleware::from_fn_with_state(
-            state.clone(),
-            metrics_middleware::<S>,
-        ))
-        .layer(middleware::from_fn_with_state(
             state,
-            protocol_resolution_middleware::<S>,
+            metrics_middleware::<S>,
         ))
 }
 
@@ -174,7 +221,7 @@ where
             "global_ip_rate_limiter_triggered"
         );
         return ApiError::new(
-            ErrorCategory::Internal,
+            ErrorCategory::RateLimited,
             "TOO_MANY_REQUESTS",
             "global per-ip rate limit exceeded",
         )
@@ -478,15 +525,73 @@ mod tests {
         assert_eq!(extract_client_ip(&req, false), "198.51.100.20");
     }
 
+    /// With proxy headers trusted, the RIGHTMOST x-forwarded-for entry wins
+    /// (default `KRAB_TRUSTED_PROXY_HOPS=1`): only the entries appended by
+    /// our own proxies are trustworthy, and the leftmost values are
+    /// client-controlled — taking the leftmost let any client spoof its IP
+    /// past the rate limiter.
     #[test]
-    fn extract_client_ip_prefers_leftmost_forwarded_value_when_trusted() {
+    #[serial_test::serial]
+    fn extract_client_ip_prefers_rightmost_forwarded_value_when_trusted() {
+        std::env::remove_var("KRAB_TRUSTED_PROXY_HOPS");
         let req = Request::builder()
             .header("x-forwarded-for", "203.0.113.10, 10.0.0.2")
             .header("x-real-ip", "203.0.113.11")
             .body(Body::empty())
             .expect("request should build");
 
-        assert_eq!(extract_client_ip(&req, true), "203.0.113.10");
+        assert_eq!(extract_client_ip(&req, true), "10.0.0.2");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn extract_client_ip_skips_configured_trusted_hops_from_the_right() {
+        std::env::set_var("KRAB_TRUSTED_PROXY_HOPS", "2");
+        let req = Request::builder()
+            .header("x-forwarded-for", "203.0.113.10, 198.51.100.7, 10.0.0.2")
+            .body(Body::empty())
+            .expect("request should build");
+
+        let ip = extract_client_ip(&req, true);
+        std::env::remove_var("KRAB_TRUSTED_PROXY_HOPS");
+
+        assert_eq!(ip, "198.51.100.7");
+    }
+
+    /// A candidate that does not parse as an IP address must not be used as a
+    /// rate-limit key; the extraction falls through to x-real-ip, then
+    /// ConnectInfo.
+    #[test]
+    #[serial_test::serial]
+    fn extract_client_ip_garbage_forwarded_entry_falls_back() {
+        std::env::remove_var("KRAB_TRUSTED_PROXY_HOPS");
+        let mut req = Request::builder()
+            .header("x-forwarded-for", "203.0.113.10, not-an-ip")
+            .header("x-real-ip", "203.0.113.11")
+            .body(Body::empty())
+            .expect("request should build");
+        req.extensions_mut()
+            .insert(axum::extract::connect_info::ConnectInfo(
+                "198.51.100.20:443"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("socket addr should parse"),
+            ));
+
+        assert_eq!(extract_client_ip(&req, true), "203.0.113.11");
+
+        let mut req_no_real_ip = Request::builder()
+            .header("x-forwarded-for", "garbage")
+            .body(Body::empty())
+            .expect("request should build");
+        req_no_real_ip
+            .extensions_mut()
+            .insert(axum::extract::connect_info::ConnectInfo(
+                "198.51.100.20:443"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("socket addr should parse"),
+            ));
+
+        assert_eq!(extract_client_ip(&req_no_real_ip, true), "198.51.100.20");
     }
 
     #[test]

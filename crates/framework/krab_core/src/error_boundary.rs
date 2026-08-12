@@ -40,8 +40,30 @@ impl ErrorBoundary {
                     events: vec![],
                 });
 
+                // The fallback is user-supplied markup too, and a boundary
+                // whose fallback also panics must still produce HTML — the
+                // whole point of the boundary is that rendering continues.
+                // Degrade to a minimal error div that keeps the
+                // `data-krab-boundary-state="error"` attribute contract the
+                // client and tests key on.
+                let html = match catch_unwind(AssertUnwindSafe(|| wrapped_fallback.render())) {
+                    Ok(html) => html,
+                    Err(fallback_payload) => {
+                        let fallback_message = panic_message(fallback_payload);
+                        tracing::error!(
+                            boundary_id = %self.boundary_id,
+                            error = %fallback_message,
+                            "error_boundary_fallback_panicked"
+                        );
+                        format!(
+                            "<div data-krab-boundary=\"{}\" data-krab-boundary-state=\"error\"></div>",
+                            crate::escape_html_attr(&self.boundary_id)
+                        )
+                    }
+                };
+
                 (
-                    wrapped_fallback.render(),
+                    html,
                     Some(BoundaryDiagnostic {
                         boundary_id: self.boundary_id.clone(),
                         phase: "ssr",
@@ -100,5 +122,30 @@ mod tests {
         let diag = diag.expect("diagnostic should exist");
         assert_eq!(diag.phase, "ssr");
         assert!(diag.message.contains("boom"));
+    }
+
+    /// A fallback that itself panics must not escape the boundary: the render
+    /// degrades to a minimal error div that still carries the
+    /// `data-krab-boundary-state="error"` attribute contract.
+    #[test]
+    fn a_panicking_fallback_degrades_to_minimal_error_markup() {
+        let boundary = ErrorBoundary::new(
+            "home",
+            Node::Dynamic(std::rc::Rc::new(|| panic!("child boom"))),
+            Node::Dynamic(std::rc::Rc::new(|| panic!("fallback boom"))),
+        );
+
+        let (html, diag) = boundary.render_with_diagnostics();
+        assert!(
+            html.contains("data-krab-boundary-state=\"error\""),
+            "the degraded markup must keep the boundary-state contract, got: {html}"
+        );
+        assert!(html.contains("data-krab-boundary=\"home\""));
+
+        // The diagnostic reports the original child failure, which is the
+        // error the operator needs first.
+        let diag = diag.expect("diagnostic should exist");
+        assert_eq!(diag.phase, "ssr");
+        assert!(diag.message.contains("child boom"));
     }
 }

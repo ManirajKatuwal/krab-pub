@@ -16,53 +16,147 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ## [Unreleased]
 
+Nothing yet — `0.3.0` is the current release.
+
+---
+
+## [0.3.0] — 2026-08-12
+
+A robustness and hardening release from a full `krab_core` runtime audit,
+landed in two tranches. It contains breaking changes (see **Changed**), so it
+takes the minor field per Cargo's pre-`1.0` semver rules.
+
 ### Security
 
+- Protocol resolution now runs **after** authentication. Tenant protocol policy
+  (`KRAB_PROTOCOL_TENANT_OVERRIDES_JSON`) is selected from the authenticated
+  tenant claim; the client-supplied `x-krab-tenant-id` header / `?tenant_id=`
+  query fallback is disabled unless `KRAB_PROTOCOL_TENANT_HINT_UNTRUSTED=true`
+  (dev only, logs on use). Previously a client could spoof or omit the header to
+  inherit another tenant's overrides or escape its own. See ADR 0010.
+- Requests to a route family whose protocol is disabled are rejected with 400
+  `PROTOCOL_NOT_SUPPORTED` instead of passing through to the handler.
+- With `KRAB_TRUST_PROXY_HEADERS=true`, the client IP is taken from the rightmost
+  trusted `X-Forwarded-For` entry (`KRAB_TRUSTED_PROXY_HOPS`, default 1) and must
+  parse as an IP; the leftmost, client-controlled entry could previously spoof
+  rate-limit identity.
+- `RuntimeState::try_new()` fails startup in staging/prod/unknown environments
+  when `KRAB_REDIS_URL` is set but Redis cannot be used — whether the URL is
+  broken or the binary was compiled without the `redis-store` feature — instead
+  of silently downgrading to a per-process store (which breaks shared rate
+  limiting and token revocation). Dev warns and falls back. All in-repo services
+  boot through it.
 - Server-function errors converted from `anyhow::Error` no longer serialize the
   underlying error chain (connection strings, SQL fragments, filesystem paths)
-  into the client-visible 500 envelope. The full chain now goes to the server
-  log (`server_fn_internal_error`); the wire message is a generic
-  `internal server error`. Callers that want a client-visible message construct
-  one explicitly with `ServerFnError::new`.
-- Malformed `KRAB_AUTH_ROUTE_POLICIES_JSON` now fails closed. Previously a JSON
-  typo silently parsed to an empty policy set and every configured route
-  restriction vanished; the enforcement path now rejects requests with 500 and
-  logs `auth_route_policies_json_malformed_failing_closed`. New
-  `try_load_route_policies()` exposes the parse result.
+  into the client-visible 500 envelope. The full chain goes to the server log
+  (`server_fn_internal_error`); the wire message is a generic
+  `internal server error`.
+- Malformed `KRAB_AUTH_ROUTE_POLICIES_JSON` now fails closed (500 +
+  `auth_route_policies_json_malformed_failing_closed`) instead of silently
+  dropping every route restriction. New `try_load_route_policies()` exposes the
+  parse result.
 - Malformed `KRAB_PROTOCOL_RESTRICTED_OPS_JSON` / `KRAB_PROTOCOL_TENANT_OVERRIDES_JSON`
   no longer silently drop every protocol restriction: `ProtocolConfig::validate()`
-  reports bad JSON and unknown protocol names as startup errors, and
-  `from_env` logs the failure instead of ignoring it.
-- `DbConfig`'s `Debug` output redacts the userinfo section of the database URL,
-  so a `{:?}` in error context can no longer print the `DATABASE_URL` password.
+  reports bad JSON and unknown protocol names as startup errors.
+- `DbConfig`'s `Debug` output redacts the database-URL userinfo, so a `{:?}` can
+  no longer print the `DATABASE_URL` password.
+
+### Added
+
+- `ErrorCategory::RateLimited` (429, wire `rate_limited`) and
+  `ErrorCategory::Unauthenticated` (401, wire `unauthenticated`).
+- Request timeout (`KRAB_HTTP_REQUEST_TIMEOUT_SECS`, default 30 s → 408) and
+  concurrency limit (`KRAB_HTTP_MAX_CONCURRENCY`, default 1024) layers in the
+  common HTTP stack.
+- `JwtVerifierCache` on `RuntimeState`: JWT providers and decoding keys are
+  parsed once per state instead of per request; `authorize_with_jwt_cached`
+  exposed, `authorize_with_jwt` retained as an env-building wrapper.
+- `DistributedStore::set_if_absent` (atomic create-if-missing; Redis
+  `SET NX PX`), and `IsrCache::serve_or_lease` / `release_lease` /
+  `IsrServeOutcome` for cold-miss single-flight rendering. See ADR 0011.
+- `MemoryStore::with_max_entries` and `KRAB_MEMORY_STORE_MAX_ENTRIES` capacity
+  cap (default 100 000, 0 = unlimited) with throttled `memory_store_evicted`
+  telemetry.
+- `WsRoom::join() -> WsConnectionGuard` (RAII connection tracking),
+  `WsRoomManager::reap_empty()` / `try_room()` / `with_max_rooms()`, and an
+  optional room cap via `KRAB_WS_MAX_ROOMS`.
+- `CircuitBreakerConfig` with `TripPolicy::FailureRate` (rolling-window) mode,
+  `SharedCircuitBreaker` for cross-task sharing, and a full circuit-breaker
+  unit-test suite (previously zero tests).
+- `signal::create_effect_scoped` returning `EffectHandle` — the first disposal
+  API for root effects.
+- `TopologyRuntime::from_env_checked()` — errors on unrecognized topology,
+  unparseable endpoints JSON, and distributed mode with an empty endpoint map;
+  `krab topology doctor` and `krab release check` run it.
+- `FRONTEND_ISR_QUERY_ALLOWLIST` bounds which query params enter `service_frontend`
+  cache keys (default path-only).
+
+### Changed
+
+- **Breaking:** `ChunkedStreamWriter::finish()` returns `FinishedStream` (chunks
+  plus `budget_exceeded`/`cancelled` flags) instead of `Vec<String>`; `write()`,
+  `write_suspense_marker()`, and `render_to_chunk_stream()` return `bool`
+  (accepted/dropped), the first two `#[must_use]`.
+- **Breaking:** `DistributedStore` gained the required method `set_if_absent`;
+  external implementors must add it.
+- **Breaking:** `WsRoom::connections()` is synchronous (atomic counter); drop the
+  `.await`.
+- **Breaking (wire):** an `ApiError` with `category=authz` / `code=UNAUTHORIZED`
+  now maps to 403 (was 401) — use `Unauthenticated`; `code=TOO_MANY_REQUESTS`
+  under other categories no longer forces 429 — use `RateLimited`. The error
+  envelope `category` gains `rate_limited` and `unauthenticated`.
+- **One-time ISR cache flush:** the ISR key separator changed from `:` to a
+  control byte so a namespace cannot prefix-match a sibling. Old-format entries
+  miss once and repopulate (the single-flight lease absorbs the burst);
+  no-TTL `Static` entries linger unread in Redis — see the migration guide for
+  cleanup. `service_frontend` cache keys are now normalized (path + allowlisted
+  query params).
+- `CircuitBreaker` counts the cooldown-expiry request as the first half-open
+  probe (previously `half_open_max_probes + 1` requests could pass).
+
+### Deprecated
+
+- `KrabConfig::from_env` (panics on invalid `KRAB_PORT`) — use
+  `from_env_checked`. All in-repo callers migrated.
+- `WsRoom::connect()` / `disconnect()` — use `join()`'s RAII guard.
 
 ### Fixed
 
-- `run_versioned_migrations` now serializes concurrent migrators with a
-  session-level Postgres advisory lock. Two replicas booting through a rolling
-  deploy could both observe a version as unapplied and both execute its DDL —
-  one crashed on the `krab_migrations` primary key.
+- `run_versioned_migrations` serializes concurrent migrators with a session-level
+  Postgres advisory lock; a rolling deploy could otherwise crash a pod on the
+  `krab_migrations` primary key. Migration/rollback bodies now execute via
+  `sqlx::raw_sql`, so multi-statement migrations work.
+- `DbConfig::from_env` rejects unparseable pool values and validates
+  `1 <= min <= max` with non-zero timeouts; `connect_with_config` fails fast on
+  auth/config/TLS errors instead of exhausting the retry schedule;
+  `enforce_promotion_policy` rejects unknown environment names instead of
+  treating them as `local`; `enforce_migration_governance` records the audit row
+  then denies (`Err`) when `DB_MIGRATION_ALLOW_APPLY=false`.
 - `enforce_migration_governance` creates the rollback-rehearsal ledger before
-  querying it, so a fresh release-environment database reports the governance
-  verdict ("missing successful rollback rehearsal") instead of a raw
-  `relation does not exist` error.
-- `MemoryStore` reaps expired entries during writes (every 256 writes).
-  Epoch-suffixed rate-limit and auth-failure keys were written once and never
-  read again, so they accumulated for the life of the process — one per client
-  IP per window. `incr` also logs when it resets a non-numeric value instead
-  of silently clobbering it.
-- The `krab_inflight_requests` gauge decrements via a drop guard, so a client
-  disconnecting mid-request no longer leaks an increment and drifts the gauge
-  upward permanently.
-- `serve_with_graceful_shutdown` also listens for SIGTERM on Unix. Kubernetes
-  and Docker stop containers with SIGTERM; previously only Ctrl+C (SIGINT)
-  triggered a drain, so stopped pods were SIGKILLed at the grace deadline.
-- `init_tracing`/`init_tracing_with_config` use `try_init` and log instead of
-  panicking when a global tracing subscriber is already installed.
-- Native `call_server_fn` reuses one shared `reqwest` client with a request
-  timeout (default 30 s, `KRAB_SERVER_FN_TIMEOUT_MS`) instead of building an
-  unpooled client with no timeout per call, and non-JSON error bodies decoded
-  into `ServerFnError` are truncated to 2 KiB.
+  querying it, so a fresh release DB reports the governance verdict, not
+  `relation does not exist`.
+- An effect that writes its own dependency no longer overflows the stack: the
+  re-entrant run is refused (`signal_effect_cycle_detected`), delivered after the
+  body finishes so it still converges, and capped (`signal_flush_depth_exceeded`).
+  A self-referential memo serves the stale value instead of panicking. Interleaved
+  parent/child reads no longer grow a signal's subscriber list. `ErrorBoundary`
+  fallbacks that panic degrade to a minimal error div. On wasm, an `Action`/`Resource`
+  whose future panics no longer latches `pending` forever.
+- Render-budget exhaustion is no longer silent: `write()` returns `false`,
+  `finish()` reports `budget_exceeded`, and the first drop warns
+  `render_budget_exceeded`; dropped suspense markers no longer inflate telemetry.
+- WebSocket connection counts no longer leak on a panicked/aborted task, and
+  `service_frontend`'s chat socket no longer double-decrements the count.
+- `MemoryStore` reaps expired entries during writes; the `krab_inflight_requests`
+  gauge decrements via a drop guard; `serve_with_graceful_shutdown` handles
+  SIGTERM on Unix; `init_tracing` uses `try_init` instead of panicking on
+  double-init; native `call_server_fn` uses one shared timed `reqwest` client and
+  truncates non-JSON error bodies to 2 KiB.
+- `cors_middleware` no longer 403s an OPTIONS request that carries no `Origin`
+  (non-CORS preflight reaches the router), and origin-dependent CORS responses
+  carry `Vary: Origin`.
+- `TopologyRuntime::from_env` warns instead of silently swallowing malformed
+  `KRAB_RUNTIME_TOPOLOGY` / `KRAB_RUNTIME_ENDPOINTS_JSON`.
 
 ---
 

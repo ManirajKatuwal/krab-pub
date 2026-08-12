@@ -101,6 +101,14 @@ pub(crate) fn topology_doctor_report() -> Result<TopologyDoctorReport> {
         }
     }
 
+    // Also runs under `krab release check` (via doctor.rs). Safe there: with
+    // `KRAB_RUNTIME_TOPOLOGY`/`KRAB_RUNTIME_ENDPOINTS_JSON` unset, the strict
+    // parser returns the monolith default and reports no violation — it only
+    // fires when those vars are set to values the services would swallow.
+    if let Some(issue) = runtime_topology_env_violation() {
+        violations.push(issue);
+    }
+
     Ok(TopologyDoctorReport {
         checked_rust_files: rust_files.len(),
         contract_path,
@@ -108,73 +116,48 @@ pub(crate) fn topology_doctor_report() -> Result<TopologyDoctorReport> {
     })
 }
 
+/// Validate the runtime topology environment with the strict parser.
+///
+/// Returns a violation string when `KRAB_RUNTIME_TOPOLOGY` /
+/// `KRAB_RUNTIME_ENDPOINTS_JSON` are set to values the services would
+/// silently swallow at runtime (unrecognized topology, unparseable endpoint
+/// JSON, or distributed mode with an empty endpoint map).
+fn runtime_topology_env_violation() -> Option<String> {
+    match krab_core::service_contract::TopologyRuntime::from_env_checked() {
+        Ok(_) => None,
+        Err(err) => Some(format!("runtime topology environment invalid: {err:#}")),
+    }
+}
+
 fn run_topology_doctor(diagnostics: bool) -> Result<()> {
     println!("🩺 Running topology doctor...");
 
-    let mut violations: Vec<String> = Vec::new();
-    let mut rust_files = Vec::new();
-    collect_rust_files_under(Path::new("services"), &mut rust_files)?;
-
-    for file in &rust_files {
-        let owner = owning_service_name(file);
-        let raw = fs::read_to_string(file)
-            .with_context(|| format!("Failed reading Rust source {}", file.display()))?;
-
-        for (line_idx, line) in raw.lines().enumerate() {
-            if let Some(target) = parse_direct_service_import(line) {
-                if owner
-                    .as_ref()
-                    .map(|service| service != &target)
-                    .unwrap_or(true)
-                {
-                    violations.push(format!(
-                        "{}:{} direct cross-service import `{}` bypasses contract boundary",
-                        file.display(),
-                        line_idx + 1,
-                        target
-                    ));
-                }
-            }
-        }
-
-        collect_service_endpoint_block_violations(file, &raw, &mut violations);
-    }
-
-    let contract_path = PathBuf::from("crates/framework/krab_core/src/service_contract.rs");
-    let contract_raw = fs::read_to_string(&contract_path)
-        .with_context(|| format!("Failed reading {}", contract_path.display()))?;
-    for issue in detect_contract_payload_violations(&contract_raw) {
-        violations.push(format!("{}: {issue}", contract_path.display()));
-    }
-
-    let service_config_path = PathBuf::from("krab.toml");
-    if service_config_path.exists() {
-        let service_config_raw = fs::read_to_string(&service_config_path)
-            .with_context(|| format!("Failed reading {}", service_config_path.display()))?;
-        for issue in detect_service_config_violations(&service_config_raw) {
-            violations.push(format!("{}: {issue}", service_config_path.display()));
-        }
-    }
+    // Single source of truth: the same report `krab release check` consumes,
+    // so the two paths cannot drift in which checks they run.
+    let report = topology_doctor_report()?;
 
     if diagnostics {
-        println!("   > checked Rust files: {}", rust_files.len());
+        println!("   > checked Rust files: {}", report.checked_rust_files);
         println!(
             "   > checked contract payload serialization derives in {}",
-            contract_path.display()
+            report.contract_path.display()
         );
+        println!("   > checked orchestrator service health/restart policy in krab.toml");
         println!(
-            "   > checked orchestrator service health/restart policy in {}",
-            service_config_path.display()
+            "   > checked runtime topology env (KRAB_RUNTIME_TOPOLOGY, KRAB_RUNTIME_ENDPOINTS_JSON) with strict parsing"
         );
     }
 
-    if violations.is_empty() {
+    if report.violations.is_empty() {
         println!("✅ topology doctor passed");
         return Ok(());
     }
 
-    eprintln!("❌ topology doctor found {} issue(s):", violations.len());
-    for issue in &violations {
+    eprintln!(
+        "❌ topology doctor found {} issue(s):",
+        report.violations.len()
+    );
+    for issue in &report.violations {
         eprintln!(" - {issue}");
     }
     anyhow::bail!("topology doctor failed")
@@ -589,8 +572,13 @@ fn detect_service_config_violations(raw: &str) -> Vec<String> {
 mod tests {
     use super::{
         detect_service_config_violations, parse_direct_service_import,
-        split_contract_conformance_test,
+        runtime_topology_env_violation, split_contract_conformance_test,
     };
+
+    fn clear_topology_env() {
+        std::env::remove_var("KRAB_RUNTIME_TOPOLOGY");
+        std::env::remove_var("KRAB_RUNTIME_ENDPOINTS_JSON");
+    }
 
     /// The generated test must never again assert something that cannot fail.
     ///
@@ -706,6 +694,41 @@ interval_ms = 300
                 .any(|issue| issue.contains("missing [services.frontend.restart_policy]")),
             "{violations:?}"
         );
+    }
+
+    // Serialized: these mutate process-global env vars.
+    #[test]
+    #[serial_test::serial]
+    fn topology_doctor_passes_clean_runtime_topology_env() {
+        clear_topology_env();
+        assert_eq!(runtime_topology_env_violation(), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn topology_doctor_flags_malformed_runtime_endpoints_json() {
+        clear_topology_env();
+        std::env::set_var("KRAB_RUNTIME_ENDPOINTS_JSON", "{not json");
+
+        let violation =
+            runtime_topology_env_violation().expect("malformed endpoints JSON must be flagged");
+        assert!(
+            violation.contains("invalid KRAB_RUNTIME_ENDPOINTS_JSON"),
+            "{violation}"
+        );
+        clear_topology_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn topology_doctor_flags_split_mode_with_empty_endpoint_map() {
+        clear_topology_env();
+        std::env::set_var("KRAB_RUNTIME_TOPOLOGY", "split");
+
+        let violation =
+            runtime_topology_env_violation().expect("split mode with no endpoints must be flagged");
+        assert!(violation.contains("endpoint map is empty"), "{violation}");
+        clear_topology_env();
     }
 
     #[test]

@@ -74,15 +74,15 @@ pub(crate) async fn run_postgres_migration_lifecycle(pool: &DbPool) -> Result<()
         .await
         .context("failed to enforce migration promotion policy")?;
 
+    // A denied apply (DB_MIGRATION_ALLOW_APPLY=false) now surfaces here as an
+    // `Err` from the governance check itself, after the deny decision has been
+    // recorded in the policy audit ledger — so this `?` is the single gate
+    // that refuses to run automatic migrations and says why. The previous
+    // extra `ensure!(promotion.allow_apply)` double-gated the same env var.
     let governance = MigrationGovernanceConfig::from_env();
     enforce_migration_governance(pool, &governance)
         .await
-        .context("failed to enforce migration governance policy")?;
-
-    anyhow::ensure!(
-        promotion.allow_apply,
-        "DB_MIGRATION_ALLOW_APPLY is false; refusing to run automatic migrations"
-    );
+        .context("migration governance policy refused to allow automatic migrations")?;
 
     let migrations = users_service_migrations();
     let report = run_versioned_migrations(pool, &migrations, migration_failure_policy_from_env())

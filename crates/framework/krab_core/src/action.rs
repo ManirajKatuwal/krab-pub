@@ -182,9 +182,9 @@ where
 }
 
 /// The generation-guarded run shared by [`Action::dispatch`] and
-/// [`Resource::fetch`](crate::resource::Resource): bump the generation, apply
-/// the start-of-run writes, spawn the future, and discard its result if a newer
-/// run superseded it before completion.
+/// [`Resource::fetch`](crate::resource::Resource): bump the generation, build
+/// the future, apply the start-of-run writes, spawn the future, and discard
+/// its result if a newer run superseded it before completion.
 ///
 /// Off the browser there is no executor, so the operation would never be
 /// polled. Returning *first* is the whole point: were `begin`'s writes to run
@@ -206,16 +206,40 @@ pub(crate) fn run_guarded<T: 'static>(
         return;
     }
 
+    run_on_executor(generation, begin, make_future, apply);
+}
+
+/// The body of [`run_guarded`] past the executor check, separated so its
+/// ordering contract is natively testable (natively `run_guarded` itself
+/// returns at the check before reaching any of this).
+///
+/// Two panic-robustness guarantees live here:
+///
+/// 1. The future is constructed **before** `begin`'s writes. A future factory
+///    that panics therefore unwinds before `pending` is set — the old order
+///    latched `pending` true forever, because the future that was supposed to
+///    clear it was never created.
+/// 2. The spawned future is polled through [`CatchUnwind`], so a panic while
+///    the operation runs resolves to the `Err` outcome — clearing `pending`
+///    and populating `error` — instead of unwinding through the executor with
+///    `pending` latched.
+fn run_on_executor<T: 'static>(
+    generation: &Rc<Cell<u64>>,
+    begin: impl FnOnce(),
+    make_future: impl FnOnce() -> GuardedFuture<T>,
+    apply: impl FnOnce(Result<T, String>) + 'static,
+) {
     let current = generation.get().wrapping_add(1);
     generation.set(current);
 
+    let future = make_future();
+
     begin();
 
-    let future = make_future();
     let expected = generation.clone();
 
     spawn_local_task(async move {
-        let outcome = future.await;
+        let outcome = CatchUnwind { inner: future }.await;
 
         // A newer run has started; this result is stale.
         if expected.get() != current {
@@ -224,6 +248,53 @@ pub(crate) fn run_guarded<T: 'static>(
 
         batch(|| apply(outcome));
     });
+}
+
+/// Awaits the wrapped operation, converting a panic inside its `poll` into the
+/// `Err` outcome instead of letting it unwind through the executor.
+///
+/// Hand-rolled: the `futures` crate — whose `FutureExt::catch_unwind` is the
+/// off-the-shelf version of this — is not in the dependency tree, and a
+/// one-struct wrapper does not justify adding it. `GuardedFuture` is
+/// `Pin<Box<dyn Future>>`, which is `Unpin`, so no pin projection is needed.
+///
+/// On `wasm32-unknown-unknown` panics currently abort rather than unwind, so
+/// the catch is best-effort there; it is exact on unwinding targets and keeps
+/// both compilations on one code path.
+struct CatchUnwind<T> {
+    inner: GuardedFuture<T>,
+}
+
+impl<T> Future for CatchUnwind<T> {
+    type Output = Result<T, String>;
+
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let inner = &mut self.get_mut().inner;
+        // AssertUnwindSafe: on a caught panic the inner future is never polled
+        // again — `Ready` is returned and the executor drops the task — so no
+        // broken invariant can be observed.
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.as_mut().poll(cx)));
+        match result {
+            Ok(poll) => poll,
+            Err(payload) => std::task::Poll::Ready(Err(panic_message(payload))),
+        }
+    }
+}
+
+/// A human-readable message from a panic payload, for the action's `error`
+/// signal.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "operation panicked".to_string()
+    }
 }
 
 /// Whether this target has an executor [`Action::dispatch`] can hand a future to.
@@ -312,5 +383,55 @@ mod tests {
 
         assert!(!observer.pending().get());
         assert_eq!(observer.value().get(), None);
+    }
+
+    /// The constructor-latch bug, exercised on the executor path
+    /// (`run_on_executor`, which `run_guarded` reaches only on wasm): the
+    /// future is built *before* `begin`, so a factory that panics unwinds
+    /// before any signal write — with the old order `begin` had already set
+    /// `pending` and nothing was left to clear it.
+    ///
+    /// The full wasm runtime behaviour (a real `dispatch` through
+    /// `wasm_bindgen_futures`) cannot be exercised natively; this pins the
+    /// shared ordering both targets compile.
+    #[test]
+    fn a_panicking_future_factory_does_not_reach_begin() {
+        let generation = Rc::new(Cell::new(0u64));
+        let began = Rc::new(Cell::new(false));
+
+        let began_probe = began.clone();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_on_executor(
+                &generation,
+                move || began_probe.set(true),
+                || -> GuardedFuture<u32> { panic!("building the operation failed") },
+                |_outcome| {},
+            );
+        }));
+
+        assert!(panicked.is_err(), "the factory panic must propagate");
+        assert!(
+            !began.get(),
+            "begin must not run when the factory panics: pending would latch \
+             with no future left to clear it"
+        );
+    }
+
+    /// A panic while the operation itself runs resolves to `Err` through
+    /// [`CatchUnwind`] instead of unwinding through the executor — on wasm
+    /// that is what clears `pending` and populates `error`.
+    #[test]
+    fn a_panicking_operation_resolves_to_the_error_outcome() {
+        let future: GuardedFuture<u32> = Box::pin(async { panic!("operation failed mid-flight") });
+
+        let outcome = tokio_test::block_on(CatchUnwind { inner: future });
+
+        match outcome {
+            Err(message) => assert!(
+                message.contains("operation failed mid-flight"),
+                "the panic message must reach the error state, got: {message}"
+            ),
+            Ok(_) => panic!("a panicking operation must resolve to Err"),
+        }
     }
 }

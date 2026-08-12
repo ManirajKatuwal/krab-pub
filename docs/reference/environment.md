@@ -110,7 +110,10 @@ Required when `KRAB_AUTH_MODE=jwt`.
 | `KRAB_RATE_LIMIT_REFILL_PER_SEC` | No | `60` | Token-bucket refill rate |
 | `KRAB_RATE_LIMIT_FAIL_OPEN` | No | `true` in `dev`, `false` elsewhere | Whether to allow requests when the limiter backing store is unreachable |
 | `KRAB_TRUST_PROXY_HEADERS` | No | `false` | Trust `X-Forwarded-*` for client IP and protocol. **Only enable behind a proxy you control** |
+| `KRAB_TRUSTED_PROXY_HOPS` | No | `1` | Only with `KRAB_TRUST_PROXY_HEADERS=true`: how many trusted proxy hops to skip from the right of `X-Forwarded-For` when choosing the client IP. `1` = rightmost entry. The candidate must parse as an IP or it is ignored |
 | `KRAB_CORS_ORIGINS` | No | — | Comma-separated allowed origins. Unset means no cross-origin allowance |
+| `KRAB_HTTP_REQUEST_TIMEOUT_SECS` | No | `30` | Per-request timeout applied innermost in the common HTTP stack; overruns return 408. `0` disables |
+| `KRAB_HTTP_MAX_CONCURRENCY` | No | `1024` | Maximum concurrently processed requests. Excess requests queue (backpressure) and are bounded by the request timeout. `0` disables |
 
 ## Database
 
@@ -168,6 +171,7 @@ which are reachable and where they resolve. See
 | `KRAB_PROTOCOL_RESTRICTED_OPS_JSON` | No | — | JSON map of operation → allowed protocols, e.g. `{"auth.login":["rest"]}` |
 | `KRAB_PROTOCOL_SPLIT_TARGETS_JSON` | No | — | JSON map of domain → per-protocol target URL |
 | `KRAB_PROTOCOL_TENANT_OVERRIDES_JSON` | No | `{}` | JSON map of tenant → protocol override |
+| `KRAB_PROTOCOL_TENANT_HINT_UNTRUSTED` | No | `false` | Opt-in: allow the unauthenticated `x-krab-tenant-id` header / `?tenant_id=` query to select tenant protocol policy when there is no authenticated tenant claim. **Dev only** — each use logs a warning. Left off, tenant policy keys solely off the JWT claim |
 | `KRAB_PROTOCOL_EXTERNAL_MODE` | No | `false` | Treat protocol exposure as externally reachable |
 | `KRAB_PROTOCOL_GATEWAY_BASE_URL` | No | — | Gateway origin when `KRAB_PROTOCOL_EXTERNAL_MODE` is on |
 | `KRAB_RUNTIME_TOPOLOGY` | No | — | Overrides the service-contract topology mode at runtime |
@@ -185,7 +189,10 @@ which are reachable and where they resolve. See
 | `KRAB_CACHE_NAMESPACE` | No | `default` | Cache key namespace. Change to isolate deployments sharing a Redis instance |
 | `KRAB_CACHE_MAX_BODY_BYTES` | No | `10485760` (10 MiB) | Largest cacheable response body, minimum `1024` |
 | `KRAB_DISTRIBUTED_CACHE_TTL_SECS` | No | `60` | Distributed cache TTL, clamped to `1`–`3600` |
-| `KRAB_REDIS_URL` | Conditional | — | Required by the `redis-store` feature, the distributed cache, **and the ISR cache**. Without it, ISR falls back to a per-process store — see below |
+| `KRAB_REDIS_URL` | Conditional | — | Required by the `redis-store` feature, the distributed cache, **and the ISR cache**. Without it, ISR falls back to a per-process store — see below. If set while the binary was built without `redis-store`, startup fails closed outside `dev` |
+| `FRONTEND_ISR_QUERY_ALLOWLIST` | No | — (path-only) | `service_frontend`: comma-separated query-parameter names allowed into ISR/SWR cache keys. Empty means cache keys are path-only, so arbitrary query strings cannot multiply cache entries |
+| `KRAB_MEMORY_STORE_MAX_ENTRIES` | No | `100000` | Max live entries in an in-process `MemoryStore` (read once per process; `0` = unlimited). At capacity, expired entries are reclaimed first, then oldest-inserted are evicted with a throttled `memory_store_evicted` warning |
+| `KRAB_WS_MAX_ROOMS` | No | `0` (unlimited) | Maximum WebSocket rooms a `WsRoomManager` will create. Read once at construction; at the cap, `try_room()` returns an error and the infallible `room()` logs `ws_room_cap_reached` and returns a detached room. `reap_empty()` frees slots |
 
 ## Build and tooling
 

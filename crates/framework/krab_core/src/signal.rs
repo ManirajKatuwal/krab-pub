@@ -32,6 +32,12 @@ thread_local! {
     static BATCH_DEPTH: Cell<u32> = const { Cell::new(0) };
     /// Effects deferred by an open [`batch`], deduplicated.
     static BATCHED_EFFECTS: RefCell<Vec<Rc<EffectState>>> = const { RefCell::new(Vec::new()) };
+    /// Nesting depth of synchronous flushes on the native path. A write inside
+    /// an effect flushes synchronously, so chained writes across *distinct*
+    /// effects stack these frames; the depth is capped at [`MAX_FLUSH_DEPTH`]
+    /// as the backstop the per-effect running flag cannot provide.
+    #[cfg(any(not(feature = "web"), not(target_arch = "wasm32")))]
+    static FLUSH_DEPTH: Cell<u32> = const { Cell::new(0) };
     #[cfg(feature = "web")]
     static PENDING_EFFECTS: RefCell<Vec<Rc<EffectState>>> = const { RefCell::new(Vec::new()) };
     #[cfg(feature = "web")]
@@ -58,21 +64,43 @@ impl Subscriber {
             _ => false,
         }
     }
+
+    /// Whether the reactive node this subscriber points at is still alive.
+    fn is_alive(&self) -> bool {
+        match self {
+            Self::Effect(weak) => weak.strong_count() > 0,
+            Self::Memo(weak) => weak.strong_count() > 0,
+        }
+    }
 }
 
-/// Subscribe `subscriber` unless the list's last entry is already it.
+/// Subscribe `subscriber` unless it is already in the list.
 ///
 /// `get()` subscribes on every read, so an effect reading a signal `k` times in
 /// one run would otherwise land `k` identical entries — and for a source that is
 /// read by a re-running dependent but never itself written (so never drained),
 /// the list grew by one per run for the life of the page.
+///
+/// The whole list is scanned, not just its tail: interleaved reads (a parent
+/// effect reads, its child effect reads, the parent reads again) put another
+/// node between two reads by the same subscriber, and a tail-only check
+/// re-added the parent on every run. Lists are short — one entry per live
+/// dependent — so the scan is cheap, and it doubles as garbage collection:
+/// entries whose node has been dropped are retained out while scanning.
 fn push_subscriber(list: &mut Vec<Subscriber>, subscriber: &Subscriber) {
-    if let Some(last) = list.last() {
-        if last.same_node(subscriber) {
-            return;
+    let mut already_subscribed = false;
+    list.retain(|existing| {
+        if !existing.is_alive() {
+            return false;
         }
+        if existing.same_node(subscriber) {
+            already_subscribed = true;
+        }
+        true
+    });
+    if !already_subscribed {
+        list.push(subscriber.clone());
     }
-    list.push(subscriber.clone());
 }
 
 /// Restores [`CURRENT_SUBSCRIBER`] whether the scope exits normally or unwinds.
@@ -116,6 +144,13 @@ struct MemoState {
     /// are marked before either is pulled, so the effect downstream runs once
     /// and sees two fresh values.
     dirty: Cell<bool>,
+    /// Whether `recompute_now` for this memo is currently on the stack.
+    ///
+    /// A read of the memo while this is set is a self-referential computation:
+    /// the memo's own closure (directly or through a chain) read the memo back.
+    /// Such a read is served the stale cached value, untracked, with a
+    /// `memo_self_reference_detected` error event — recomputing would recurse.
+    computing: Cell<bool>,
     /// Recomputes the cached value. Installed after construction, because it
     /// needs a `Weak` back to the state it lives in.
     recompute: RefCell<Option<Box<dyn Fn()>>>,
@@ -134,6 +169,10 @@ impl MemoState {
         // Cleared before running so a read of this memo from inside its own
         // computation cannot re-enter and recurse.
         self.dirty.set(false);
+        // Raised for the duration of the computation so a self-referential
+        // read is detected rather than served silently. Cleared by
+        // `RecomputeGuard` below, so a caught panic cannot leave it wedged.
+        self.computing.set(true);
 
         let _subscriber = SubscriberGuard::swap_in(Some(Subscriber::Memo(Rc::downgrade(self))));
 
@@ -149,6 +188,7 @@ impl MemoState {
         }
         impl Drop for RecomputeGuard<'_> {
             fn drop(&mut self) {
+                self.state.computing.set(false);
                 *self.state.recompute.borrow_mut() = self.compute.take();
                 if !self.completed {
                     // The computation did not finish, so the cached value is
@@ -176,6 +216,21 @@ struct EffectState {
     /// Set when this effect is torn down. A disposed effect never runs again,
     /// even if a stale subscription still points at it.
     disposed: Cell<bool>,
+    /// Whether this effect's body is currently on the stack.
+    ///
+    /// A `set()` inside an effect on one of the effect's own dependencies
+    /// notifies the effect itself; natively that delivery is synchronous, so
+    /// without this flag `run_effect` re-entered on the same stack and
+    /// recursed until it overflowed. See [`run_effect`].
+    running: Cell<bool>,
+    /// Set when a notification for this effect arrived while it was running.
+    /// The refused re-entrant run is owed: [`run_effect`] delivers it after
+    /// the current body finishes, so the effect still converges.
+    rerun_requested: Cell<bool>,
+    /// Whether `signal_effect_cycle_detected` has been emitted for this
+    /// effect. The event identifies a coding bug, so it is reported once per
+    /// effect rather than once per refused re-entry.
+    cycle_reported: Cell<bool>,
     /// Effects created *during* this effect's last run.
     ///
     /// This is what makes disposal possible. `create_dom_node` calls
@@ -504,6 +559,32 @@ fn schedule_async(#[allow(unused_variables)] effects: Vec<Rc<EffectState>>) {
 
     #[cfg(any(not(feature = "web"), not(target_arch = "wasm32")))]
     {
+        // Restores the depth even if an effect body panics under
+        // `catch_unwind`; a wedged depth would make every later flush on the
+        // thread look nested and eventually refuse to deliver anything.
+        struct FlushDepthGuard;
+        impl Drop for FlushDepthGuard {
+            fn drop(&mut self) {
+                FLUSH_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+            }
+        }
+
+        let depth = FLUSH_DEPTH.with(|depth| depth.get());
+        if depth >= MAX_FLUSH_DEPTH {
+            // A chain of effects each writing another's dependency has nested
+            // this deep synchronously — a livelock. Drop the delivery rather
+            // than overflow the stack; the values are already committed, so
+            // the next legitimate write re-runs the dependents.
+            tracing::error!(
+                depth,
+                dropped = effects.len(),
+                "signal_flush_depth_exceeded"
+            );
+            return;
+        }
+        FLUSH_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        let _guard = FlushDepthGuard;
+
         for effect in effects {
             run_effect(effect);
         }
@@ -679,6 +760,15 @@ impl<T> Clone for Memo<T> {
 impl<T> Memo<T> {
     /// Subscribe the current reactive node, and recompute if stale.
     fn track_and_refresh(&self) {
+        if self.state.computing.get() {
+            // The memo's own computation is on the stack and has read the memo
+            // back. Recomputing would recurse without bound, and subscribing
+            // would make the memo its own dependent, so the read is treated as
+            // untracked and stale: it serves whatever value is cached.
+            tracing::error!("memo_self_reference_detected");
+            return;
+        }
+
         CURRENT_SUBSCRIBER.with(|current| {
             if let Some(subscriber) = current.borrow().as_ref() {
                 push_subscriber(&mut self.state.subscribers.borrow_mut(), subscriber);
@@ -691,16 +781,48 @@ impl<T> Memo<T> {
     }
 
     /// Borrow the computed value.
+    ///
+    /// A self-referential read — the memo's computation reading the memo back —
+    /// is served the previous (stale) value with a `memo_self_reference_detected`
+    /// error event rather than recursing. Because [`create_memo`] computes
+    /// eagerly before any handle to the memo exists, a value is always present
+    /// by the time a self-read is reachable through the public API.
     pub fn with<U, F>(&self, f: F) -> U
     where
         F: FnOnce(&T) -> U,
     {
         self.track_and_refresh();
-        let value = self.value.borrow();
-        let value = value
-            .as_ref()
-            .expect("memo value is absent after computation");
-        f(value)
+        {
+            let value = self.value.borrow();
+            if let Some(value) = value.as_ref() {
+                return f(value);
+            }
+        }
+
+        // No value has ever been computed. `create_memo` computes eagerly
+        // before returning, so the only route here is a first computation that
+        // panicked (and was caught upstream) followed by a later read. If no
+        // computation is on the stack, retry it now and serve the result.
+        if !self.state.computing.get() && !self.state.disposed.get() {
+            self.state.dirty.set(true);
+            self.state.recompute_now();
+            let value = self.value.borrow();
+            if let Some(value) = value.as_ref() {
+                return f(value);
+            }
+        }
+
+        // A self-referential read during the memo's *first* computation: there
+        // is no stale value to serve and no way to conjure a `T`, so this is
+        // unsatisfiable. It is unreachable through the public API (no handle
+        // exists until the first computation has completed); the panic below —
+        // preceded by the error event — is a guarded invariant, not a control
+        // path, and the enclosing `RecomputeGuard` leaves the memo retryable.
+        tracing::error!("memo_self_reference_detected");
+        panic!(
+            "memo read its own value during its first computation; no previous value \
+             exists to break the cycle"
+        );
     }
 }
 
@@ -740,6 +862,7 @@ where
         // Starts dirty so the first read computes it; nothing is evaluated
         // until then.
         dirty: Cell::new(true),
+        computing: Cell::new(false),
         recompute: RefCell::new(None),
         subscribers: RefCell::new(Vec::new()),
         disposed: Cell::new(false),
@@ -769,6 +892,21 @@ where
     memo
 }
 
+/// Build a fresh, not-yet-run effect state.
+#[cfg(any(feature = "web", test))]
+fn new_effect_state(f: impl Fn() + 'static) -> Rc<EffectState> {
+    Rc::new(EffectState {
+        execute: Box::new(f),
+        disposed: Cell::new(false),
+        running: Cell::new(false),
+        rerun_requested: Cell::new(false),
+        cycle_reported: Cell::new(false),
+        children: RefCell::new(Vec::new()),
+        owned_memos: RefCell::new(Vec::new()),
+        cleanups: RefCell::new(Vec::new()),
+    })
+}
+
 /// Run `f` now, and again whenever a signal it read changes.
 ///
 /// # Ownership
@@ -782,19 +920,22 @@ where
 /// the client rebuilds their effects on every parent re-render, and without
 /// ownership each rebuild left the previous effects subscribed and patching
 /// detached DOM.
+///
+/// # Permanence
+///
+/// A top-level effect created this way is **permanent by design**: it is
+/// retained in the thread's root-effect list and there is no API to tear it
+/// down. That is the right lifetime for the common callers — hydration effects
+/// that must live as long as the page. An effect whose lifetime is shorter
+/// than the thread (per-widget, per-subscription) should use
+/// [`create_effect_scoped`], which returns a disposable [`EffectHandle`].
 pub fn create_effect<F>(#[allow(unused_variables)] f: F)
 where
     F: Fn() + 'static,
 {
     #[cfg(any(feature = "web", test))]
     {
-        let effect = Rc::new(EffectState {
-            execute: Box::new(f),
-            disposed: Cell::new(false),
-            children: RefCell::new(Vec::new()),
-            owned_memos: RefCell::new(Vec::new()),
-            cleanups: RefCell::new(Vec::new()),
-        });
+        let effect = new_effect_state(f);
 
         let owned_by_parent = CURRENT_SUBSCRIBER.with(|current| {
             match current.borrow().as_ref() {
@@ -822,6 +963,77 @@ where
     }
 }
 
+/// A handle to an effect created with [`create_effect_scoped`].
+///
+/// Disposing the handle tears the effect down permanently: it never runs
+/// again, its cleanups and children are released, and its entry in the
+/// thread's root-effect list is removed, so the effect's memory can actually
+/// be reclaimed. Dropping the handle *without* calling
+/// [`dispose`](Self::dispose) leaves the effect running for the life of the
+/// thread, exactly like [`create_effect`].
+pub struct EffectHandle {
+    state: Rc<EffectState>,
+}
+
+impl EffectHandle {
+    /// Tear the effect down: mark it disposed, run its cleanups, dispose
+    /// everything it owns, and release its root-list retention.
+    ///
+    /// Idempotent — disposing twice is a no-op.
+    pub fn dispose(&self) {
+        self.state.dispose();
+        ROOT_EFFECTS.with(|roots| {
+            roots
+                .borrow_mut()
+                .retain(|root| !Rc::ptr_eq(root, &self.state));
+        });
+    }
+}
+
+/// Like [`create_effect`], but returns an [`EffectHandle`] that can tear the
+/// effect down.
+///
+/// The effect is always retained as a **root** effect — it is never adopted as
+/// a child of an enclosing effect — so its lifetime is governed solely by the
+/// returned handle. Use this for effects scoped to something shorter-lived
+/// than the thread; use [`create_effect`] for effects that should live as long
+/// as the page.
+#[cfg(any(feature = "web", test))]
+pub fn create_effect_scoped<F>(f: F) -> EffectHandle
+where
+    F: Fn() + 'static,
+{
+    let effect = new_effect_state(f);
+    ROOT_EFFECTS.with(|roots| {
+        roots.borrow_mut().push(effect.clone());
+    });
+    run_effect(effect.clone());
+    EffectHandle { state: effect }
+}
+
+/// See the enabled variant above. Without the `web` feature nothing runs
+/// effects on this target, matching [`create_effect`]; the returned handle
+/// controls an inert, already-disposed effect so `dispose()` is a no-op.
+#[cfg(not(any(feature = "web", test)))]
+pub fn create_effect_scoped<F>(f: F) -> EffectHandle
+where
+    F: Fn() + 'static,
+{
+    let _ = f;
+    EffectHandle {
+        state: Rc::new(EffectState {
+            execute: Box::new(|| {}),
+            disposed: Cell::new(true),
+            running: Cell::new(false),
+            rerun_requested: Cell::new(false),
+            cycle_reported: Cell::new(false),
+            children: RefCell::new(Vec::new()),
+            owned_memos: RefCell::new(Vec::new()),
+            cleanups: RefCell::new(Vec::new()),
+        }),
+    }
+}
+
 /// Register a callback to run when the current effect is disposed or re-runs.
 ///
 /// Outside an effect this is a no-op — there is nothing to attach to.
@@ -843,20 +1055,86 @@ where
     }
 }
 
+/// Ceiling on consecutive owed re-runs of one effect, and on nested
+/// synchronous flushes. High enough that any legitimately converging effect
+/// settles long before it; low enough that a genuine livelock is cut off with
+/// a `signal_flush_depth_exceeded` error event instead of hanging the thread.
+const MAX_FLUSH_DEPTH: u32 = 64;
+
+/// Clears an effect's `running` flag when the scope exits, normally or by
+/// unwinding. Island factories run under `catch_unwind` and `error_boundary`
+/// makes a panic recoverable, so execution continues past one — a wedged flag
+/// would make every later run of the effect refuse as a false cycle.
+struct RunningGuard<'a> {
+    flag: &'a Cell<bool>,
+}
+
+impl<'a> RunningGuard<'a> {
+    fn arm(flag: &'a Cell<bool>) -> Self {
+        flag.set(true);
+        Self { flag }
+    }
+}
+
+impl Drop for RunningGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.set(false);
+    }
+}
+
 fn run_effect(effect: Rc<EffectState>) {
     if effect.disposed.get() {
         return;
     }
 
-    // A re-run invalidates everything the previous run created.
-    effect.dispose_children();
+    if effect.running.get() {
+        // Re-entry: a write inside this effect's own body notified the effect
+        // itself, and the native path delivers notifications synchronously on
+        // the same stack. Running here would recurse without bound (the
+        // pre-guard failure mode was a stack overflow). Refuse the nested run
+        // and remember that one re-run is owed once the current body
+        // finishes, so the effect still observes the value it wrote.
+        if !effect.cycle_reported.get() {
+            effect.cycle_reported.set(true);
+            tracing::error!("signal_effect_cycle_detected");
+        }
+        effect.rerun_requested.set(true);
+        return;
+    }
 
-    // Guard, not sequential replace calls: an effect body that panics under
-    // `catch_unwind` must not leave the thread-local pointing at itself —
-    // that zombie subscriber adopted every later top-level effect and then
-    // mass-disposed them on its next run.
-    let _guard = SubscriberGuard::swap_in(Some(Subscriber::Effect(Rc::downgrade(&effect))));
-    effect.run();
+    let mut reruns: u32 = 0;
+    loop {
+        effect.rerun_requested.set(false);
+
+        {
+            // Drop guard so a panic in the body cannot wedge the flag.
+            let _running = RunningGuard::arm(&effect.running);
+
+            // A re-run invalidates everything the previous run created.
+            effect.dispose_children();
+
+            // Guard, not sequential replace calls: an effect body that panics
+            // under `catch_unwind` must not leave the thread-local pointing at
+            // itself — that zombie subscriber adopted every later top-level
+            // effect and then mass-disposed them on its next run.
+            let _subscriber =
+                SubscriberGuard::swap_in(Some(Subscriber::Effect(Rc::downgrade(&effect))));
+            effect.run();
+        }
+
+        // Deliver the re-run a refused re-entry left owing, now that the body
+        // is off the stack. Bounded: an effect that unconditionally rewrites
+        // its own dependency would otherwise loop forever.
+        if effect.disposed.get() || !effect.rerun_requested.get() {
+            break;
+        }
+        reruns += 1;
+        if reruns >= MAX_FLUSH_DEPTH {
+            tracing::error!(reruns, "signal_flush_depth_exceeded");
+            effect.rerun_requested.set(false);
+            break;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1726,5 +2004,220 @@ mod unwind_and_growth_tests {
             len <= 2,
             "an unwritten source's subscriber list must stay bounded, found {len}"
         );
+    }
+
+    /// The interleaved variant the tail-only dedup missed: a parent effect and
+    /// its child both read the same unwritten signal, and the parent reads it
+    /// again after the child is created. With `last()`-only dedup the parent's
+    /// second read always landed a duplicate, one per parent re-run.
+    #[test]
+    fn interleaved_parent_and_child_reads_do_not_accumulate_subscribers() {
+        let (written, set_written) = create_signal(0);
+        let (unwritten, _set_unwritten) = create_signal(0);
+
+        let parent_probe = unwritten.clone();
+        let child_probe = unwritten.clone();
+        create_effect(move || {
+            let _ = written.get();
+            // Parent subscribes; list tail is now the parent.
+            let _ = parent_probe.get();
+            let probe = child_probe.clone();
+            create_effect(move || {
+                // Child subscribes; list tail is now the child.
+                let _ = probe.get();
+            });
+            // Parent reads again: the tail is the child, so a tail-only check
+            // pushed a second parent entry every run.
+            let _ = parent_probe.get();
+        });
+
+        for i in 1..=25 {
+            set_written.set(i);
+        }
+
+        let len = unwritten.inner.state.borrow().subscribers.len();
+        assert!(
+            len <= 2,
+            "one parent and one child must mean at most two subscriptions, found {len}"
+        );
+    }
+}
+
+/// Guards against reactive cycles: an effect writing its own dependency, a
+/// memo reading itself, and the disposal API for root effects.
+#[cfg(test)]
+mod cycle_guard_tests {
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    /// The stack-overflow bug: natively a `set()` inside an effect ran the
+    /// effect again synchronously on the same stack, so an effect that wrote
+    /// its own dependency recursed until it overflowed. The running flag
+    /// refuses the re-entrant run and delivers it after the body finishes, so
+    /// the effect terminates *and* settles on the value it wrote.
+    #[test]
+    fn an_effect_writing_its_own_dependency_terminates_and_converges() {
+        let (count, set_count) = create_signal(0u32);
+        let runs = Rc::new(Cell::new(0u32));
+
+        let reader = count.clone();
+        let seen = runs.clone();
+        create_effect(move || {
+            seen.set(seen.get() + 1);
+            let current = reader.get();
+            if current < 5 {
+                set_count.set(current + 1);
+            }
+        });
+
+        assert_eq!(count.get(), 5, "the effect must converge on its own writes");
+        assert_eq!(runs.get(), 6, "initial run plus one owed re-run per write");
+    }
+
+    /// An effect that unconditionally rewrites its own dependency can never
+    /// converge; the iteration cap must cut it off instead of hanging.
+    #[test]
+    fn an_unconditional_self_write_is_cut_off_by_the_flush_cap() {
+        let (value, set_value) = create_signal(0u64);
+        let runs = Rc::new(Cell::new(0u32));
+
+        let reader = value.clone();
+        let seen = runs.clone();
+        create_effect(move || {
+            seen.set(seen.get() + 1);
+            set_value.set(reader.get() + 1);
+        });
+
+        assert_eq!(
+            runs.get(),
+            MAX_FLUSH_DEPTH,
+            "consecutive runs of a livelocked effect are capped at MAX_FLUSH_DEPTH"
+        );
+    }
+
+    /// A panic inside a self-notifying effect must not wedge the running flag:
+    /// the drop guard clears it, so the effect is not refused as a false cycle
+    /// on its next legitimate run.
+    #[test]
+    fn a_panicking_effect_does_not_wedge_the_running_flag() {
+        let (value, set_value) = create_signal(0);
+        let should_panic = Rc::new(Cell::new(true));
+        let runs = Rc::new(Cell::new(0u32));
+
+        let flag = should_panic.clone();
+        let seen = runs.clone();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            create_effect(move || {
+                let _ = value.get();
+                seen.set(seen.get() + 1);
+                if flag.get() {
+                    panic!("first run fails");
+                }
+            });
+        }));
+        assert!(result.is_err(), "the panic must propagate");
+
+        should_panic.set(false);
+        set_value.set(1);
+        assert_eq!(
+            runs.get(),
+            2,
+            "after a caught panic the effect must run again, not be refused as a cycle"
+        );
+    }
+
+    /// The self-referential-memo panic: the memo's closure reading the memo
+    /// back found `dirty` already cleared and an (on the panicking path)
+    /// absent value, and `with()` `expect()`ed. The computing flag now serves
+    /// the stale value to the self-read, so the computation completes
+    /// deterministically instead of panicking.
+    #[test]
+    fn a_self_referential_memo_serves_the_stale_value_instead_of_panicking() {
+        let handle: Rc<RefCell<Option<Memo<i32>>>> = Rc::new(RefCell::new(None));
+        let (source, set_source) = create_signal(1);
+
+        let handle_in_closure = handle.clone();
+        let memo = create_memo(move || {
+            let base = source.get();
+            // On the eager first computation the handle is still empty, so
+            // there is a non-recursive base case; every recomputation after
+            // that reads the memo back through the handle.
+            let previous = handle_in_closure
+                .borrow()
+                .as_ref()
+                .map(|memo: &Memo<i32>| memo.get())
+                .unwrap_or(0);
+            base + previous
+        });
+        *handle.borrow_mut() = Some(memo.clone());
+
+        assert_eq!(memo.get(), 1, "eager run: base 1 with no previous value");
+
+        set_source.set(10);
+        let result = catch_unwind(AssertUnwindSafe(|| memo.get()));
+        let value = result.expect("a self-referential memo must not panic");
+        assert_eq!(
+            value, 11,
+            "the self-read must see the stale value (1), giving 10 + 1"
+        );
+
+        // Deterministic thereafter: reading again without a write serves the
+        // cached value, no recomputation, no panic.
+        assert_eq!(memo.get(), 11);
+    }
+
+    /// Root effects were pushed into `ROOT_EFFECTS` forever with no disposal
+    /// API; `create_effect_scoped` must return the list to its baseline.
+    #[test]
+    fn disposing_a_scoped_effect_returns_root_effects_to_baseline() {
+        let baseline = ROOT_EFFECTS.with(|roots| roots.borrow().len());
+
+        let (value, set_value) = create_signal(0);
+        let runs = Rc::new(Cell::new(0u32));
+
+        let reader = value.clone();
+        let seen = runs.clone();
+        let handle = create_effect_scoped(move || {
+            let _ = reader.get();
+            seen.set(seen.get() + 1);
+        });
+
+        assert_eq!(
+            ROOT_EFFECTS.with(|roots| roots.borrow().len()),
+            baseline + 1,
+            "a scoped effect is retained while live"
+        );
+        set_value.set(1);
+        assert_eq!(runs.get(), 2, "a live scoped effect reacts to writes");
+
+        handle.dispose();
+        assert_eq!(
+            ROOT_EFFECTS.with(|roots| roots.borrow().len()),
+            baseline,
+            "dispose must remove the retained Rc from ROOT_EFFECTS"
+        );
+
+        set_value.set(2);
+        assert_eq!(runs.get(), 2, "a disposed scoped effect must not run again");
+
+        // Idempotent: a second dispose must not remove anything else.
+        handle.dispose();
+        assert_eq!(ROOT_EFFECTS.with(|roots| roots.borrow().len()), baseline);
+    }
+
+    /// `on_cleanup` callbacks registered by a scoped effect run at dispose.
+    #[test]
+    fn disposing_a_scoped_effect_runs_its_cleanups() {
+        let cleanups = Rc::new(Cell::new(0u32));
+
+        let counter = cleanups.clone();
+        let handle = create_effect_scoped(move || {
+            let counter = counter.clone();
+            on_cleanup(move || counter.set(counter.get() + 1));
+        });
+
+        assert_eq!(cleanups.get(), 0);
+        handle.dispose();
+        assert_eq!(cleanups.get(), 1, "dispose must run the registered cleanup");
     }
 }

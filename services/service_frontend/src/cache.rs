@@ -9,10 +9,11 @@ use krab_core::http::HasRuntimeState;
 
 // Use IsrPolicy from core explicitly inside `cache_middleware` if needed, or re-export it.
 use axum::body::Body;
-use krab_core::isr::IsrPolicy;
+use krab_core::isr::{IsrEntry, IsrPolicy, IsrServeOutcome};
 use krab_core::render_policy::CacheMode;
 use krab_core::render_stream::{SuspenseMarker, SuspenseState};
 use std::collections::HashMap;
+use std::time::Duration;
 
 use crate::frontend_env::{distributed_cache_ttl, isr_revalidate_duration};
 use crate::render_policy::route_render_policy;
@@ -63,6 +64,73 @@ pub fn distributed_cache_key(uri: &str) -> String {
     format!("cache:{}:{}", distributed_cache_namespace(), uri)
 }
 
+/// Query parameters allowed to participate in cache keys, from
+/// `FRONTEND_ISR_QUERY_ALLOWLIST` (comma-separated). Default: empty, meaning
+/// cache keys are path-only.
+pub fn isr_query_allowlist() -> Vec<String> {
+    std::env::var("FRONTEND_ISR_QUERY_ALLOWLIST")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Cache key for a request: the path plus only allowlisted query parameters,
+/// sorted for determinism.
+///
+/// Keying on the raw request URI let every distinct query string mint its own
+/// cache entry — unbounded key cardinality from attacker-chosen URLs
+/// (`/page?x=1`, `/page?x=2`, …), each one a cold render plus a stored copy of
+/// the page. Parameters outside the allowlist are dropped from the key, so
+/// they can no longer multiply entries; renderers ignore them anyway (ISR
+/// pages render from the path). Invalidation and revalidation both operate on
+/// this same normalized key, and ETags derive from the cached HTML, so both
+/// stay consistent with it.
+pub fn normalized_cache_key(uri: &axum::http::Uri) -> String {
+    let path = uri.path();
+    let Some(query) = uri.query() else {
+        return path.to_string();
+    };
+
+    let allowlist = isr_query_allowlist();
+    if allowlist.is_empty() {
+        return path.to_string();
+    }
+
+    let mut kept: Vec<(&str, &str)> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
+        .filter(|(name, _)| allowlist.iter().any(|allowed| allowed == name))
+        .collect();
+    if kept.is_empty() {
+        return path.to_string();
+    }
+    kept.sort_unstable();
+
+    let joined = kept
+        .iter()
+        .map(|(name, value)| {
+            if value.is_empty() {
+                (*name).to_string()
+            } else {
+                format!("{name}={value}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{path}?{joined}")
+}
+
+/// How long a request that lost the cold-miss render lease polls for the
+/// winner's entry before rendering anyway (fail open).
+const ISR_COLD_WAIT_ATTEMPTS: u32 = 10;
+const ISR_COLD_WAIT_INTERVAL: Duration = Duration::from_millis(100);
+
 pub fn is_finalized_ssr_snapshot(html: &str) -> bool {
     let mut boundary_state: HashMap<String, (usize, usize, usize)> = HashMap::new();
 
@@ -94,9 +162,52 @@ pub fn is_finalized_ssr_snapshot(html: &str) -> bool {
         .all(|(pending, resolved, error)| *pending > 0 && *pending == (*resolved + *error))
 }
 
+/// Build the response for an ISR cache hit and, when the entry is stale,
+/// start background revalidation.
+fn serve_isr_hit(state: &AppState, cache_key: &str, path: &str, entry: IsrEntry) -> Response {
+    let state_header = if entry.is_stale() { "stale" } else { "fresh" };
+
+    let etag = entry.etag.clone();
+    let mut res = Response::new(Body::from(entry.html.into_bytes()));
+    res.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    if let Ok(etag) = etag.parse() {
+        res.headers_mut().insert(axum::http::header::ETAG, etag);
+    }
+
+    if state_header == "stale" {
+        let cache_key_bg = cache_key.to_string();
+        let path_bg = path.to_string();
+        let state_bg = state.clone();
+        tokio::spawn(async move {
+            trigger_isr_revalidation(state_bg, cache_key_bg, path_bg).await;
+        });
+        res.headers_mut().insert(
+            axum::http::header::HeaderName::from_static("x-cache"),
+            axum::http::HeaderValue::from_static("STALE"),
+        );
+    } else {
+        res.headers_mut().insert(
+            axum::http::header::HeaderName::from_static("x-cache"),
+            axum::http::HeaderValue::from_static("HIT"),
+        );
+    }
+
+    res.headers_mut().insert(
+        axum::http::header::HeaderName::from_static("x-isr-state"),
+        axum::http::HeaderValue::from_static(state_header),
+    );
+
+    res
+}
+
 pub async fn cache_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
-    let cache_key = req.uri().to_string(); // Include query params in cache key
+    // Path plus allowlisted query params only — raw URIs gave every distinct
+    // query string its own entry (unbounded cardinality).
+    let cache_key = normalized_cache_key(req.uri());
     let method = req.method().clone();
 
     let authority = cache_authority(&method, &path);
@@ -104,11 +215,41 @@ pub async fn cache_middleware(State(state): State<AppState>, req: Request, next:
     let distributed_eligible = authority == CacheAuthority::Distributed;
     let distributed_key = distributed_eligible.then(|| distributed_cache_key(&cache_key));
 
+    // True when this request won the cold-miss render lease and must release
+    // it once the render outcome is settled.
+    let mut isr_lease_held = false;
+
     if isr_eligible {
         // A cache read that fails is a degraded cache, not a failed request:
         // fall through and render the page rather than 500.
-        let cached = match state.isr_cache.get(&cache_key).await {
-            Ok(entry) => entry,
+        match state.isr_cache.serve_or_lease(&cache_key).await {
+            Ok(IsrServeOutcome::Hit(entry)) => {
+                return serve_isr_hit(&state, &cache_key, &path, entry);
+            }
+            Ok(IsrServeOutcome::MissAcquired) => {
+                isr_lease_held = true;
+            }
+            Ok(IsrServeOutcome::MissLocked) => {
+                // Another request (possibly on another replica) is rendering
+                // this page. Poll briefly for its entry; if it never lands,
+                // render anyway — the lease must not make requests fail.
+                for _ in 0..ISR_COLD_WAIT_ATTEMPTS {
+                    tokio::time::sleep(ISR_COLD_WAIT_INTERVAL).await;
+                    match state.isr_cache.get(&cache_key).await {
+                        Ok(Some(entry)) => {
+                            return serve_isr_hit(&state, &cache_key, &path, entry);
+                        }
+                        Ok(None) => {}
+                        Err(_) => break,
+                    }
+                }
+                tracing::debug!(
+                    event = "isr_cold_miss_wait_timeout",
+                    cache_key = %cache_key,
+                    http.route = %path,
+                    "lease holder did not populate in time; rendering anyway"
+                );
+            }
             Err(error) => {
                 tracing::warn!(
                     event = "isr_cache_read_failed",
@@ -116,46 +257,7 @@ pub async fn cache_middleware(State(state): State<AppState>, req: Request, next:
                     %error,
                     "serving uncached after an ISR read failure"
                 );
-                None
             }
-        };
-
-        if let Some(entry) = cached {
-            let state_header = if entry.is_stale() { "stale" } else { "fresh" };
-
-            let mut res = Response::new(Body::from(entry.html.into_bytes()));
-            res.headers_mut().insert(
-                axum::http::header::CONTENT_TYPE,
-                axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
-            );
-            if let Ok(etag) = entry.etag.parse() {
-                res.headers_mut().insert(axum::http::header::ETAG, etag);
-            }
-
-            if state_header == "stale" {
-                let cache_key_bg = cache_key.clone();
-                let path_bg = path.clone();
-                let state_bg = state.clone();
-                tokio::spawn(async move {
-                    trigger_isr_revalidation(state_bg, cache_key_bg, path_bg).await;
-                });
-                res.headers_mut().insert(
-                    axum::http::header::HeaderName::from_static("x-cache"),
-                    axum::http::HeaderValue::from_static("STALE"),
-                );
-            } else {
-                res.headers_mut().insert(
-                    axum::http::header::HeaderName::from_static("x-cache"),
-                    axum::http::HeaderValue::from_static("HIT"),
-                );
-            }
-
-            res.headers_mut().insert(
-                axum::http::header::HeaderName::from_static("x-isr-state"),
-                axum::http::HeaderValue::from_static(state_header),
-            );
-
-            return res;
         }
     }
 
@@ -199,6 +301,9 @@ pub async fn cache_middleware(State(state): State<AppState>, req: Request, next:
 
     // Only cache successful responses
     if !res.status().is_success() {
+        if isr_lease_held {
+            let _ = state.isr_cache.release_lease(&cache_key).await;
+        }
         return res;
     }
 
@@ -211,6 +316,9 @@ pub async fn cache_middleware(State(state): State<AppState>, req: Request, next:
         Ok(collected) => collected.to_bytes(),
         Err(err) => {
             tracing::error!("failed to read response body for caching: {}", err);
+            if isr_lease_held {
+                let _ = state.isr_cache.release_lease(&cache_key).await;
+            }
             return Response::from_parts(parts, Body::empty());
         }
     };
@@ -328,5 +436,64 @@ pub async fn cache_middleware(State(state): State<AppState>, req: Request, next:
         }
     }
 
+    // Whatever happened above — stored, skipped, or errored — the render is
+    // settled, so let go of the cold-miss lease rather than making the next
+    // request wait out its TTL. The lease expires on its own if this is missed.
+    if isr_lease_held {
+        let _ = state.isr_cache.release_lease(&cache_key).await;
+    }
+
     res
+}
+
+// Serial: these tests mutate FRONTEND_ISR_QUERY_ALLOWLIST, shared process env.
+#[cfg(test)]
+#[serial_test::serial]
+mod cache_key_tests {
+    use super::*;
+    use axum::http::Uri;
+
+    #[test]
+    fn default_cache_key_is_path_only() {
+        std::env::remove_var("FRONTEND_ISR_QUERY_ALLOWLIST");
+
+        let with_query: Uri = "/page?a=1&b=2".parse().unwrap();
+        assert_eq!(normalized_cache_key(&with_query), "/page");
+
+        let bare: Uri = "/page".parse().unwrap();
+        assert_eq!(normalized_cache_key(&bare), "/page");
+    }
+
+    #[test]
+    fn allowlisted_params_are_kept_sorted_and_the_rest_dropped() {
+        std::env::set_var("FRONTEND_ISR_QUERY_ALLOWLIST", "page, lang");
+
+        let uri: Uri = "/blog?utm_source=x&page=2&lang=en".parse().unwrap();
+        assert_eq!(normalized_cache_key(&uri), "/blog?lang=en&page=2");
+
+        // Parameter order in the URL must not change the key.
+        let reordered: Uri = "/blog?lang=en&utm_source=y&page=2".parse().unwrap();
+        assert_eq!(normalized_cache_key(&reordered), "/blog?lang=en&page=2");
+
+        std::env::remove_var("FRONTEND_ISR_QUERY_ALLOWLIST");
+    }
+
+    #[test]
+    fn query_with_no_allowlisted_params_falls_back_to_path_only() {
+        std::env::set_var("FRONTEND_ISR_QUERY_ALLOWLIST", "page");
+
+        let uri: Uri = "/blog?utm_source=x&utm_medium=y".parse().unwrap();
+        assert_eq!(normalized_cache_key(&uri), "/blog");
+
+        std::env::remove_var("FRONTEND_ISR_QUERY_ALLOWLIST");
+    }
+
+    #[test]
+    fn allowlist_env_parsing_trims_and_skips_empty_segments() {
+        std::env::set_var("FRONTEND_ISR_QUERY_ALLOWLIST", " page ,, lang ,");
+        assert_eq!(isr_query_allowlist(), vec!["page", "lang"]);
+
+        std::env::remove_var("FRONTEND_ISR_QUERY_ALLOWLIST");
+        assert!(isr_query_allowlist().is_empty());
+    }
 }

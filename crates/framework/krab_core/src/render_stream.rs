@@ -79,6 +79,53 @@ pub struct StreamTelemetry {
     pub cancel_reason: Option<String>,
 }
 
+/// Result of consuming a [`ChunkedStreamWriter`] via [`finish`](ChunkedStreamWriter::finish).
+///
+/// Carries the emitted chunks together with the terminal stream flags so
+/// callers can tell a complete render apart from one that was truncated by
+/// the byte budget or cancelled mid-flight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinishedStream {
+    /// Emitted chunks, in order.
+    pub chunks: Vec<String>,
+    /// True if at least one write was dropped because the byte budget was hit.
+    pub budget_exceeded: bool,
+    /// True if the stream was cancelled before completion.
+    pub cancelled: bool,
+}
+
+impl FinishedStream {
+    /// Emitted chunks, in order.
+    pub fn chunks(&self) -> &[String] {
+        &self.chunks
+    }
+
+    /// Consume, returning the emitted chunks.
+    pub fn into_chunks(self) -> Vec<String> {
+        self.chunks
+    }
+
+    /// Concatenate all chunks into a single string.
+    pub fn concat(&self) -> String {
+        self.chunks.concat()
+    }
+
+    /// True if at least one write was dropped because the byte budget was hit.
+    pub fn budget_exceeded(&self) -> bool {
+        self.budget_exceeded
+    }
+
+    /// True if the stream was cancelled before completion.
+    pub fn cancelled(&self) -> bool {
+        self.cancelled
+    }
+
+    /// True if the stream finished without truncation or cancellation.
+    pub fn is_complete(&self) -> bool {
+        !self.budget_exceeded && !self.cancelled
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ChunkedStreamWriter {
     chunk_size: usize,
@@ -127,8 +174,10 @@ impl ChunkedStreamWriter {
 
     /// Set a maximum per-request render budget in bytes.
     ///
-    /// Once the budget is exceeded, subsequent writes are ignored and
-    /// `budget_exceeded` is surfaced via [`telemetry_snapshot`](Self::telemetry_snapshot).
+    /// Once the budget is exceeded, subsequent writes are rejected —
+    /// [`write`](Self::write) returns `false` — and `budget_exceeded` is
+    /// surfaced via [`telemetry_snapshot`](Self::telemetry_snapshot) and
+    /// [`finish`](Self::finish).
     pub fn with_max_total_bytes(mut self, max_total_bytes: usize) -> Self {
         self.max_total_bytes = Some(max_total_bytes.max(1));
         self
@@ -139,16 +188,29 @@ impl ChunkedStreamWriter {
         self.max_total_bytes = Some(max_total_bytes.max(1));
     }
 
-    pub fn write(&mut self, input: &str) {
+    /// Write raw output into the stream.
+    ///
+    /// Returns `true` if the input was accepted, `false` if it was dropped
+    /// because the stream is cancelled or the byte budget would be exceeded.
+    /// The first budget-driven drop emits a `render_budget_exceeded` warning.
+    #[must_use = "a false return means the output was dropped (budget exceeded or stream cancelled)"]
+    pub fn write(&mut self, input: &str) -> bool {
         if self.budget_exceeded || self.stream_cancelled {
-            return;
+            return false;
         }
 
         if let Some(limit) = self.max_total_bytes {
             let projected = self.emitted_bytes + self.pending.len() + input.len();
             if projected > limit {
                 self.budget_exceeded = true;
-                return;
+                tracing::warn!(
+                    emitted_bytes = self.emitted_bytes,
+                    pending_bytes = self.pending.len(),
+                    dropped_bytes = input.len(),
+                    limit,
+                    "render_budget_exceeded"
+                );
+                return false;
             }
         }
 
@@ -158,19 +220,30 @@ impl ChunkedStreamWriter {
 
         self.pending.push_str(input);
         self.flush_if_ready();
+        true
     }
 
-    pub fn write_suspense_marker(&mut self, boundary_id: &str, state: SuspenseState) {
-        self.suspense_marker_count += 1;
-        *self
-            .boundary_events
-            .entry(boundary_id.to_string())
-            .or_insert(0) += 1;
-        self.write(&format!(
+    /// Write a suspense boundary marker.
+    ///
+    /// Returns `true` if the marker was accepted. Marker and boundary
+    /// counters are only incremented for markers that actually reached the
+    /// stream — a marker dropped by the budget or a cancellation is not
+    /// counted in telemetry.
+    #[must_use = "a false return means the marker was dropped (budget exceeded or stream cancelled)"]
+    pub fn write_suspense_marker(&mut self, boundary_id: &str, state: SuspenseState) -> bool {
+        let accepted = self.write(&format!(
             "<!--krab:suspense:{}:{}-->",
             boundary_id,
             state.as_str()
         ));
+        if accepted {
+            self.suspense_marker_count += 1;
+            *self
+                .boundary_events
+                .entry(boundary_id.to_string())
+                .or_insert(0) += 1;
+        }
+        accepted
     }
 
     pub fn flush(&mut self) {
@@ -199,9 +272,18 @@ impl ChunkedStreamWriter {
         self.flush_count += 1;
     }
 
-    pub fn finish(mut self) -> Vec<String> {
+    /// Flush any pending output and consume the writer.
+    ///
+    /// The returned [`FinishedStream`] carries the emitted chunks plus the
+    /// terminal `budget_exceeded` / `cancelled` flags, so truncation is
+    /// visible to the caller instead of silently producing a shorter stream.
+    pub fn finish(mut self) -> FinishedStream {
         self.flush();
-        self.chunks
+        FinishedStream {
+            budget_exceeded: self.budget_exceeded,
+            cancelled: self.stream_cancelled,
+            chunks: self.chunks,
+        }
     }
 
     pub fn flush_count(&self) -> usize {
@@ -254,8 +336,10 @@ impl ChunkedStreamWriter {
     }
 }
 
-pub fn render_to_chunk_stream(renderable: &impl Render, writer: &mut ChunkedStreamWriter) {
-    writer.write(&renderable.render());
+/// Render into the chunk stream. Returns `true` if the rendered output was
+/// accepted, `false` if it was dropped (budget exceeded or stream cancelled).
+pub fn render_to_chunk_stream(renderable: &impl Render, writer: &mut ChunkedStreamWriter) -> bool {
+    writer.write(&renderable.render())
 }
 
 fn nearest_char_boundary(s: &str, target: usize) -> usize {
@@ -277,19 +361,22 @@ mod tests {
     #[test]
     fn chunk_writer_splits_and_flushes() {
         let mut writer = ChunkedStreamWriter::new(128, 256);
-        writer.write(&"a".repeat(300));
+        assert!(writer.write(&"a".repeat(300)));
 
-        let chunks = writer.finish();
-        assert!(chunks.len() >= 3);
-        assert_eq!(chunks.concat(), "a".repeat(300));
+        let finished = writer.finish();
+        assert!(finished.chunks.len() >= 3);
+        assert_eq!(finished.concat(), "a".repeat(300));
+        assert!(finished.is_complete());
+        assert!(!finished.budget_exceeded());
+        assert!(!finished.cancelled());
     }
 
     #[test]
     fn suspense_markers_are_hydration_compatible_comments() {
         let mut writer = ChunkedStreamWriter::new(32, 64);
-        writer.write_suspense_marker("home-data", SuspenseState::Pending);
-        writer.write("<div data-krab-hydration=\"home-data\">fallback</div>");
-        writer.write_suspense_marker("home-data", SuspenseState::Resolved);
+        let _ = writer.write_suspense_marker("home-data", SuspenseState::Pending);
+        let _ = writer.write("<div data-krab-hydration=\"home-data\">fallback</div>");
+        let _ = writer.write_suspense_marker("home-data", SuspenseState::Resolved);
         let html = writer.finish().concat();
 
         assert!(html.contains("<!--krab:suspense:home-data:pending-->"));
@@ -339,19 +426,19 @@ mod tests {
     #[test]
     fn backpressure_flushes_when_threshold_reached() {
         let mut writer = ChunkedStreamWriter::new(128, 128);
-        writer.write("hello");
+        let _ = writer.write("hello");
         assert_eq!(writer.flush_count(), 0);
-        writer.write(&"x".repeat(130));
+        let _ = writer.write(&"x".repeat(130));
         assert!(writer.flush_count() >= 1);
     }
 
     #[test]
     fn telemetry_snapshot_tracks_stream_events() {
         let mut writer = ChunkedStreamWriter::new(64, 64);
-        writer.write("<!DOCTYPE html>");
-        writer.write_suspense_marker("home", SuspenseState::Pending);
-        writer.write("<div>hello</div>");
-        writer.write_suspense_marker("home", SuspenseState::Resolved);
+        let _ = writer.write("<!DOCTYPE html>");
+        let _ = writer.write_suspense_marker("home", SuspenseState::Pending);
+        let _ = writer.write("<div>hello</div>");
+        let _ = writer.write_suspense_marker("home", SuspenseState::Resolved);
         writer.flush();
 
         let telemetry = writer.telemetry_snapshot();
@@ -366,13 +453,16 @@ mod tests {
     #[test]
     fn budget_guard_blocks_writes_once_exceeded() {
         let mut writer = ChunkedStreamWriter::new(128, 256).with_max_total_bytes(10);
-        writer.write("12345");
-        writer.write("67890");
-        writer.write("EXTRA"); // must be blocked by budget
+        assert!(writer.write("12345"));
+        assert!(writer.write("67890"));
+        assert!(!writer.write("EXTRA")); // must be blocked by budget
         writer.flush();
         let telemetry = writer.telemetry_snapshot();
-        let html = writer.finish().concat();
-        assert_eq!(html, "1234567890");
+        let finished = writer.finish();
+        assert_eq!(finished.concat(), "1234567890");
+        assert!(finished.budget_exceeded);
+        assert!(!finished.cancelled);
+        assert!(!finished.is_complete());
 
         assert_eq!(telemetry.budget_limit_bytes, Some(10));
         assert!(telemetry.budget_exceeded);
@@ -380,15 +470,47 @@ mod tests {
     }
 
     #[test]
+    fn suspense_marker_dropped_by_budget_is_not_counted() {
+        // Budget fits the pending marker exactly; nothing more.
+        let pending_marker = "<!--krab:suspense:home:pending-->";
+        let mut writer =
+            ChunkedStreamWriter::new(128, 256).with_max_total_bytes(pending_marker.len());
+
+        assert!(writer.write_suspense_marker("home", SuspenseState::Pending));
+        assert!(!writer.write_suspense_marker("home", SuspenseState::Resolved));
+
+        let telemetry = writer.telemetry_snapshot();
+        assert_eq!(telemetry.suspense_marker_count, 1);
+        assert_eq!(telemetry.boundary_events.get("home"), Some(&1));
+
+        let finished = writer.finish();
+        assert!(finished.budget_exceeded);
+        assert_eq!(finished.concat(), pending_marker);
+    }
+
+    #[test]
+    fn suspense_marker_after_cancel_is_not_counted() {
+        let mut writer = ChunkedStreamWriter::new(64, 64);
+        assert!(writer.write_suspense_marker("home", SuspenseState::Pending));
+        writer.cancel("client disconnected");
+        assert!(!writer.write_suspense_marker("home", SuspenseState::Resolved));
+
+        let telemetry = writer.telemetry_snapshot();
+        assert_eq!(telemetry.suspense_marker_count, 1);
+        assert_eq!(telemetry.boundary_events.get("home"), Some(&1));
+    }
+
+    #[test]
     fn budget_guard_can_be_set_after_initialization() {
         let mut writer = ChunkedStreamWriter::new(128, 256);
         writer.set_max_total_bytes(4);
-        writer.write("abcd");
-        writer.write("e"); // exceeds budget
+        assert!(writer.write("abcd"));
+        assert!(!writer.write("e")); // exceeds budget
         writer.flush();
         let telemetry = writer.telemetry_snapshot();
-        let html = writer.finish().concat();
-        assert_eq!(html, "abcd");
+        let finished = writer.finish();
+        assert!(finished.budget_exceeded);
+        assert_eq!(finished.concat(), "abcd");
 
         assert_eq!(telemetry.budget_limit_bytes, Some(4));
         assert!(telemetry.budget_exceeded);
@@ -398,9 +520,9 @@ mod tests {
     #[test]
     fn cancellation_stops_future_writes_and_exposes_reason() {
         let mut writer = ChunkedStreamWriter::new(64, 64);
-        writer.write("<html>");
+        assert!(writer.write("<html>"));
         writer.cancel("client disconnected");
-        writer.write("<body>should-not-appear</body>");
+        assert!(!writer.write("<body>should-not-appear</body>"));
         writer.flush();
 
         let telemetry = writer.telemetry_snapshot();
@@ -411,7 +533,10 @@ mod tests {
             Some("client disconnected")
         );
 
-        let html = writer.finish().concat();
-        assert_eq!(html, "<html>");
+        let finished = writer.finish();
+        assert!(finished.cancelled);
+        assert!(!finished.budget_exceeded);
+        assert!(!finished.is_complete());
+        assert_eq!(finished.concat(), "<html>");
     }
 }
