@@ -73,6 +73,17 @@ impl DependencySource {
     }
 }
 
+/// Minimum toolchain the generated dependency set actually needs.
+///
+/// `axum 0.8.8` declares `rust-version = "1.78"`, and the generated manifest
+/// floats its dependencies (`axum = "0.8"`, `tokio = "1.0"`, ...) to the latest
+/// compatible release, so the real floor is set by whatever those resolve to —
+/// not by this workspace's own `rust-version = "1.75"`. Declaring it in the
+/// generated manifest turns an MSRV mismatch into Cargo's own
+/// "package requires rustc 1.78" message instead of a type error deep inside a
+/// dependency, and keeps the Dockerfile's toolchain choice checkable.
+const GENERATED_PROJECT_MSRV: &str = "1.78";
+
 #[derive(Clone, Copy)]
 struct TemplateMetadata {
     flag: &'static str,
@@ -80,6 +91,13 @@ struct TemplateMetadata {
     starter_scope: Option<&'static str>,
     axum_dep: &'static str,
     extra_deps: &'static str,
+    /// Whether this template ships `docs/render_policy.md`.
+    ///
+    /// Only `edge-ssr` configures a [`krab_core::render_policy::RouteRenderPolicy`],
+    /// so it is the only template for which such a document says anything. The
+    /// scaffold used to create an empty `docs/` for every template, which git
+    /// dropped on the first clone.
+    render_policy_doc: bool,
     /// Cargo features to enable on `krab_core`, one per element.
     ///
     /// This was a single comma-joined string interpolated straight into
@@ -103,6 +121,7 @@ fn template_metadata(template: &ProjectTemplate) -> TemplateMetadata {
 argon2 = "0.5"
 jsonwebtoken = "9.0"
 "#,
+            render_policy_doc: false,
             // `db-postgres`, not the deprecated `db` alias — a scaffolded
             // project should start on the name that will still exist at 0.2.0.
             extra_features: &["db-postgres", "rest"],
@@ -116,6 +135,7 @@ jsonwebtoken = "9.0"
             axum_dep: r#"axum = "0.8"
 "#,
             extra_deps: "",
+            render_policy_doc: true,
             extra_features: &["rest"],
         },
         ProjectTemplate::EventStream => TemplateMetadata {
@@ -127,6 +147,7 @@ jsonwebtoken = "9.0"
             extra_deps: r#"tokio-stream = "0.1"
 futures-util = "0.3"
 "#,
+            render_policy_doc: false,
             extra_features: &["rest"],
         },
         ProjectTemplate::Default => TemplateMetadata {
@@ -136,6 +157,7 @@ futures-util = "0.3"
             axum_dep: r#"axum = "0.8"
 "#,
             extra_deps: "",
+            render_policy_doc: false,
             extra_features: &["rest"],
         },
     }
@@ -147,6 +169,15 @@ fn generate_readme(name: &str, metadata: TemplateMetadata) -> String {
         .map(|note| format!("## Starter Scope\n\n{}\n\n", note))
         .unwrap_or_default();
 
+    // Without a pointer the generated document is undiscoverable.
+    let render_policy_doc = if metadata.render_policy_doc {
+        "## Render Policy\n\nThis starter declares one route render policy. \
+         [`docs/render_policy.md`](docs/render_policy.md) documents what it \
+         configures, what startup validation rejects, and how to change it.\n\n"
+    } else {
+        ""
+    };
+
     format!(
         r#"# {name}
 
@@ -154,7 +185,7 @@ fn generate_readme(name: &str, metadata: TemplateMetadata) -> String {
 
 Generated with `krab new {name} --template {template_flag}`.
 
-{starter_scope}## Quick Start
+{starter_scope}{render_policy_doc}## Quick Start
 
 ```bash
 cp .env.example .env
@@ -192,50 +223,184 @@ kubectl apply -f deploy/kubernetes.yaml
     )
 }
 
+/// Rust keywords (2015, 2018, 2021) plus the words reserved for future use.
+///
+/// Cargo refuses these as package *and* binary target names, so a project named
+/// after one cannot be built at all.
+const RUST_KEYWORDS: &[&str] = &[
+    "abstract", "as", "async", "await", "become", "box", "break", "const", "continue", "crate",
+    "do", "dyn", "else", "enum", "extern", "false", "final", "fn", "for", "gen", "if", "impl",
+    "in", "let", "loop", "macro", "match", "mod", "move", "mut", "override", "priv", "pub", "ref",
+    "return", "self", "Self", "static", "struct", "super", "trait", "true", "try", "type",
+    "typeof", "unsafe", "unsized", "use", "virtual", "where", "while", "yield",
+];
+
+/// Windows reserved device names. The project name becomes a directory name, so
+/// `krab new con` cannot even create its own folder on the platform this
+/// project primarily targets. Cargo rejects these outright as well.
+const WINDOWS_RESERVED_NAMES: &[&str] = &[
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// Names Cargo rejects because they collide with its own build layout
+/// (`target/debug/deps`, `examples`, `build`, `incremental`) or with Rust's
+/// built-in `test` crate. These are `cargo new` errors, not warnings, so they
+/// belong in the same gate.
+const CARGO_RESERVED_NAMES: &[&str] = &["deps", "examples", "build", "incremental", "test"];
+
+/// crates.io caps package names at 64 characters.
+const MAX_PROJECT_NAME_LEN: usize = 64;
+
+fn is_reserved_project_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    RUST_KEYWORDS.contains(&name)
+        || RUST_KEYWORDS.contains(&lower.as_str())
+        || WINDOWS_RESERVED_NAMES.contains(&lower.as_str())
+        || CARGO_RESERVED_NAMES.contains(&lower.as_str())
+}
+
+/// Derive a valid project name from whatever the user typed, for the "did you
+/// mean" line of a rejection.
+///
+/// Always returns a name that [`validate_project_name`] accepts.
+fn suggested_project_slug(raw: &str) -> String {
+    let mut slug = String::new();
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+
+    // ASCII by construction, so byte truncation cannot split a character.
+    slug.truncate(MAX_PROJECT_NAME_LEN);
+    let mut slug = slug.trim_matches('-').to_string();
+
+    if slug.is_empty() {
+        return "krab-app".to_string();
+    }
+    if slug.starts_with(|c: char| c.is_ascii_digit()) {
+        slug.insert_str(0, "app-");
+        slug.truncate(MAX_PROJECT_NAME_LEN);
+    }
+    if is_reserved_project_name(&slug) {
+        slug.push_str("-app");
+    }
+    slug
+}
+
+fn reject_project_name(name: &str, reason: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "invalid project name '{name}': {reason}\n\
+         The name is used as the Cargo package name, the binary name, and the directory \
+         name, so it has to satisfy all three.\n\
+         Try: krab new {slug}",
+        slug = suggested_project_slug(name)
+    )
+}
+
+/// Reject a project name that would produce an unbuildable project.
+///
+/// Interpolating the name straight into `name = "{name}"` used to defer the
+/// failure to the user's first `cargo run`, with a Cargo parse error pointing at
+/// a manifest they did not write. The rules below are Cargo's own package-name
+/// rules, narrowed to ASCII, plus the Windows device names — the name becomes a
+/// directory too.
+fn validate_project_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(reject_project_name(name, "the name is empty"));
+    }
+    if name.len() > MAX_PROJECT_NAME_LEN {
+        return Err(reject_project_name(
+            name,
+            &format!(
+                "it is {} characters; crates.io allows at most {MAX_PROJECT_NAME_LEN}",
+                name.len()
+            ),
+        ));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
+    {
+        return Err(reject_project_name(
+            name,
+            &format!("it contains {bad:?}; only ASCII letters, digits, '-' and '_' are allowed"),
+        ));
+    }
+
+    // Non-empty and ASCII-only at this point.
+    let first = name.as_bytes()[0];
+    if first.is_ascii_digit() {
+        return Err(reject_project_name(
+            name,
+            "it starts with a digit; Cargo package names must start with a letter or '_'",
+        ));
+    }
+    if first == b'-' {
+        return Err(reject_project_name(name, "it starts with '-'"));
+    }
+
+    if RUST_KEYWORDS.contains(&name) {
+        return Err(reject_project_name(name, "it is a Rust keyword"));
+    }
+    if WINDOWS_RESERVED_NAMES.contains(&name.to_ascii_lowercase().as_str()) {
+        return Err(reject_project_name(
+            name,
+            "it is a reserved Windows device name",
+        ));
+    }
+    if CARGO_RESERVED_NAMES.contains(&name.to_ascii_lowercase().as_str()) {
+        return Err(reject_project_name(
+            name,
+            "Cargo reserves it — it collides with Cargo's build directory names or with \
+             Rust's built-in test library",
+        ));
+    }
+    Ok(())
+}
+
 fn write_project_from_template(
     path: &Path,
     name: &str,
     template: &ProjectTemplate,
     deps: &DependencySource,
 ) -> Result<()> {
+    // Before anything touches the filesystem: a bad name must leave nothing
+    // behind, not a half-scaffolded directory.
+    validate_project_name(name)?;
     if path.exists() {
         anyhow::bail!("Directory '{}' already exists", path.display());
     }
     let metadata = template_metadata(template);
 
-    /*
-    ///
-    /// The generator writes a minimal but release-aware project skeleton including source layout,
-    /// environment template, CI workflow, deployment manifest, Dockerfile, and README.
-    pub(super) fn generate_project_from_template(name: &str, template: &ProjectTemplate) -> Result<()> {
-        println!(
-            "🦀 Scaffolding new Krab project '{}' (template: {:?})...",
-            name, template
-        );
-        let path = PathBuf::from(name);
-        if path.exists() {
-            anyhow::bail!("Directory '{}' already exists", name);
-        }
-    */
-
-    for dir in [
-        "",
-        "src",
-        "src/routes",
-        "src/api",
-        "public",
-        ".github/workflows",
-        "deploy",
-        "docs",
-    ] {
+    // Only directories this function actually populates are created. Git does
+    // not track empty directories, so `src/routes/`, `src/api/` and `docs/`
+    // vanished the moment anyone cloned a scaffolded project — and `public/`
+    // vanishing broke `docker build`, because the generated Dockerfile does
+    // `COPY public/ public/`. `src/routes/` is now created on demand by
+    // `krab gen route`, and `public/` is pinned by a `.gitkeep`.
+    for dir in ["", "src", "public", ".github/workflows", "deploy"] {
         fs::create_dir_all(path.join(dir))?;
     }
+
+    fs::write(
+        path.join("public/.gitkeep"),
+        "# Keeps public/ in git so the Dockerfile's `COPY public/ public/` survives a clone.\n",
+    )?;
 
     let cargo_toml = format!(
         r#"[package]
 name = "{name}"
 version = "0.1.0"
 edition = "2021"
+# The floor of the dependency set below, not a preference: `axum 0.8` declares
+# `rust-version = "{msrv}"`. Because the versions below float to the latest
+# compatible release, a dependency raising its own MSRV raises this one — Cargo
+# will say so by name. Keep the Dockerfile's toolchain at or above this.
+rust-version = "{msrv}"
 description = "{template_desc}"
 
 [dependencies]
@@ -248,6 +413,7 @@ tracing = "0.1"
 tracing-subscriber = {{ version = "0.3", features = ["json", "env-filter"] }}
 {extra_deps}
 "#,
+        msrv = GENERATED_PROJECT_MSRV,
         template_desc = metadata.description,
         krab_core_dep = deps.render(
             "krab_core",
@@ -272,36 +438,20 @@ tracing-subscriber = {{ version = "0.3", features = ["json", "env-filter"] }}
     };
     fs::write(path.join("src/main.rs"), main_rs)?;
 
-    let env_example = match template {
-        ProjectTemplate::Saas => format!(
-            r#"# {name} Environment Configuration
-KRAB_ENVIRONMENT=dev
-KRAB_HOST=0.0.0.0
-KRAB_PORT=3000
-KRAB_AUTH_MODE=jwt
-KRAB_JWT_SECRET=change-me-in-production
-KRAB_OIDC_ISSUER=https://auth.example.com
-KRAB_OIDC_AUDIENCE={name}
-DATABASE_URL=postgres://localhost:5432/{name}
-KRAB_SECRETS_SOURCE=env
-"#
-        ),
-        _ => format!(
-            r#"# {name} Environment Configuration
-KRAB_ENVIRONMENT=dev
-KRAB_HOST=0.0.0.0
-KRAB_PORT=3000
-KRAB_AUTH_MODE=static
-KRAB_SECRETS_SOURCE=env
-"#
-        ),
-    };
-    fs::write(path.join(".env.example"), env_example)?;
+    fs::write(
+        path.join(".env.example"),
+        generate_env_example(name, template),
+    )?;
+
+    if let Some(doc) = generate_render_policy_doc(name, metadata) {
+        fs::create_dir_all(path.join("docs"))?;
+        fs::write(path.join("docs/render_policy.md"), doc)?;
+    }
 
     let project_toml = generate_project_toml(name);
     fs::write(path.join("krab.toml"), project_toml)?;
 
-    let ci_yaml = generate_ci_workflow(name, template);
+    let ci_yaml = generate_ci_workflow(name);
     fs::write(path.join(".github/workflows/ci.yaml"), ci_yaml)?;
 
     let deploy_yaml = generate_deploy_manifest(name, template);
@@ -317,7 +467,6 @@ KRAB_SECRETS_SOURCE=env
 
     println!("✅ Project '{}' created successfully!", name);
     println!("   Template: {:?}", template);
-    println!("   Next: cd {} && cp .env.example .env && cargo run", name);
     Ok(())
 }
 
@@ -329,11 +478,91 @@ KRAB_SECRETS_SOURCE=env
 /// `path_deps` points the generated manifest at a local checkout of this
 /// repository instead of crates.io. It exists so the `generated-project` CI
 /// gate can build scaffolded output against the working tree.
+/// Result of the post-scaffold `git init`.
+///
+/// Every variant leaves a complete, working project — initialising a repository
+/// is a convenience, never a precondition, so nothing here is an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GitInitOutcome {
+    /// An empty repository was created. No commit is made: what to commit, and
+    /// under whose identity, is the user's call.
+    Initialised,
+    /// `--no-git` was passed.
+    Disabled,
+    /// The target already sits inside a git work tree. Nesting a repository
+    /// inside someone's checkout is worse than leaving it alone — the
+    /// `generated-project` CI gate scaffolds into `$RUNNER_TEMP`, but a
+    /// developer trying a template out will often do it inside a clone.
+    AlreadyInWorkTree,
+    /// `git` is not on PATH, or `git init` failed. Carries the reason.
+    Unavailable(String),
+}
+
+fn run_git(path: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .output()
+}
+
+/// Initialise a git repository in the freshly scaffolded `path`.
+///
+/// `krab new` writes a `.gitignore` for a repository it never created. This
+/// creates it — but only when doing so is unambiguously right.
+fn init_git_repository(path: &Path) -> GitInitOutcome {
+    // A non-zero exit is the ordinary "not a git repository" answer, so only a
+    // successful `true` counts as "already tracked".
+    match run_git(path, &["rev-parse", "--is-inside-work-tree"]) {
+        Ok(probe) => {
+            if probe.status.success() && String::from_utf8_lossy(&probe.stdout).trim() == "true" {
+                return GitInitOutcome::AlreadyInWorkTree;
+            }
+        }
+        Err(err) => return GitInitOutcome::Unavailable(format!("git is not on PATH: {err}")),
+    }
+
+    match run_git(path, &["init"]) {
+        Ok(out) if out.status.success() => GitInitOutcome::Initialised,
+        Ok(out) => {
+            let reason = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            GitInitOutcome::Unavailable(if reason.is_empty() {
+                format!("git init exited with {}", out.status)
+            } else {
+                reason
+            })
+        }
+        Err(err) => GitInitOutcome::Unavailable(format!("git is not on PATH: {err}")),
+    }
+}
+
+fn report_git_init(outcome: &GitInitOutcome, path: &Path) {
+    match outcome {
+        GitInitOutcome::Initialised => {
+            println!("   Initialised an empty git repository (no commit was created).");
+        }
+        GitInitOutcome::Disabled => {}
+        GitInitOutcome::AlreadyInWorkTree => println!(
+            "ℹ️  '{}' is already inside a git work tree, so no repository was initialised. \
+             The generated .gitignore applies to the enclosing repository.",
+            path.display()
+        ),
+        GitInitOutcome::Unavailable(reason) => println!(
+            "⚠️  Could not initialise a git repository ({reason}). The project is complete — \
+             run `git init` in it yourself once git is available."
+        ),
+    }
+}
+
 pub(super) fn generate_project_from_template(
     name: &str,
     template: &ProjectTemplate,
     path_deps: Option<&Path>,
+    no_git: bool,
 ) -> Result<()> {
+    // Checked here as well as in `write_project_from_template` so a rejection
+    // is not preceded by an optimistic "Scaffolding..." line.
+    validate_project_name(name)?;
+
     println!(
         "🦀 Scaffolding new Krab project '{}' (template: {:?})...",
         name, template
@@ -353,7 +582,251 @@ pub(super) fn generate_project_from_template(
     };
 
     let path = PathBuf::from(name);
-    write_project_from_template(&path, name, template, &deps)
+    write_project_from_template(&path, name, template, &deps)?;
+
+    let git = if no_git {
+        GitInitOutcome::Disabled
+    } else {
+        init_git_repository(&path)
+    };
+    report_git_init(&git, &path);
+
+    println!("   Next: cd {} && cp .env.example .env && cargo run", name);
+    Ok(())
+}
+
+/// The secret-sourcing preamble every generated `.env.example` carries.
+///
+/// The scaffold used to ship `KRAB_JWT_SECRET=change-me-in-production` next to
+/// `KRAB_SECRETS_SOURCE=env` — a variable no Krab code reads and no reference
+/// page documents — which taught a configuration that
+/// `KrabConfig::validate_all()` refuses to start on in `staging`/`prod`. The
+/// rules restated here are the ones `krab_core::config::check_secret_source`
+/// and `read_env_or_file` actually implement.
+const SECRET_SOURCING_PREAMBLE: &str = r#"#
+# SECRET SOURCING — read this before promoting past dev.
+#
+# Secrets reach the process through `krab_core::config::read_env_or_file()`,
+# which resolves, in order:
+#
+#   1. NAME            an inline value, as below
+#   2. NAME_FILE       a path whose file contents are the secret
+#   3. NAME_VAULT_REF  a reference an external resolver must materialise
+#
+# `cfg.validate_all()` applies a per-environment policy on top of that:
+#
+#   dev              any source; the inline values below are fine
+#   staging / prod   an inline secret is REJECTED and startup fails
+#
+# Krab has no runtime vault client, so a NAME_VAULT_REF that is still set at
+# startup is rejected outside dev as well — the reference is for a secrets
+# operator to resolve into NAME_FILE before the process starts. NAME_FILE is
+# therefore the promotion path: comment the inline line out and uncomment the
+# _FILE line beside it.
+#"#;
+
+/// Render the `.env.example` for one template.
+fn generate_env_example(name: &str, template: &ProjectTemplate) -> String {
+    let header = format!(
+        "# {name} environment template. Copy to .env for local development:\n\
+         #\n\
+         #     cp .env.example .env\n\
+         #\n\
+         # Every variable here is documented in the Krab reference under\n\
+         # docs/reference/environment.md.\n\
+         {SECRET_SOURCING_PREAMBLE}\n\
+         \n\
+         KRAB_ENVIRONMENT=dev\n\
+         KRAB_HOST=0.0.0.0\n\
+         KRAB_PORT=3000\n\
+         \n\
+         # Required in staging/prod: startup refuses wildcard CORS outside dev.\n\
+         # KRAB_CORS_ORIGINS=https://app.example.com\n"
+    );
+
+    match template {
+        ProjectTemplate::Saas => format!(
+            r#"{header}
+KRAB_AUTH_MODE=jwt
+KRAB_OIDC_ISSUER=https://auth.example.com
+KRAB_OIDC_AUDIENCE={name}
+
+# Secret. Inline is dev-only — staging/prod reject it and require the _FILE
+# form. Generate a value with: openssl rand -hex 32
+KRAB_JWT_SECRET=dev-only-change-me
+# KRAB_JWT_SECRET_FILE=/run/secrets/krab_jwt_secret
+# KRAB_JWT_SECRET_VAULT_REF=kv/data/{name}/auth#jwt_secret
+
+# Secret. Inline is dev-only — staging/prod reject it and require the _FILE
+# form.
+DATABASE_URL=postgres://localhost:5432/{name}
+# DATABASE_URL_FILE=/run/secrets/{name}_database_url
+# DATABASE_URL_VAULT_REF=kv/data/{name}/db#url
+"#
+        ),
+        _ => format!(
+            r#"{header}
+# `static` is a dev-only auth mode: startup rejects it in staging/prod. Switch
+# to KRAB_AUTH_MODE=jwt and configure a provider before promoting.
+KRAB_AUTH_MODE=static
+
+# Secret, and the one that has no promotion path: a shared bearer token must be
+# unset outside dev whatever it is sourced from, so _FILE and _VAULT_REF do not
+# make it acceptable in staging/prod.
+# KRAB_BEARER_TOKEN=
+"#
+        ),
+    }
+}
+
+/// Render `docs/render_policy.md` for templates that configure a render policy.
+///
+/// Returns `None` for every template that does not, rather than writing a
+/// placeholder: the scaffold used to create `docs/` empty for all four, which
+/// git dropped on the first clone while two reference-app READMEs went on
+/// pointing at a `docs/render_policy.md` that had never been generated.
+///
+/// The content tracks [`generate_edge_ssr_main`] and
+/// `krab_core::render_policy`; both are the source of truth for it.
+fn generate_render_policy_doc(name: &str, metadata: TemplateMetadata) -> Option<String> {
+    if !metadata.render_policy_doc {
+        return None;
+    }
+
+    Some(format!(
+        r##"# Render policy — {name}
+
+This project declares one route render policy, in `src/main.rs`:
+
+```rust
+fn home_render_policy() -> RouteRenderPolicy {{
+    RouteRenderPolicy::new(
+        "/",
+        RenderMode::Server,
+        CacheMode::Isr {{
+            revalidate_after: Duration::from_secs(30),
+        }},
+    )
+    .with_edge_capability(EdgeCapability::Eligible)
+    .with_streaming(true)
+}}
+```
+
+`RouteRenderPolicy` is `krab_core::render_policy::RouteRenderPolicy`. It is a
+declaration of intent that the runtime and your deployment target read; it does
+not by itself install caching or routing behaviour.
+
+## What this policy says
+
+| Field | Value here | Meaning |
+| --- | --- | --- |
+| `route_pattern` | `/` | The route the policy describes |
+| `render_mode` | `RenderMode::Server` | Rendered per request on the server |
+| `cache_mode` | `CacheMode::Isr {{ revalidate_after: 30s }}` | Rendered output is cached and considered stale 30 seconds after it was stored |
+| `edge_capability` | `EdgeCapability::Eligible` | The route *may* run at an edge PoP |
+| `streaming` | `true` | The route *may* stream its response |
+
+`edge_capability` and `streaming` are declarations. Nothing in this starter
+routes traffic to an edge, and `home_handler` returns a complete
+`Html<String>`, so no response is streamed yet. Both fields exist so the
+decision is recorded in code and can be validated before anything depends on
+it.
+
+## The full vocabulary
+
+Pick from these when you add policies for your own routes:
+
+| Enum | Variants |
+| --- | --- |
+| `RenderMode` | `Static`, `Server`, `ClientOnly` |
+| `CacheMode` | `None`, `Static`, `Isr {{ revalidate_after }}`, `Swr {{ stale_after }}` |
+| `EdgeCapability` | `OriginOnly`, `Eligible`, `Preferred`, `Required` |
+
+`RouteRenderPolicy::new` defaults `edge_capability` to `OriginOnly` and
+`streaming` to `false`; `with_edge_capability` and `with_streaming` override
+them.
+
+## Startup validation
+
+`main` calls `home_render_policy().validates()` before it binds the listener and
+returns an error if the combination is rejected — a contradictory policy stops
+the process instead of misleading a cache. `validates()` rejects exactly these:
+
+| Combination | Error |
+| --- | --- |
+| `Static` + `Isr` | `static_render_cannot_use_runtime_regeneration` |
+| `Static` + `streaming` | `static_render_cannot_stream` |
+| `ClientOnly` + `Isr` or `Swr` | `client_only_render_cannot_use_server_cache_revalidation` |
+| `ClientOnly` + `streaming` | `client_only_render_cannot_stream` |
+
+Everything else passes, including the `Server` + `Isr` + streaming combination
+above.
+
+## How ISR is actually served here
+
+`cache_mode` records the intent; `home_handler` implements it against
+`krab_core::isr::IsrCache`:
+
+1. `isr_cache.serve("/")` is consulted first. A fresh entry is returned as-is.
+2. A stale entry is returned immediately and re-rendered into the cache behind
+   the response — stale-while-revalidate, so no request pays the render cost.
+3. A miss renders, stores the result under
+   `IsrPolicy::revalidate(HOME_REVALIDATE)`, and returns it.
+
+A cache error degrades to a plain render; it never fails the request.
+`HOME_REVALIDATE` and the `revalidate_after` in the policy are both 30 seconds
+and are meant to stay in step — the policy is what a reader and any tooling
+consult, the constant is what the cache enforces.
+
+## Changing it
+
+- Editing the policy alone changes what is declared, not what happens. Change
+  `HOME_REVALIDATE` with `revalidate_after`, and the handler with `render_mode`.
+- Adding a route: give it its own `RouteRenderPolicy`, call `validates()` on it
+  at startup next to this one, and fail startup on the error.
+- `CacheMode::Swr` and `CacheMode::Static` report `true` from
+  `uses_distributed_cache()`, meaning they are meant to be backed by a shared
+  store rather than the in-process `IsrCache` this starter uses.
+"##
+    ))
+}
+
+/// The `#[cfg(test)]` module appended to every generated `src/main.rs`.
+///
+/// The CI workflow `krab new` writes runs `cargo test`, and no test was ever
+/// scaffolded — so the step passed by running zero tests while looking like a
+/// gate. `/health` is the one assertion the scaffold can make that stays true
+/// for any project built on it: the generated Kubernetes manifest polls it as
+/// the liveness probe, so a handler that stops returning `status: ok` breaks
+/// the deployment this repository ships.
+///
+/// It is a unit test inside the binary rather than a `tests/` integration test
+/// because a binary crate exposes no library target — an integration test could
+/// not reach the handler without restructuring the scaffold into lib + bin.
+/// `#[tokio::test]` needs no new dependency: `tokio` is already a dependency
+/// with `features = ["full"]`.
+fn generate_health_smoke_test(handler: &str, service: Option<&str>) -> String {
+    let service_assertion = service
+        .map(|name| format!("        assert_eq!(body[\"service\"], \"{name}\");\n"))
+        .unwrap_or_default();
+
+    format!(
+        r#"
+#[cfg(test)]
+mod tests {{
+    use super::*;
+
+    /// `/health` is the generated Kubernetes liveness probe's target. Keep this
+    /// in step with `{handler}` if you change the response body.
+    #[tokio::test]
+    async fn health_endpoint_reports_ok() {{
+        let Json(body) = {handler}().await;
+
+{service_assertion}        assert_eq!(body["status"], "ok");
+    }}
+}}
+"#
+    )
 }
 
 /// Generate the default minimal service entrypoint used by `krab new`.
@@ -365,6 +838,10 @@ use krab_core::config::KrabConfig;
 use krab_core::telemetry::init_tracing;
 use serde_json::json;
 use std::net::SocketAddr;
+
+// `krab gen` inserts module declarations (for example `mod routes;`) directly
+// below this marker — leave the line in place.
+// krab:modules
 
 // Named handlers rather than inline closures: the closure form put the whole
 // route on one line, whose width depends on the project name, so `cargo fmt
@@ -393,13 +870,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {{
         .route("/", get(index))
         .route("/health", get(health))
         .route("/ready", get(ready));
+    // krab:routes
+    // `krab gen route <name>` registers generated routers at the marker above,
+    // as `let app = app.merge(...);` statements. The marker sits on the router
+    // that is handed to `axum::serve`, and nothing is layered onto it
+    // afterwards, so generated routes are treated exactly like the ones above.
 
     tracing::info!(service = "{name}", %addr, "listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }}
-"#
+{tests}"#,
+        tests = generate_health_smoke_test("health", None)
     )
 }
 
@@ -413,6 +896,10 @@ use krab_core::http::{{apply_common_http_layers, HasRuntimeState, RuntimeState}}
 use krab_core::telemetry::init_tracing;
 use serde_json::json;
 use std::net::SocketAddr;
+
+// `krab gen` inserts module declarations (for example `mod routes;`) directly
+// below this marker — leave the line in place.
+// krab:modules
 
 #[derive(Clone)]
 struct AppState {{
@@ -452,6 +939,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {{
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))
         .route("/api/v1/tenants", get(tenants_handler));
+    // krab:routes
+    // `krab gen route <name>` registers generated routers at the marker above,
+    // as `let app = app.merge(...);` statements. The marker sits here, while
+    // `app` is still `Router<AppState>`, so generated routes receive the same
+    // common HTTP layers and state as the routes above. Merging after
+    // `apply_common_http_layers` would silently exempt them from every one.
 
     let app = apply_common_http_layers(app, state.clone()).with_state(state);
 
@@ -460,7 +953,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {{
     axum::serve(listener, app).await?;
     Ok(())
 }}
-"#
+{tests}"#,
+        tests = generate_health_smoke_test("health_handler", Some(name))
     )
 }
 
@@ -477,6 +971,10 @@ use krab_core::telemetry::init_tracing;
 use serde_json::json;
 use std::net::SocketAddr;
 use std::time::Duration;
+
+// `krab gen` inserts module declarations (for example `mod routes;`) directly
+// below this marker — leave the line in place.
+// krab:modules
 
 #[derive(Clone)]
 struct AppState {{
@@ -565,18 +1063,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {{
         isr_cache: IsrCache::new(),
     }};
 
-    let app = Router::new()
+    let app: Router<AppState> = Router::new()
         .route("/", get(home_handler))
         .route("/health", get(health_handler))
-        .route("/ready", get(ready_handler))
-        .with_state(state);
+        .route("/ready", get(ready_handler));
+    // krab:routes
+    // `krab gen route <name>` registers generated routers at the marker above,
+    // as `let app = app.merge(...);` statements. The marker sits here, before
+    // `with_state`, so generated routes are given the same state as the routes
+    // above rather than being merged into an already-finalised router.
+
+    let app = app.with_state(state);
 
     tracing::info!(service = "{name}", %addr, "listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }}
-"###
+{tests}"###,
+        tests = generate_health_smoke_test("health_handler", Some(name))
     )
 }
 
@@ -594,6 +1099,10 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio_stream::wrappers::IntervalStream;
+
+// `krab gen` inserts module declarations (for example `mod routes;`) directly
+// below this marker — leave the line in place.
+// krab:modules
 
 async fn health_handler() -> Json<serde_json::Value> {{
     Json(json!({{ "service": "{name}", "status": "ok" }}))
@@ -655,31 +1164,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {{
         .route("/api/dashboard", get(dashboard_handler))
         .route("/api/events", get(events_sse))
         .route("/api/ws", get(ws_handler));
+    // krab:routes
+    // `krab gen route <name>` registers generated routers at the marker above,
+    // as `let app = app.merge(...);` statements. The marker sits on the router
+    // that is handed to `axum::serve`, and nothing is layered onto it
+    // afterwards, so generated routes are treated exactly like the ones above.
 
     tracing::info!(service = "{name}", %addr, "listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }}
-"#
+{tests}"#,
+        tests = generate_health_smoke_test("health_handler", Some(name))
     )
 }
 
-fn generate_ci_workflow(name: &str, template: &ProjectTemplate) -> String {
-    let extra_steps = match template {
-        ProjectTemplate::Saas => format!(
-            r#"
-      - name: Run database migration checks
-        run: cargo test --package {name} -- db_
-        env:
-          DATABASE_URL: postgres://localhost:5432/{name}_test
-"#
-        ),
-        _ => String::new(),
-    };
-
+/// Render the CI workflow a generated project ships.
+///
+/// This used to take the template as well, to append a `saas`-only step:
+///
+/// ```yaml
+/// - name: Run database migration checks
+///   run: cargo test --package <name> -- db_
+///   env:
+///     DATABASE_URL: postgres://localhost:5432/<name>_test
+/// ```
+///
+/// It asserted nothing. The filter matched no test — the scaffold has no `db_`
+/// test and no migrations to test — so it exited 0 by running zero tests, and
+/// the `DATABASE_URL` it exported pointed at a Postgres the workflow never
+/// started, so even a real test would not have connected. Making it honest
+/// would mean scaffolding a migration, a `db_`-prefixed test, and a service
+/// container, which would leave a starter whose `cargo test` fails on any
+/// machine without a database. It is deleted instead; add it back alongside
+/// your first migration.
+fn generate_ci_workflow(name: &str) -> String {
     format!(
-        r#"name: CI
+        r#"name: {name} CI
 
 on:
   push:
@@ -717,12 +1239,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # `src/main.rs` carries a smoke test over the `/health` handler the
+      # Kubernetes liveness probe in deploy/kubernetes.yaml polls.
       - name: Run tests
         run: cargo test --all-features
         env:
           KRAB_ENVIRONMENT: dev
           KRAB_AUTH_MODE: static
-{extra_steps}
+
       - name: Dependency policy gate
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
@@ -819,7 +1343,15 @@ spec:
 fn generate_dockerfile(name: &str) -> String {
     format!(
         r#"# Build stage
-FROM rust:1.77-slim-bookworm AS builder
+#
+# The `1` tag is the latest stable Rust, deliberately. The manifest floats its
+# dependencies (`axum = "0.8"`, `tokio = "1.0"`, ...) to the newest compatible
+# release, so a pinned old toolchain breaks this build the first time any of
+# them raises its MSRV — with an error inside a dependency that looks nothing
+# like the cause. Cargo.toml declares `rust-version = "{msrv}"` as the floor;
+# pin this image to a specific tag at or above it once you commit a Cargo.lock
+# and want byte-reproducible builds.
+FROM rust:1-slim-bookworm AS builder
 WORKDIR /app
 # No Cargo.lock COPY: generated projects do not ship one until the first
 # local build, and a COPY of a missing file fails the whole build. Commit
@@ -840,7 +1372,8 @@ ENV KRAB_PORT=3000
 EXPOSE 3000
 
 CMD ["/app/{name}"]
-"#
+"#,
+        msrv = GENERATED_PROJECT_MSRV
     )
 }
 
@@ -862,7 +1395,9 @@ hmr_signal_path = "dist/.hmr_signal"
 mod tests {
     use super::{
         generate_ci_workflow, generate_deploy_manifest, generate_edge_ssr_main,
-        write_project_from_template, DependencySource, FRAMEWORK_VERSION,
+        init_git_repository, suggested_project_slug, validate_project_name,
+        write_project_from_template, DependencySource, GitInitOutcome, FRAMEWORK_VERSION,
+        GENERATED_PROJECT_MSRV,
     };
     use crate::ProjectTemplate;
     use anyhow::Result;
@@ -885,7 +1420,32 @@ mod tests {
         Ok((temp_dir, project_dir))
     }
 
-    fn assert_common_scaffold(project_dir: &Path, name: &str) -> Result<()> {
+    /// Fail if any directory under `dir` (including `dir`) has no entries.
+    ///
+    /// Git cannot represent an empty directory, so one that survives generation
+    /// is a directory the first `git clone` of the scaffolded project will not
+    /// have.
+    fn assert_no_empty_directories(dir: &Path) -> Result<()> {
+        let mut entries = fs::read_dir(dir)?.peekable();
+        assert!(
+            entries.peek().is_some(),
+            "{} is empty; git will not preserve it",
+            dir.display()
+        );
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                assert_no_empty_directories(&entry.path())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn assert_common_scaffold(
+        project_dir: &Path,
+        name: &str,
+        template: &ProjectTemplate,
+    ) -> Result<()> {
         for relative in [
             "Cargo.toml",
             "src/main.rs",
@@ -896,12 +1456,34 @@ mod tests {
             "Dockerfile",
             "README.md",
             ".gitignore",
+            // The Dockerfile does `COPY public/ public/`. Git does not track
+            // empty directories, so without this file the directory is gone
+            // after a clone and the container build fails.
+            "public/.gitkeep",
         ] {
             assert!(
                 project_dir.join(relative).exists(),
                 "expected {relative} to be generated"
             );
         }
+
+        // Directories the scaffolder never populated used to be created anyway;
+        // they disappeared on clone and misled users into thinking they were
+        // wired up. `src/routes/` is created on demand by `krab gen route`.
+        // `docs/` is created only where a document is written into it — for
+        // `edge-ssr`, which has a render policy worth documenting.
+        let mut never_populated = vec!["src/routes", "src/api"];
+        if *template != ProjectTemplate::EdgeSsr {
+            never_populated.push("docs");
+        }
+        for relative in never_populated {
+            assert!(
+                !project_dir.join(relative).exists(),
+                "{relative} is created but never populated; git will not preserve it"
+            );
+        }
+
+        assert_no_empty_directories(project_dir)?;
 
         let project_toml = fs::read_to_string(project_dir.join("krab.toml"))?;
         assert!(project_toml.contains(&format!("frontend_bin = \"{name}\"")));
@@ -1105,11 +1687,55 @@ mod tests {
 
     #[test]
     fn generated_ci_uses_pinned_dependency_gate_action() {
-        let workflow = generate_ci_workflow("demo", &ProjectTemplate::Default);
+        let workflow = generate_ci_workflow("demo");
 
         assert!(workflow.contains("EmbarkStudios/cargo-deny-action@v2"));
         assert!(!workflow.contains("cargo install cargo-deny"));
         assert!(workflow.contains("cargo fmt --all --check"));
+        assert!(workflow.contains("cargo test --all-features"));
+    }
+
+    /// The `saas` workflow carried a step that asserted nothing: `cargo test
+    /// --package <name> -- db_` matched no test (none is scaffolded, and there
+    /// are no migrations), so it exited 0 having run zero tests, and its
+    /// `DATABASE_URL` pointed at a Postgres no step ever started. A step that
+    /// cannot fail is worse than no step — it reads as a gate.
+    #[test]
+    fn generated_ci_has_no_step_that_cannot_fail() {
+        for name in ["demo", "demo-saas"] {
+            let workflow = generate_ci_workflow(name);
+
+            assert!(
+                !workflow.contains("-- db_"),
+                "{name}: the db_ test filter matches nothing the scaffold generates"
+            );
+            assert!(
+                !workflow.contains("DATABASE_URL"),
+                "{name}: DATABASE_URL is exported for a database no step starts"
+            );
+            assert!(
+                !workflow.contains("services:"),
+                "{name}: a service container is declared but nothing uses it"
+            );
+        }
+    }
+
+    /// Every step must be reachable from the template-independent workflow now
+    /// that `generate_ci_workflow` no longer varies by template.
+    #[test]
+    fn generated_ci_is_identical_for_every_template() -> Result<()> {
+        let mut rendered: Vec<String> = Vec::new();
+        for template in ALL_TEMPLATES {
+            let (_temp, project_dir) = generate_fixture("demo-ci", &template)?;
+            rendered.push(fs::read_to_string(
+                project_dir.join(".github/workflows/ci.yaml"),
+            )?);
+        }
+        assert!(
+            rendered.windows(2).all(|pair| pair[0] == pair[1]),
+            "the generated workflow still differs per template"
+        );
+        Ok(())
     }
 
     #[test]
@@ -1138,7 +1764,7 @@ mod tests {
     #[test]
     fn default_template_smoke_generates_expected_files() -> Result<()> {
         let (_temp_dir, project_dir) = generate_fixture("demo-default", &ProjectTemplate::Default)?;
-        assert_common_scaffold(&project_dir, "demo-default")?;
+        assert_common_scaffold(&project_dir, "demo-default", &ProjectTemplate::Default)?;
 
         let main_rs = fs::read_to_string(project_dir.join("src/main.rs"))?;
         assert!(main_rs.contains(r#".route("/", get"#));
@@ -1150,7 +1776,7 @@ mod tests {
     #[test]
     fn saas_template_smoke_marks_scope_as_scaffold() -> Result<()> {
         let (_temp_dir, project_dir) = generate_fixture("demo-saas", &ProjectTemplate::Saas)?;
-        assert_common_scaffold(&project_dir, "demo-saas")?;
+        assert_common_scaffold(&project_dir, "demo-saas", &ProjectTemplate::Saas)?;
 
         let main_rs = fs::read_to_string(project_dir.join("src/main.rs"))?;
         assert!(main_rs.contains("apply_common_http_layers"));
@@ -1160,15 +1786,18 @@ mod tests {
         assert!(readme.contains("SaaS service skeleton"));
         assert!(readme.contains("does not include a completed auth flow"));
 
-        let workflow = fs::read_to_string(project_dir.join(".github/workflows/ci.yaml"))?;
-        assert!(workflow.contains("DATABASE_URL"));
+        // DATABASE_URL belongs in the environment template, where it configures
+        // something — not in the CI workflow, where it used to point at a
+        // database no step started. See `generated_ci_has_no_step_that_cannot_fail`.
+        let env_example = fs::read_to_string(project_dir.join(".env.example"))?;
+        assert!(env_example.contains("DATABASE_URL=postgres://"));
         Ok(())
     }
 
     #[test]
     fn edge_ssr_template_smoke_calls_out_policy_scope() -> Result<()> {
         let (_temp_dir, project_dir) = generate_fixture("demo-edge", &ProjectTemplate::EdgeSsr)?;
-        assert_common_scaffold(&project_dir, "demo-edge")?;
+        assert_common_scaffold(&project_dir, "demo-edge", &ProjectTemplate::EdgeSsr)?;
 
         let main_rs = fs::read_to_string(project_dir.join("src/main.rs"))?;
         assert!(main_rs.contains("RouteRenderPolicy"));
@@ -1194,12 +1823,668 @@ mod tests {
     fn event_stream_template_smoke_generates_stream_endpoints() -> Result<()> {
         let (_temp_dir, project_dir) =
             generate_fixture("demo-stream", &ProjectTemplate::EventStream)?;
-        assert_common_scaffold(&project_dir, "demo-stream")?;
+        assert_common_scaffold(&project_dir, "demo-stream", &ProjectTemplate::EventStream)?;
 
         let main_rs = fs::read_to_string(project_dir.join("src/main.rs"))?;
         assert!(main_rs.contains("/api/events"));
         assert!(main_rs.contains("/api/ws"));
         assert!(main_rs.contains("tokio_stream"));
+        Ok(())
+    }
+
+    /// `krab gen route foo` writes `src/routes/foo.rs`, which is dead weight
+    /// unless something declares the module and merges the router. `krab gen`
+    /// finds its insertion points by these two marker lines, so every template
+    /// has to emit both, exactly, once.
+    #[test]
+    fn every_template_emits_module_and_route_markers() -> Result<()> {
+        for template in ALL_TEMPLATES {
+            let (_temp, project_dir) = generate_fixture("demo-markers", &template)?;
+            let main_rs = fs::read_to_string(project_dir.join("src/main.rs"))?;
+
+            let module_marker = main_rs
+                .lines()
+                .filter(|line| *line == "// krab:modules")
+                .count();
+            assert_eq!(
+                module_marker, 1,
+                "{template:?}: expected exactly one `// krab:modules` line, found \
+                 {module_marker}\n{main_rs}"
+            );
+
+            let route_marker = main_rs
+                .lines()
+                .filter(|line| *line == "    // krab:routes")
+                .count();
+            assert_eq!(
+                route_marker, 1,
+                "{template:?}: expected exactly one `    // krab:routes` line (four-space \
+                 indent, inside `main`), found {route_marker}\n{main_rs}"
+            );
+
+            let lines: Vec<&str> = main_rs.lines().collect();
+            let module_at = lines
+                .iter()
+                .position(|line| *line == "// krab:modules")
+                .expect("module marker located above");
+            let route_at = lines
+                .iter()
+                .position(|line| *line == "    // krab:routes")
+                .expect("route marker located above");
+
+            // The module marker sits at item position: after the `use` block,
+            // before the first item.
+            let last_use = lines
+                .iter()
+                .rposition(|line| line.starts_with("use "))
+                .unwrap_or_else(|| panic!("{template:?}: generated main.rs has no `use` block"));
+            assert!(
+                module_at > last_use,
+                "{template:?}: `// krab:modules` at line {module_at} precedes the end of the \
+                 use block at line {last_use}"
+            );
+            assert!(
+                module_at < route_at,
+                "{template:?}: markers are out of order"
+            );
+
+            // The route marker sits where `app` is a fully built router, so an
+            // inserted `let app = app.merge(...);` type-checks.
+            let main_fn = lines
+                .iter()
+                .position(|line| line.starts_with("async fn main("))
+                .unwrap_or_else(|| {
+                    panic!("{template:?}: generated main.rs has no `async fn main`")
+                });
+            let serve_at = lines
+                .iter()
+                .position(|line| line.contains("axum::serve(listener, app)"))
+                .unwrap_or_else(|| panic!("{template:?}: generated main.rs never serves `app`"));
+            assert!(
+                route_at > main_fn && route_at < serve_at,
+                "{template:?}: `    // krab:routes` at line {route_at} is not between \
+                 `async fn main` ({main_fn}) and `axum::serve` ({serve_at})"
+            );
+            assert!(
+                lines[route_at - 1].trim_end().ends_with(';'),
+                "{template:?}: `    // krab:routes` must follow a completed statement, but the \
+                 preceding line is {:?}",
+                lines[route_at - 1]
+            );
+        }
+        Ok(())
+    }
+
+    /// `public/` is the one empty directory the scaffold genuinely needs: the
+    /// generated Dockerfile copies it.
+    #[test]
+    fn public_directory_is_pinned_for_the_dockerfile_copy() -> Result<()> {
+        let (_temp, project_dir) = generate_fixture("demo-public", &ProjectTemplate::Default)?;
+
+        let gitkeep = fs::read_to_string(project_dir.join("public/.gitkeep"))?;
+        assert!(
+            !gitkeep.trim().is_empty(),
+            "public/.gitkeep is empty; it must explain why it exists"
+        );
+        assert!(
+            gitkeep.contains("COPY public/ public/"),
+            "public/.gitkeep does not name the Dockerfile step it protects: {gitkeep:?}"
+        );
+
+        let dockerfile = fs::read_to_string(project_dir.join("Dockerfile"))?;
+        assert!(dockerfile.contains("COPY public/ public/"));
+        Ok(())
+    }
+
+    /// The `saas` template applies `apply_common_http_layers` — rate limiting,
+    /// auth, tracing, the lot. The route marker sat *after* that line, so every
+    /// route added by `krab gen route` merged into an already-layered router
+    /// and silently bypassed all of it, while the hand-written routes beside it
+    /// kept them. Nothing failed; the routes were just unprotected.
+    #[test]
+    fn saas_routes_marker_precedes_the_common_http_layers() -> Result<()> {
+        let (_temp, project_dir) = generate_fixture("demo-layers", &ProjectTemplate::Saas)?;
+        let main_rs = fs::read_to_string(project_dir.join("src/main.rs"))?;
+        let lines: Vec<&str> = main_rs.lines().collect();
+
+        let marker_at = lines
+            .iter()
+            .position(|line| *line == "    // krab:routes")
+            .expect("the route marker is generated");
+        let layers_at = lines
+            .iter()
+            .position(|line| line.contains("apply_common_http_layers("))
+            .expect("the saas template applies the common layers");
+
+        assert!(
+            marker_at < layers_at,
+            "routes merged at line {marker_at} would bypass the layers applied at \
+             line {layers_at}:\n{main_rs}"
+        );
+        // And the merge has to happen while `app` still carries the state type,
+        // or `Router::merge` will not accept the generated `router::<S>()`.
+        let typed_at = lines
+            .iter()
+            .position(|line| line.contains("let app: Router<AppState>"))
+            .expect("the router binding is explicitly typed");
+        assert!(typed_at < marker_at, "{main_rs}");
+        Ok(())
+    }
+
+    /// Same reasoning for `edge-ssr`: `with_state` finalises the router, so a
+    /// merge after it lands on a `Router<()>` that can never see `AppState`.
+    #[test]
+    fn edge_ssr_routes_marker_precedes_with_state() -> Result<()> {
+        let (_temp, project_dir) = generate_fixture("demo-state", &ProjectTemplate::EdgeSsr)?;
+        let main_rs = fs::read_to_string(project_dir.join("src/main.rs"))?;
+        let lines: Vec<&str> = main_rs.lines().collect();
+
+        let marker_at = lines
+            .iter()
+            .position(|line| *line == "    // krab:routes")
+            .expect("the route marker is generated");
+        let with_state_at = lines
+            .iter()
+            .position(|line| line.contains("let app = app.with_state(state);"))
+            .expect("edge-ssr installs its state in a separate statement");
+
+        assert!(marker_at < with_state_at, "{main_rs}");
+        Ok(())
+    }
+
+    /// The `default` and `event-stream` templates layer nothing onto `app`, so
+    /// the marker only has to sit on the router `axum::serve` is handed —
+    /// covered by `every_template_emits_module_and_route_markers`. What must
+    /// hold everywhere is that nothing reassigns `app` between the marker and
+    /// `axum::serve` without the merge having happened first.
+    #[test]
+    fn nothing_rebinds_app_between_the_marker_and_serve_except_declared_finalisers() -> Result<()> {
+        // Statements that are allowed to follow the marker, because merged
+        // routes go through them exactly as the built-in routes do.
+        const FINALISERS: &[&str] = &["apply_common_http_layers(", "app.with_state("];
+
+        for template in ALL_TEMPLATES {
+            let (_temp, project_dir) = generate_fixture("demo-tail", &template)?;
+            let main_rs = fs::read_to_string(project_dir.join("src/main.rs"))?;
+            let lines: Vec<&str> = main_rs.lines().collect();
+
+            let marker_at = lines
+                .iter()
+                .position(|line| *line == "    // krab:routes")
+                .expect("the route marker is generated");
+            let serve_at = lines
+                .iter()
+                .position(|line| line.contains("axum::serve(listener, app)"))
+                .expect("app is served");
+
+            for line in &lines[marker_at + 1..serve_at] {
+                if !line.trim_start().starts_with("let app") {
+                    continue;
+                }
+                assert!(
+                    FINALISERS.iter().any(|f| line.contains(f)),
+                    "{template:?}: `{}` rebinds `app` after the route marker but is not a \
+                     declared finaliser, so merged routes are treated differently from the \
+                     built-in ones",
+                    line.trim()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The generated CI ran `cargo test` against a project with no tests: the
+    /// step passed by running zero of them.
+    #[test]
+    fn every_template_scaffolds_a_health_smoke_test() -> Result<()> {
+        for (template, handler) in [
+            (ProjectTemplate::Default, "health"),
+            (ProjectTemplate::Saas, "health_handler"),
+            (ProjectTemplate::EdgeSsr, "health_handler"),
+            (ProjectTemplate::EventStream, "health_handler"),
+        ] {
+            let (_temp, project_dir) = generate_fixture("demo-smoke", &template)?;
+            let main_rs = fs::read_to_string(project_dir.join("src/main.rs"))?;
+
+            assert!(main_rs.contains("#[cfg(test)]"), "{template:?}:\n{main_rs}");
+            assert!(
+                main_rs.contains("async fn health_endpoint_reports_ok()"),
+                "{template:?}:\n{main_rs}"
+            );
+            // It must exercise the handler the route table actually registers.
+            assert!(
+                main_rs.contains(&format!("let Json(body) = {handler}().await;")),
+                "{template:?}: the smoke test does not call `{handler}`:\n{main_rs}"
+            );
+            assert!(
+                main_rs.contains(&format!(r#".route("/health", get({handler}))"#)),
+                "{template:?}: `{handler}` is not the handler mounted on /health:\n{main_rs}"
+            );
+            // No new dependency: tokio is already declared with `features = ["full"]`.
+            let deps = generated_dependencies(&project_dir);
+            assert!(
+                deps.contains_key("tokio"),
+                "{template:?}: the smoke test needs #[tokio::test]"
+            );
+        }
+        Ok(())
+    }
+
+    /// The scaffold shipped `KRAB_JWT_SECRET=change-me-in-production` beside
+    /// `KRAB_SECRETS_SOURCE=env` — a variable no Krab code reads and no
+    /// reference page documents — teaching a configuration that
+    /// `KrabConfig::validate_all()` refuses to start on in staging/prod.
+    #[test]
+    fn env_example_teaches_a_promotable_secret_configuration() -> Result<()> {
+        for template in ALL_TEMPLATES {
+            let (_temp, project_dir) = generate_fixture("demo-env", &template)?;
+            let env_example = fs::read_to_string(project_dir.join(".env.example"))?;
+
+            assert!(
+                !env_example.contains("KRAB_SECRETS_SOURCE"),
+                "{template:?}: KRAB_SECRETS_SOURCE is read by nothing in krab_core and is \
+                 documented nowhere:\n{env_example}"
+            );
+            assert!(
+                !env_example.contains("change-me-in-production"),
+                "{template:?}: the inline value advertises itself as the production value, \
+                 but staging/prod reject inline secrets outright:\n{env_example}"
+            );
+            // The policy has to be stated, not implied.
+            assert!(
+                env_example.contains("staging / prod   an inline secret is REJECTED"),
+                "{template:?}: the secret-sourcing policy is not stated:\n{env_example}"
+            );
+            assert!(
+                env_example.contains("KRAB_ENVIRONMENT=dev"),
+                "{template:?}: the inline values are only usable under dev:\n{env_example}"
+            );
+        }
+
+        // Every secret the saas template sets inline must carry its promotion
+        // path directly beside it.
+        let (_temp, project_dir) = generate_fixture("demo-secrets", &ProjectTemplate::Saas)?;
+        let env_example = fs::read_to_string(project_dir.join(".env.example"))?;
+        for secret in ["KRAB_JWT_SECRET", "DATABASE_URL"] {
+            assert!(
+                env_example.contains(&format!("{secret}=")),
+                "{secret} is not set inline for dev:\n{env_example}"
+            );
+            assert!(
+                env_example.contains(&format!("# {secret}_FILE=")),
+                "{secret} has no commented _FILE alternative:\n{env_example}"
+            );
+            assert!(
+                env_example.contains(&format!("# {secret}_VAULT_REF=")),
+                "{secret} has no commented _VAULT_REF alternative:\n{env_example}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Every variable the scaffold emits has to exist in the framework's own
+    /// reference page — CLAUDE.md convention 4. Read from the file so adding an
+    /// undocumented knob to a template fails here.
+    #[test]
+    fn every_env_example_variable_is_documented() -> Result<()> {
+        let reference = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../docs/reference/environment.md")
+            .canonicalize()
+            .expect("docs/reference/environment.md not found");
+        let documented = fs::read_to_string(reference)?;
+
+        for template in ALL_TEMPLATES {
+            let (_temp, project_dir) = generate_fixture("demo-doc", &template)?;
+            let env_example = fs::read_to_string(project_dir.join(".env.example"))?;
+
+            for line in env_example.lines() {
+                // Assignments, including the commented-out alternatives.
+                let candidate = line.trim().trim_start_matches("# ").trim();
+                let Some((var, _)) = candidate.split_once('=') else {
+                    continue;
+                };
+                if var.is_empty()
+                    || !var
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                {
+                    continue;
+                }
+                // `_FILE` / `_VAULT_REF` are documented as a suffix convention
+                // that applies to every variable marked **secret**.
+                let base = var
+                    .strip_suffix("_VAULT_REF")
+                    .or_else(|| var.strip_suffix("_FILE"))
+                    .unwrap_or(var);
+                assert!(
+                    documented.contains(base),
+                    "{template:?}: .env.example sets {var}, which \
+                     docs/reference/environment.md does not document"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The Dockerfile pinned `rust:1.77-slim-bookworm` while the manifest
+    /// floated every dependency to latest. `axum 0.8` already declares
+    /// `rust-version = "1.78"`, so the container build broke on a toolchain
+    /// error that named none of that.
+    #[test]
+    fn dockerfile_toolchain_is_not_older_than_the_declared_msrv() -> Result<()> {
+        for template in ALL_TEMPLATES {
+            let (_temp, project_dir) = generate_fixture("demo-msrv", &template)?;
+
+            let dockerfile = fs::read_to_string(project_dir.join("Dockerfile"))?;
+            let from = dockerfile
+                .lines()
+                .find(|line| line.starts_with("FROM rust:"))
+                .unwrap_or_else(|| panic!("{template:?}: no rust builder stage:\n{dockerfile}"));
+            assert!(
+                !from.contains("rust:1.7"),
+                "{template:?}: {from:?} pins a toolchain older than the floating \
+                 dependency set needs"
+            );
+            assert!(
+                from.starts_with("FROM rust:1-"),
+                "{template:?}: {from:?} should track the latest stable 1.x"
+            );
+
+            // And the manifest states the floor, so a mismatch is Cargo's own
+            // error naming the package, not a type error inside a dependency.
+            let manifest: toml::Value =
+                toml::from_str(&fs::read_to_string(project_dir.join("Cargo.toml"))?)?;
+            assert_eq!(
+                manifest
+                    .get("package")
+                    .and_then(|p| p.get("rust-version"))
+                    .and_then(|v| v.as_str()),
+                Some(GENERATED_PROJECT_MSRV),
+                "{template:?}: the generated manifest declares no MSRV"
+            );
+        }
+        Ok(())
+    }
+
+    /// Two reference-app READMEs told users to read `docs/render_policy.md` in
+    /// their scaffolded project. It had never been generated — `krab new`
+    /// created `docs/` empty, and once the empty directory was removed the
+    /// reference dangled permanently.
+    #[test]
+    fn edge_ssr_documents_the_render_policy_it_configures() -> Result<()> {
+        let (_temp, project_dir) = generate_fixture("demo-policy", &ProjectTemplate::EdgeSsr)?;
+        let doc = fs::read_to_string(project_dir.join("docs/render_policy.md"))?;
+        let main_rs = fs::read_to_string(project_dir.join("src/main.rs"))?;
+
+        // Everything the document claims the template configures, it configures.
+        for claim in [
+            "RenderMode::Server",
+            "CacheMode::Isr",
+            "EdgeCapability::Eligible",
+            "with_streaming(true)",
+            "home_render_policy",
+            "IsrPolicy::revalidate",
+        ] {
+            assert!(doc.contains(claim), "the document omits {claim}:\n{doc}");
+            assert!(
+                main_rs.contains(claim),
+                "the document names {claim}, which the template does not use"
+            );
+        }
+        // The startup validation table must match `RouteRenderPolicy::validates`.
+        for error in [
+            "static_render_cannot_use_runtime_regeneration",
+            "static_render_cannot_stream",
+            "client_only_render_cannot_use_server_cache_revalidation",
+            "client_only_render_cannot_stream",
+        ] {
+            assert!(doc.contains(error), "the document omits {error}:\n{doc}");
+        }
+        // The edge_rendered reference README sends readers here to choose
+        // between the render and cache modes, so all of them must be listed.
+        for variant in ["`None`", "`Swr {{ stale_after }}`", "`OriginOnly`"] {
+            assert!(
+                doc.contains(variant.replace("{{", "{").replace("}}", "}").as_str()),
+                "the document omits {variant}:\n{doc}"
+            );
+        }
+
+        // And it is discoverable.
+        let readme = fs::read_to_string(project_dir.join("README.md"))?;
+        assert!(readme.contains("docs/render_policy.md"), "{readme}");
+        Ok(())
+    }
+
+    /// Only `edge-ssr` configures a render policy, so only `edge-ssr` gets the
+    /// document — recreating an empty `docs/` for the rest would put back the
+    /// directory git drops on clone.
+    #[test]
+    fn other_templates_get_no_docs_directory() -> Result<()> {
+        for template in [
+            ProjectTemplate::Default,
+            ProjectTemplate::Saas,
+            ProjectTemplate::EventStream,
+        ] {
+            let (_temp, project_dir) = generate_fixture("demo-nodocs", &template)?;
+            assert!(
+                !project_dir.join("docs").exists(),
+                "{template:?} has no render policy to document"
+            );
+            let readme = fs::read_to_string(project_dir.join("README.md"))?;
+            assert!(
+                !readme.contains("docs/render_policy.md"),
+                "{template:?}: the README points at a file this template does not write"
+            );
+        }
+        Ok(())
+    }
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    /// `krab new` wrote a `.gitignore` for a repository it never created.
+    #[test]
+    fn git_init_creates_a_repository_without_committing() -> Result<()> {
+        if !git_available() {
+            eprintln!("git is not on PATH; skipping the git init gate");
+            return Ok(());
+        }
+        let temp = TempDir::new()?;
+        let project_dir = temp.path().join("demo-git");
+        fs::create_dir(&project_dir)?;
+
+        let outcome = init_git_repository(&project_dir);
+        if outcome == GitInitOutcome::AlreadyInWorkTree {
+            eprintln!("the temp directory is inside a git work tree; skipping");
+            return Ok(());
+        }
+
+        assert_eq!(outcome, GitInitOutcome::Initialised);
+        assert!(
+            project_dir.join(".git").exists(),
+            "no repository was created"
+        );
+
+        // Initialised, not committed: what to commit and under whose identity
+        // is the user's decision, and a commit needs a configured identity that
+        // a fresh machine may not have.
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "HEAD"])
+            .current_dir(&project_dir)
+            .output()?;
+        assert!(
+            !head.status.success(),
+            "a commit was created: {}",
+            String::from_utf8_lossy(&head.stdout)
+        );
+        Ok(())
+    }
+
+    /// Scaffolding inside an existing checkout must not nest a repository —
+    /// the `generated-project` gate uses `$RUNNER_TEMP`, but a developer
+    /// trying a template out will often do it inside a clone.
+    #[test]
+    fn git_init_refuses_to_nest_inside_an_existing_work_tree() -> Result<()> {
+        if !git_available() {
+            eprintln!("git is not on PATH; skipping the git init gate");
+            return Ok(());
+        }
+        let temp = TempDir::new()?;
+        let outer = temp.path().join("outer");
+        fs::create_dir(&outer)?;
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .current_dir(&outer)
+            .output()?;
+        assert!(init.status.success(), "could not set up the fixture");
+
+        let nested = outer.join("demo-nested");
+        fs::create_dir(&nested)?;
+
+        assert_eq!(
+            init_git_repository(&nested),
+            GitInitOutcome::AlreadyInWorkTree
+        );
+        assert!(
+            !nested.join(".git").exists(),
+            "a repository was nested inside an existing checkout"
+        );
+        Ok(())
+    }
+
+    /// A missing or failing `git` must never fail the scaffold.
+    #[test]
+    fn a_git_failure_is_reported_but_never_fatal() -> Result<()> {
+        let temp = TempDir::new()?;
+        // A path that does not exist makes `Command::current_dir` fail to
+        // spawn, which is the same error shape as `git` missing from PATH.
+        let missing = temp.path().join("not-created");
+
+        match init_git_repository(&missing) {
+            GitInitOutcome::Unavailable(reason) => {
+                assert!(!reason.is_empty(), "the warning must say what went wrong")
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn valid_project_names_are_accepted() {
+        for name in [
+            "demo", "demo-app", "demo_app", "krab2", "_private", "a", "Demo-App",
+            "consul",   // only exact Windows device names are reserved
+            "constant", // ditto; `con` as a prefix is fine
+            "testing",  // only bare `test` collides with the built-in crate
+        ] {
+            assert!(
+                validate_project_name(name).is_ok(),
+                "{name:?} should be accepted: {:?}",
+                validate_project_name(name).unwrap_err().to_string()
+            );
+        }
+    }
+
+    /// Every rejection has to name the problem and offer something that works —
+    /// the previous behaviour deferred the failure to the user's first
+    /// `cargo run`, with a Cargo error pointing at a manifest they never wrote.
+    #[test]
+    fn invalid_project_names_are_rejected_with_a_usable_suggestion() {
+        for (name, expected_reason, expected_slug) in [
+            ("", "the name is empty", "krab-app"),
+            ("My App", "only ASCII letters", "my-app"),
+            ("my.app", "only ASCII letters", "my-app"),
+            ("my/app", "only ASCII letters", "my-app"),
+            ("café", "only ASCII letters", "caf"),
+            ("2fast", "starts with a digit", "app-2fast"),
+            ("-lead", "starts with '-'", "lead"),
+            ("async", "is a Rust keyword", "async-app"),
+            ("struct", "is a Rust keyword", "struct-app"),
+            ("con", "reserved Windows device name", "con-app"),
+            ("COM1", "reserved Windows device name", "com1-app"),
+            ("nul", "reserved Windows device name", "nul-app"),
+            ("lpt9", "reserved Windows device name", "lpt9-app"),
+            ("test", "Cargo reserves it", "test-app"),
+            ("deps", "Cargo reserves it", "deps-app"),
+        ] {
+            let Err(err) = validate_project_name(name) else {
+                panic!("{name:?} should be rejected");
+            };
+            let err = err.to_string();
+
+            assert!(
+                err.contains(expected_reason),
+                "{name:?}: rejection does not explain why ({expected_reason:?}): {err}"
+            );
+            assert!(
+                err.contains(&format!("Try: krab new {expected_slug}")),
+                "{name:?}: rejection does not suggest {expected_slug:?}: {err}"
+            );
+        }
+
+        let long = "a".repeat(65);
+        let err = validate_project_name(&long)
+            .expect_err("a 65-character name should be rejected")
+            .to_string();
+        assert!(err.contains("crates.io allows at most 64"), "{err}");
+    }
+
+    /// The suggestion is worthless if it would itself be rejected.
+    #[test]
+    fn suggested_slugs_are_themselves_valid() {
+        for raw in [
+            "",
+            "   ",
+            "My App",
+            "My  Awful   Name!!",
+            "2fast2furious",
+            "async",
+            "con",
+            "COM1",
+            "test",
+            "----",
+            "café",
+            &"x".repeat(200),
+        ] {
+            let slug = suggested_project_slug(raw);
+            assert!(
+                validate_project_name(&slug).is_ok(),
+                "suggestion {slug:?} for {raw:?} is itself invalid: {:?}",
+                validate_project_name(&slug).unwrap_err().to_string()
+            );
+        }
+    }
+
+    /// A rejected name must not leave a half-built project behind.
+    #[test]
+    fn a_rejected_name_creates_nothing_on_disk() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let project_dir = temp_dir.path().join("My App");
+
+        let err = write_project_from_template(
+            &project_dir,
+            "My App",
+            &ProjectTemplate::Default,
+            &DependencySource::Registry,
+        )
+        .expect_err("'My App' is not a valid package name");
+        assert!(err.to_string().contains("invalid project name 'My App'"));
+
+        assert!(
+            !project_dir.exists(),
+            "a rejected name left {} on disk",
+            project_dir.display()
+        );
+        assert_eq!(
+            fs::read_dir(temp_dir.path())?.count(),
+            0,
+            "a rejected name wrote something into the parent directory"
+        );
         Ok(())
     }
 }

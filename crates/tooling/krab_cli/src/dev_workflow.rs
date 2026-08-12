@@ -320,8 +320,14 @@ pub(super) fn generate_docs(out: &PathBuf) -> Result<()> {
         "Regenerate this developer workflow document".to_string(),
     );
     command_matrix.insert(
-        "krab doctor [--diagnostics] [--strict]".to_string(),
-        "Run aggregated workspace health checks for project model, env policy, service config, and topology".to_string(),
+        "krab doctor [--diagnostics] [--strict] [--json]".to_string(),
+        "Run aggregated workspace health checks for project model, env policy, service config, and topology. Checks that do not apply to this project are reported SKIP, not OK".to_string(),
+    );
+    command_matrix.insert(
+        // Comma-separated, not `a|b|c`: this string lands in a Markdown table
+        // cell, and GFM splits cells on `|` even inside backticks.
+        "krab completions <shell>  (bash, zsh, fish, powershell, elvish)".to_string(),
+        "Write a shell completion script for the `krab` binary to stdout".to_string(),
     );
     command_matrix.insert(
         "krab security dependency-gate [--diagnostics]".to_string(),
@@ -332,7 +338,7 @@ pub(super) fn generate_docs(out: &PathBuf) -> Result<()> {
         "Run release gates and write a structured evidence bundle".to_string(),
     );
     command_matrix.insert(
-        "krab topology doctor [--diagnostics]".to_string(),
+        "krab topology doctor [--diagnostics] [--json]".to_string(),
         "Run topology boundary checks (cross-service imports, contract payload derives, endpoint config)".to_string(),
     );
     command_matrix.insert(
@@ -366,7 +372,7 @@ pub(super) fn generate_docs(out: &PathBuf) -> Result<()> {
     };
 
     let content = format!(
-        "# Dev Workflow and Build Outputs\n\n## Project Model\n\n- Frontend bin: `{}`\n- Bootstrap bin: `{}`\n- Public dir: `{}`\n- Dist dir: `{}`\n- Watch roots: {:?}\n\n## CLI Commands\n\n| Command | Description |\n|---|---|\n{}\n{}## Asset Fingerprinting\n\nWhen a client/WASM package is configured, the CLI fingerprints browser assets and writes `{}/assets.json`.\n\n## Watch/HMR Workflow\n\n`krab dev --watch` (or `krab watch`) performs incremental change detection over the configured watch roots, rebuilds only the necessary targets, mirrors changed public assets, and writes a lightweight HMR signal file at `{}`.\n\n## Bootstrap Health Semantics\n\n`krab bootstrap` starts services in dependency order, waits on each startup readiness probe before proceeding, and applies restart policy backoff/attempt limits from `krab.toml`. Use `/ready` for readiness probes and `/health` for liveness checks. Service stdout/stderr are captured with stable `[service::stream]` prefixes and written to `internal/audit/orchestrator/` for artifact collection.\n",
+        "# Dev Workflow and Build Outputs\n\n## Project Model\n\n- Frontend bin: `{}`\n- Bootstrap bin: `{}`\n- Public dir: `{}`\n- Dist dir: `{}`\n- Watch roots: {:?}\n\n## CLI Commands\n\n`--diagnostics` and `--json` are global: they may be given before or after the subcommand, and are listed below only on the commands that act on them. `--json` changes what is printed, never the exit status.\n\n| Command | Description |\n|---|---|\n{}\n{}## Asset Fingerprinting\n\nWhen a client/WASM package is configured, the CLI fingerprints browser assets and writes `{}/assets.json`.\n\n## Watch/HMR Workflow\n\n`krab dev --watch` (or `krab watch`) performs incremental change detection over the configured watch roots, rebuilds only the necessary targets, mirrors changed public assets, and writes a lightweight HMR signal file at `{}`.\n\n## Bootstrap Health Semantics\n\n`krab bootstrap` starts services in dependency order, waits on each startup readiness probe before proceeding, and applies restart policy backoff/attempt limits from `krab.toml`. Use `/ready` for readiness probes and `/health` for liveness checks. Service stdout/stderr are captured with stable `[service::stream]` prefixes and written to `internal/audit/orchestrator/` for artifact collection.\n",
         project.frontend_bin,
         project.bootstrap_bin,
         project.public_dir.display(),

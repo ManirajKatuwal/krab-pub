@@ -29,16 +29,17 @@ whichever features you need, then pick between them with `KRAB_DB_DRIVER`:
 
 ```toml
 # Postgres only — the usual production choice
-krab_core = { version = "0.2.0", features = ["db-postgres"] }
+krab_core = { version = "0.4.0", features = ["db-postgres"] }
 
 # Both, selected per environment
-krab_core = { version = "0.2.0", features = ["db-postgres", "db-sqlite"] }
+krab_core = { version = "0.4.0", features = ["db-postgres", "db-sqlite"] }
 ```
 
 > **`db` is a deprecated alias for `db-postgres`.** It is kept for one minor
 > version per the breaking-change policy in
-> [`RELEASE_POLICY.md`](../../RELEASE_POLICY.md) and will be removed no earlier
-> than `0.2.0`. Use the explicit driver feature.
+> [`RELEASE_POLICY.md`](../../RELEASE_POLICY.md). It was deprecated *in* `0.2.0`,
+> so it is removable no earlier than `0.3.0` — matching the manifest comment in
+> `krab_core/Cargo.toml`. Use the explicit driver feature.
 >
 > Before this split, `krab_core`'s `sqlx` dependency enabled `postgres`
 > unconditionally and nothing else. SQLite existed only inside

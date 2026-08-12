@@ -24,6 +24,15 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.4", features = ["derive"] }
+# Shell completion scripts behind `krab completions <shell>`. Maintained by the
+# clap organisation, versioned in lockstep with clap itself, and published under
+# the same MIT OR Apache-2.0 dual licence as the clap dependency directly above
+# — both licences are already in deny.toml's allowlist, so this adds no new
+# licence surface. It pulls in clap_lex/clap_builder, which clap already
+# provides, so it adds no new advisory surface either. `clap_mangen` (man page
+# generation) is deliberately *not* added: it is a separate crate and a separate
+# dependency decision.
+clap_complete = "4.4"
 anyhow.workspace = true
 serde_json.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -31,6 +40,13 @@ toml = "0.8"
 # `auth` provides the Argon2id hashing behind `krab auth hash-password`, so the
 # CLI produces credentials in exactly the format the auth service verifies.
 krab_core = { workspace = true, features = ["auth"] }
+# Asset fingerprint digests. SHA-256 rather than std's DefaultHasher, whose
+# output is documented as unstable across Rust releases — a toolchain bump would
+# otherwise rename every fingerprinted asset and bust every downstream cache for
+# bytes that never changed. Already in the dependency tree via krab_core's
+# migration checksums, and its licence is already in deny.toml's allowlist, so
+# this adds no new licence or advisory surface.
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

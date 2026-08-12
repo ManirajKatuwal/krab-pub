@@ -10,17 +10,20 @@
 
 ## CLI Commands
 
+`--diagnostics` and `--json` are global: they may be given before or after the subcommand, and are listed below only on the commands that act on them. `--json` changes what is printed, never the exit status.
+
 | Command | Description |
 |---|---|
 | `krab bootstrap [--release]` | Build and run `krab_orchestrator` |
 | `krab build [--release]` | Build `service_frontend` plus client/WASM artifacts into `dist` |
+| `krab completions <shell>  (bash, zsh, fish, powershell, elvish)` | Write a shell completion script for the `krab` binary to stdout |
 | `krab dev --watch [--release] [--poll-ms <n>] [--settle-ms <n>]` | Watch ["crates/framework/krab_core/src", "crates/framework/krab_macros/src", "services/service_frontend/src", "crates/framework/krab_client/src", "services/service_frontend/public"], rebuild changed targets, and restart `service_frontend` |
 | `krab dev [--release]` | Build once and run `service_frontend` |
 | `krab docs [--out <path>]` | Regenerate this developer workflow document |
-| `krab doctor [--diagnostics] [--strict]` | Run aggregated workspace health checks for project model, env policy, service config, and topology |
+| `krab doctor [--diagnostics] [--strict] [--json]` | Run aggregated workspace health checks for project model, env policy, service config, and topology. Checks that do not apply to this project are reported SKIP, not OK |
 | `krab release certify [--out <dir>] [--diagnostics] [--json]` | Run release gates and write a structured evidence bundle |
 | `krab security dependency-gate [--diagnostics]` | Run local dependency governance gate with cargo-deny (CI parity) |
-| `krab topology doctor [--diagnostics]` | Run topology boundary checks (cross-service imports, contract payload derives, endpoint config) |
+| `krab topology doctor [--diagnostics] [--json]` | Run topology boundary checks (cross-service imports, contract payload derives, endpoint config) |
 | `krab topology split <domain> [--protocols rest,graphql,rpc,grpc] [--register] [--dry-run]` | Generate split-service extraction skeleton for a domain with adapter stubs and optional registration |
 | `krab watch [--release] [--poll-ms <n>] [--settle-ms <n>]` | Alias dedicated to watch workflow |
 

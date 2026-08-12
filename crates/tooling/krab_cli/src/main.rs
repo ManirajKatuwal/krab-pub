@@ -1,10 +1,12 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 use std::path::PathBuf;
 
 mod auth_ops;
 mod dev_workflow;
 mod doctor;
+mod env_policy;
 mod generator;
 mod governance;
 mod project_model;
@@ -35,6 +37,29 @@ use crate::topology::dispatch_topology_action;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// Emit richer command diagnostics
+    //
+    // Global rather than redeclared on each gate. It used to be a separate
+    // `--diagnostics` field on ten subcommands, which is ten places for the
+    // help text and behaviour to drift, and it meant `krab --diagnostics
+    // doctor` was a parse error while `krab doctor --diagnostics` worked.
+    //
+    // `global = true` accepts the flag at either position, so every existing
+    // invocation — CI's included — parses byte-for-byte as before. clap
+    // rejects a redeclared global id, which is why the per-subcommand copies
+    // are gone rather than kept "for compatibility".
+    #[arg(long, global = true)]
+    diagnostics: bool,
+
+    /// Emit machine-readable JSON instead of human-readable output
+    //
+    // Previously only `release check|certify` had this, so the CI-facing gates
+    // could not be consumed programmatically. `--json` changes only what is
+    // *printed*; the exit status is identical in both modes for every command
+    // that accepts it (see `release_ops::finish_release_check`).
+    #[arg(long, global = true)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -54,6 +79,15 @@ enum Commands {
         /// framework change against a fresh project.
         #[arg(long, value_name = "KRAB_REPO_ROOT")]
         path_deps: Option<PathBuf>,
+        /// Do not run `git init` in the new project directory.
+        ///
+        /// The scaffold writes a `.gitignore`, so by default it also creates
+        /// the repository that file is for — an empty one, with no commit.
+        /// It is skipped automatically when the target is already inside a git
+        /// work tree, and a missing or failing `git` is a warning, never a
+        /// failed scaffold.
+        #[arg(long)]
+        no_git: bool,
     },
     /// Build the full stack application
     Build {
@@ -63,9 +97,6 @@ enum Commands {
         /// Selective rebuild target
         #[arg(long, value_enum, default_value_t = BuildTarget::All)]
         target: BuildTarget,
-        /// Emit richer command diagnostics
-        #[arg(long)]
-        diagnostics: bool,
     },
     /// Run frontend dev workflow (build + run server)
     Dev {
@@ -142,9 +173,6 @@ enum Commands {
     },
     /// Run aggregated workspace health checks
     Doctor {
-        /// Emit richer check details
-        #[arg(long)]
-        diagnostics: bool,
         /// Treat warnings as failures
         #[arg(long)]
         strict: bool,
@@ -159,44 +187,34 @@ enum Commands {
         #[command(subcommand)]
         resource: GenResource,
     },
+    /// Print a shell completion script to stdout
+    ///
+    /// Redirect it to wherever your shell loads completions from, for example:
+    /// `krab completions bash > /etc/bash_completion.d/krab`, or
+    /// `krab completions powershell | Out-String | Invoke-Expression`.
+    Completions {
+        /// Shell to generate a completion script for
+        #[arg(value_enum)]
+        shell: Shell,
+    },
 }
 
 #[derive(Subcommand)]
 enum ContractAction {
     /// Run contract checks and schema snapshots
-    Check {
-        /// Emit richer command diagnostics
-        #[arg(long)]
-        diagnostics: bool,
-    },
+    Check,
     /// Run protocol parity and resolver checks
-    ProtocolCheck {
-        /// Emit richer command diagnostics
-        #[arg(long)]
-        diagnostics: bool,
-    },
+    ProtocolCheck,
 }
 
 #[derive(Subcommand)]
 enum DbAction {
     /// Run migration lifecycle checks
-    Lifecycle {
-        /// Emit richer command diagnostics
-        #[arg(long)]
-        diagnostics: bool,
-    },
+    Lifecycle,
     /// Run rollback simulation checks
-    Rollback {
-        /// Emit richer command diagnostics
-        #[arg(long)]
-        diagnostics: bool,
-    },
+    Rollback,
     /// Run migration drift-detection checks
-    Drift {
-        /// Emit richer command diagnostics
-        #[arg(long)]
-        diagnostics: bool,
-    },
+    Drift,
     /// Run rollback rehearsal and capture evidence
     Rehearsal {
         /// Path for evidence output
@@ -205,20 +223,13 @@ enum DbAction {
             default_value = "internal/audit/evidence/rollback-rehearsal-evidence.txt"
         )]
         out: PathBuf,
-        /// Emit richer command diagnostics
-        #[arg(long)]
-        diagnostics: bool,
     },
 }
 
 #[derive(Subcommand)]
 enum SecurityAction {
     /// Run dependency policy gate (cargo-deny advisories/licenses/bans/sources)
-    DependencyGate {
-        /// Emit richer command diagnostics
-        #[arg(long)]
-        diagnostics: bool,
-    },
+    DependencyGate,
 }
 
 #[derive(Subcommand)]
@@ -243,36 +254,26 @@ enum AuthAction {
 #[derive(Subcommand)]
 enum ReleaseAction {
     /// Run comprehensive pre-flight release checklist
-    Check {
-        /// Emit richer command diagnostics
-        #[arg(long)]
-        diagnostics: bool,
-        /// Output results as machine-readable JSON
-        #[arg(long)]
-        json: bool,
-    },
+    Check,
     /// Run certification gates and write an evidence bundle
     Certify {
         /// Output directory for the evidence bundle
-        #[arg(long, default_value = "release-evidence")]
+        //
+        // Defaults under `internal/audit/release-certify/`, the gitignored
+        // evidence tree CLAUDE.md documents this command as writing to, and the
+        // same parent CI targets (`ops-hardening.yaml` passes
+        // `--out internal/audit/release-certify/run-<run_id>`). The previous
+        // default, `release-evidence`, created an untracked directory in the
+        // repository root that no `.gitignore` rule covered.
+        #[arg(long, default_value = "internal/audit/release-certify/local")]
         out: PathBuf,
-        /// Emit richer command diagnostics
-        #[arg(long)]
-        diagnostics: bool,
-        /// Output summary as machine-readable JSON
-        #[arg(long)]
-        json: bool,
     },
 }
 
 #[derive(Subcommand)]
 enum TopologyAction {
     /// Validate topology hygiene and service-boundary contract rules
-    Doctor {
-        /// Emit richer command diagnostics
-        #[arg(long)]
-        diagnostics: bool,
-    },
+    Doctor,
     /// Scaffold a split-service extraction skeleton for a domain
     Split {
         /// Domain name to extract (example: users, billing)
@@ -367,17 +368,13 @@ enum BuildTarget {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    dispatch_command(&cli.command)
+    dispatch_command(&cli.command, cli.diagnostics, cli.json)
 }
 
-fn dispatch_command(command: &Commands) -> Result<()> {
+fn dispatch_command(command: &Commands, diagnostics: bool, json: bool) -> Result<()> {
     match command {
-        Commands::Build {
-            release,
-            target,
-            diagnostics,
-        } => {
-            build_project(*release, target, *diagnostics)?;
+        Commands::Build { release, target } => {
+            build_project(*release, target, diagnostics)?;
         }
         Commands::Dev {
             release,
@@ -408,27 +405,217 @@ fn dispatch_command(command: &Commands) -> Result<()> {
             bootstrap_local_stack(*release, *skip_build)?;
         }
         Commands::EnvCheck { strict } => {
-            validate_environment(*strict)?;
+            validate_environment(*strict, json)?;
         }
-        Commands::Contract { action } => dispatch_contract_action(action)?,
-        Commands::Db { action } => dispatch_db_action(action)?,
-        Commands::Security { action } => dispatch_security_action(action)?,
+        Commands::Contract { action } => dispatch_contract_action(action, diagnostics, json)?,
+        Commands::Db { action } => dispatch_db_action(action, diagnostics, json)?,
+        Commands::Security { action } => dispatch_security_action(action, diagnostics, json)?,
         Commands::Auth { action } => dispatch_auth_action(action)?,
-        Commands::Release { action } => dispatch_release_action(action)?,
-        Commands::Doctor {
-            diagnostics,
-            strict,
-        } => dispatch_doctor_command(*diagnostics, *strict)?,
-        Commands::Topology { action } => dispatch_topology_action(action)?,
+        Commands::Release { action } => dispatch_release_action(action, diagnostics, json)?,
+        Commands::Doctor { strict } => dispatch_doctor_command(diagnostics, *strict, json)?,
+        Commands::Topology { action } => dispatch_topology_action(action, diagnostics, json)?,
         Commands::Gen { resource } => dispatch_gen_resource(resource)?,
         Commands::New {
             name,
             template,
             path_deps,
+            no_git,
         } => {
-            generate_project_from_template(name, template, path_deps.as_deref())?;
+            generate_project_from_template(name, template, path_deps.as_deref(), *no_git)?;
+        }
+        Commands::Completions { shell } => {
+            // The binary name is `krab`, not the package name `krab_cli`, and
+            // the completion script has to use the name the user actually
+            // types — see the `[[bin]]` comment in Cargo.toml.
+            let mut command = Cli::command();
+            clap_complete::generate(*shell, &mut command, "krab", &mut std::io::stdout());
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands, ContractAction, DbAction, ReleaseAction, SecurityAction, Shell};
+    use clap::{CommandFactory, Parser};
+
+    /// clap's own consistency audit. It catches exactly the class of mistake
+    /// this change could introduce — a global argument id redeclared on a
+    /// subcommand — and it panics with the offending id rather than failing at
+    /// runtime in front of a user.
+    #[test]
+    fn the_command_tree_passes_claps_debug_assertions() {
+        Cli::command().debug_assert();
+    }
+
+    /// The regression that would hurt most: `--diagnostics` and `--json` moved
+    /// to the top level, and every documented CI invocation puts them *after*
+    /// the subcommand. `global = true` is what keeps those parsing; if it were
+    /// dropped, or an arg re-declared locally, this is where it shows up —
+    /// not in a red workflow.
+    ///
+    /// The invocations below are copied from `.github/workflows/*.yaml` and
+    /// `CLAUDE.md`, argv-for-argv.
+    #[test]
+    fn documented_ci_invocations_still_parse() {
+        // .github/workflows/ops-hardening.yaml
+        let cli = Cli::try_parse_from(["krab", "security", "dependency-gate", "--diagnostics"])
+            .expect("security dependency-gate --diagnostics");
+        assert!(cli.diagnostics);
+        assert!(!cli.json);
+        assert!(matches!(
+            cli.command,
+            Commands::Security {
+                action: SecurityAction::DependencyGate
+            }
+        ));
+
+        // .github/workflows/api-contract.yaml
+        let cli = Cli::try_parse_from(["krab", "contract", "check", "--diagnostics"])
+            .expect("contract check --diagnostics");
+        assert!(cli.diagnostics);
+        assert!(matches!(
+            cli.command,
+            Commands::Contract {
+                action: ContractAction::Check
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["krab", "contract", "protocol-check", "--diagnostics"])
+            .expect("contract protocol-check --diagnostics");
+        assert!(cli.diagnostics);
+
+        // .github/workflows/db-lifecycle.yaml
+        for action in ["lifecycle", "rollback", "drift"] {
+            let cli = Cli::try_parse_from(["krab", "db", action, "--diagnostics"])
+                .unwrap_or_else(|err| panic!("db {action} --diagnostics: {err}"));
+            assert!(cli.diagnostics, "db {action}");
+        }
+
+        // A global flag must coexist with a subcommand-local option, in the
+        // order CI writes them.
+        let cli = Cli::try_parse_from([
+            "krab",
+            "db",
+            "rehearsal",
+            "--out",
+            "internal/audit/evidence/rollback-rehearsal-evidence.txt",
+            "--diagnostics",
+        ])
+        .expect("db rehearsal --out <path> --diagnostics");
+        assert!(cli.diagnostics);
+        match cli.command {
+            Commands::Db {
+                action: DbAction::Rehearsal { out },
+            } => assert_eq!(
+                out.to_string_lossy(),
+                "internal/audit/evidence/rollback-rehearsal-evidence.txt"
+            ),
+            _ => panic!("expected db rehearsal"),
+        }
+
+        // .github/workflows/ops-hardening.yaml release certification
+        let cli = Cli::try_parse_from([
+            "krab",
+            "release",
+            "certify",
+            "--out",
+            "internal/audit/release-certify/run-42",
+            "--json",
+        ])
+        .expect("release certify --out <dir> --json");
+        assert!(cli.json);
+        assert!(!cli.diagnostics);
+        match cli.command {
+            Commands::Release {
+                action: ReleaseAction::Certify { out },
+            } => assert_eq!(
+                out.to_string_lossy(),
+                "internal/audit/release-certify/run-42"
+            ),
+            _ => panic!("expected release certify"),
+        }
+
+        // CLAUDE.md governance command list
+        let cli = Cli::try_parse_from(["krab", "release", "check", "--diagnostics", "--json"])
+            .expect("release check --diagnostics --json");
+        assert!(cli.diagnostics && cli.json);
+
+        let cli = Cli::try_parse_from(["krab", "doctor", "--diagnostics", "--strict"])
+            .expect("doctor --diagnostics --strict");
+        assert!(cli.diagnostics);
+        assert!(matches!(cli.command, Commands::Doctor { strict: true }));
+
+        let cli =
+            Cli::try_parse_from(["krab", "env-check", "--strict"]).expect("env-check --strict");
+        assert!(matches!(cli.command, Commands::EnvCheck { strict: true }));
+
+        let cli = Cli::try_parse_from(["krab", "topology", "doctor", "--diagnostics"])
+            .expect("topology doctor --diagnostics");
+        assert!(cli.diagnostics);
+
+        let cli = Cli::try_parse_from(["krab", "db", "rehearsal"]).expect("db rehearsal");
+        assert!(!cli.diagnostics);
+    }
+
+    /// The point of `global = true`: the flag is now accepted before the
+    /// subcommand as well, which the per-subcommand declarations rejected.
+    #[test]
+    fn global_flags_are_accepted_before_the_subcommand_too() {
+        let cli = Cli::try_parse_from(["krab", "--diagnostics", "--json", "doctor"])
+            .expect("global flags should parse ahead of the subcommand");
+        assert!(cli.diagnostics && cli.json);
+    }
+
+    /// `--json` is now available to the gates that previously had no
+    /// machine-readable output at all. If a future change re-scopes it to a
+    /// subset of commands, these stop parsing.
+    #[test]
+    fn json_reaches_the_ci_facing_gates_that_previously_lacked_it() {
+        for argv in [
+            vec!["krab", "doctor", "--json"],
+            vec!["krab", "env-check", "--json"],
+            vec!["krab", "topology", "doctor", "--json"],
+            vec!["krab", "contract", "check", "--json"],
+            vec!["krab", "db", "drift", "--json"],
+            vec!["krab", "security", "dependency-gate", "--json"],
+        ] {
+            let cli = Cli::try_parse_from(argv.clone())
+                .unwrap_or_else(|err| panic!("{argv:?} should parse: {err}"));
+            assert!(cli.json, "{argv:?}");
+        }
+    }
+
+    /// Every shell the subcommand advertises must actually be a value clap
+    /// accepts, and the script must be non-empty and name the binary `krab`
+    /// rather than the package `krab_cli`.
+    #[test]
+    fn completions_are_generated_for_every_advertised_shell() {
+        for (name, shell) in [
+            ("bash", Shell::Bash),
+            ("zsh", Shell::Zsh),
+            ("fish", Shell::Fish),
+            ("powershell", Shell::PowerShell),
+            ("elvish", Shell::Elvish),
+        ] {
+            let cli = Cli::try_parse_from(["krab", "completions", name])
+                .unwrap_or_else(|err| panic!("completions {name} should parse: {err}"));
+            assert!(matches!(cli.command, Commands::Completions { .. }));
+
+            let mut script = Vec::new();
+            clap_complete::generate(shell, &mut Cli::command(), "krab", &mut script);
+            let script = String::from_utf8(script).expect("completion script is UTF-8");
+
+            assert!(!script.is_empty(), "{name} script should not be empty");
+            assert!(
+                script.contains("krab"),
+                "{name} script should reference the `krab` binary"
+            );
+            assert!(
+                script.contains("doctor"),
+                "{name} script should list subcommands, got:\n{script}"
+            );
+        }
+    }
 }

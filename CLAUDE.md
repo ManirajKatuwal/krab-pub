@@ -15,7 +15,10 @@ It is a **Cargo workspace**, not an application. Changes here affect downstream
 framework consumers, so API surface and governance artifacts matter as much as
 the code.
 
-- Version: `0.2.0` — prepared, not yet published (workspace-wide, `[workspace.package]` in `Cargo.toml`; see `docs/operations/release_0_2_0_checklist.md`)
+- Version: `0.4.0` (workspace-wide, `[workspace.package]` in `Cargo.toml`; see
+  `docs/operations/release_0_4_0_checklist.md`). Published to crates.io. Note
+  that `0.3.0` was tagged and released on GitHub but never reached the registry,
+  so crates.io goes `0.2.0` → `0.4.0` — the missing number is deliberate.
 - Edition: 2021, Rust stable 1.75+
 - License: MIT
 
@@ -167,7 +170,7 @@ wasm-pack build crates/framework/krab_client --release --target web -- --feature
 
 `krab_client`'s features are `web` (the hydration runtime and the client
 router's browser half), `demo-islands` (the bundled `Counter`/`Toggle`/`Likes`,
-deprecated and removed in 0.5.0), and `debug` (verbose console tracing of the
+deprecated and removed in 0.6.0), and `debug` (verbose console tracing of the
 hydration walk). `web` and `demo-islands` are **defaults**, so the `--` suffix
 above is redundant — it is written out because this command shipped a stub for
 the entire 0.1–0.2 line, when `web` was opt-in and nothing asked for it. A build

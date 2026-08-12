@@ -237,18 +237,12 @@ fn next_tag(html: &str, from: usize) -> Option<Tag> {
         if let Some(body) = rest.strip_prefix("<!--") {
             // An unterminated comment swallows the rest of the document, which
             // is what a browser does too.
-            pos = match body.find("-->") {
-                Some(close) => at + 4 + close + 3,
-                None => return None,
-            };
+            pos = at + 4 + body.find("-->")? + 3;
             continue;
         }
 
         if rest.starts_with("<!") || rest.starts_with("<?") {
-            pos = match rest.find('>') {
-                Some(close) => at + close + 1,
-                None => return None,
-            };
+            pos = at + rest.find('>')? + 1;
             continue;
         }
 
