@@ -85,7 +85,7 @@ impl ApiService for UsersService {
             .clone()
             .unwrap_or_else(ProtocolConfig::from_env);
         let capabilities = capabilities::build_capabilities(&protocol_config);
-        let runtime = RuntimeState::new().with_protocol_config(protocol_config.clone());
+        let runtime = RuntimeState::try_new()?.with_protocol_config(protocol_config.clone());
 
         let state = AppState {
             schema,
@@ -966,7 +966,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(rest.status(), StatusCode::NOT_FOUND);
+        // 0.3.0: a disabled route-family protocol is rejected with 400
+        // PROTOCOL_NOT_SUPPORTED before routing, not passed through to a 404.
+        assert_eq!(rest.status(), StatusCode::BAD_REQUEST);
 
         let rpc = app
             .oneshot(
@@ -980,7 +982,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(rpc.status(), StatusCode::NOT_FOUND);
+        // 0.3.0: disabled route-family → 400 PROTOCOL_NOT_SUPPORTED (was 404).
+        assert_eq!(rpc.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1019,7 +1022,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(graphql.status(), StatusCode::NOT_FOUND);
+        // 0.3.0: disabled route-family → 400 PROTOCOL_NOT_SUPPORTED (was 404).
+        assert_eq!(graphql.status(), StatusCode::BAD_REQUEST);
 
         let rpc = app
             .oneshot(
@@ -1033,7 +1037,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(rpc.status(), StatusCode::NOT_FOUND);
+        // 0.3.0: disabled route-family → 400 PROTOCOL_NOT_SUPPORTED (was 404).
+        assert_eq!(rpc.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1072,7 +1077,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(rest.status(), StatusCode::NOT_FOUND);
+        // 0.3.0: a disabled route-family protocol is rejected with 400
+        // PROTOCOL_NOT_SUPPORTED before routing, not passed through to a 404.
+        assert_eq!(rest.status(), StatusCode::BAD_REQUEST);
 
         let graphql = app
             .oneshot(
@@ -1086,7 +1093,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(graphql.status(), StatusCode::NOT_FOUND);
+        // 0.3.0: disabled route-family → 400 PROTOCOL_NOT_SUPPORTED (was 404).
+        assert_eq!(graphql.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

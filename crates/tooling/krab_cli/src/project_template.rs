@@ -445,7 +445,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {{
     let addr: SocketAddr = format!("{{}}:{{}}", cfg.host, cfg.port).parse()?;
 
     let state = AppState {{
-        runtime: RuntimeState::new(),
+        runtime: RuntimeState::try_new()?, // fails closed on Redis init failure outside dev
     }};
 
     let app: Router<AppState> = Router::new()

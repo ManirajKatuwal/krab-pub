@@ -10,6 +10,28 @@ use tracing::warn;
 
 use crate::http::{bool_env, constant_time_eq, HasRuntimeState};
 
+/// Number of trusted proxy hops for `x-forwarded-for` parsing, from
+/// `KRAB_TRUSTED_PROXY_HOPS`. Defaults to 1 (take the rightmost entry — the
+/// value appended by the one trusted proxy in front of the service). Values
+/// below 1 or unparseable values fall back to the default with a warning.
+fn trusted_proxy_hops() -> usize {
+    const DEFAULT_HOPS: usize = 1;
+    match std::env::var("KRAB_TRUSTED_PROXY_HOPS") {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(hops) if hops >= 1 => hops,
+            _ => {
+                warn!(
+                    value = %raw,
+                    default = DEFAULT_HOPS,
+                    "trusted_proxy_hops_invalid_using_default"
+                );
+                DEFAULT_HOPS
+            }
+        },
+        Err(_) => DEFAULT_HOPS,
+    }
+}
+
 pub fn extract_client_ip(req: &Request<Body>, trust_proxy_headers: bool) -> String {
     if trust_proxy_headers {
         if let Some(value) = req
@@ -17,11 +39,24 @@ pub fn extract_client_ip(req: &Request<Body>, trust_proxy_headers: bool) -> Stri
             .get("x-forwarded-for")
             .and_then(|h| h.to_str().ok())
         {
-            if let Some(first) = value.split(',').next() {
-                let ip = first.trim();
-                if !ip.is_empty() {
-                    return ip.to_string();
+            // Only the rightmost entries of x-forwarded-for were appended by
+            // proxies we run; everything left of them is client-controlled.
+            // Skip the trusted hops from the right (default 1 => rightmost
+            // entry) and require the candidate to parse as an IP address —
+            // garbage falls through to x-real-ip, then ConnectInfo.
+            let entries: Vec<&str> = value.split(',').map(str::trim).collect();
+            if !entries.is_empty() {
+                let hops = trusted_proxy_hops();
+                let index = entries.len().saturating_sub(hops);
+                let candidate = entries[index.min(entries.len() - 1)];
+                if candidate.parse::<std::net::IpAddr>().is_ok() {
+                    return candidate.to_string();
                 }
+                warn!(
+                    candidate = %candidate,
+                    trusted_hops = hops,
+                    "forwarded_for_candidate_not_an_ip_falling_through"
+                );
             }
         }
 

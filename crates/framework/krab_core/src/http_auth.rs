@@ -252,11 +252,22 @@ pub fn tenant_from_path(path: &str) -> Option<&str> {
     None
 }
 
+/// Parse `KRAB_AUTH_ROUTE_POLICIES_JSON`, distinguishing "not configured"
+/// (`Ok(empty)`) from "configured but malformed" (`Err`). The enforcement path
+/// treats the latter as a hard failure: a typo in the policy JSON must not
+/// silently strip every route policy.
+pub fn try_load_route_policies() -> Result<Vec<RoutePolicy>, serde_json::Error> {
+    match std::env::var("KRAB_AUTH_ROUTE_POLICIES_JSON") {
+        Ok(raw) => serde_json::from_str::<Vec<RoutePolicy>>(&raw),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
 pub fn load_route_policies() -> Vec<RoutePolicy> {
-    std::env::var("KRAB_AUTH_ROUTE_POLICIES_JSON")
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Vec<RoutePolicy>>(&raw).ok())
-        .unwrap_or_default()
+    try_load_route_policies().unwrap_or_else(|error| {
+        tracing::error!(error = %error, "auth_route_policies_json_malformed");
+        Vec::new()
+    })
 }
 
 pub fn validate_provider_claims(
@@ -322,6 +333,141 @@ pub fn roles_from_claims(claims: &JwtClaims) -> Vec<String> {
         return vec![role.clone()];
     }
     vec![]
+}
+
+/// Coarse algorithm family, used to key pre-built decoding keys: material
+/// that parses for one family (e.g. an RSA PEM) is reusable across every
+/// algorithm in that family (RS256/RS384/RS512/PS256/...).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum JwtAlgorithmFamily {
+    Hmac,
+    Rsa,
+    Ec,
+    Ed,
+}
+
+impl JwtAlgorithmFamily {
+    const ALL: [Self; 4] = [Self::Hmac, Self::Rsa, Self::Ec, Self::Ed];
+
+    fn of(algorithm: jsonwebtoken::Algorithm) -> Self {
+        match algorithm {
+            jsonwebtoken::Algorithm::HS256
+            | jsonwebtoken::Algorithm::HS384
+            | jsonwebtoken::Algorithm::HS512 => Self::Hmac,
+            jsonwebtoken::Algorithm::RS256
+            | jsonwebtoken::Algorithm::RS384
+            | jsonwebtoken::Algorithm::RS512
+            | jsonwebtoken::Algorithm::PS256
+            | jsonwebtoken::Algorithm::PS384
+            | jsonwebtoken::Algorithm::PS512 => Self::Rsa,
+            jsonwebtoken::Algorithm::ES256 | jsonwebtoken::Algorithm::ES384 => Self::Ec,
+            jsonwebtoken::Algorithm::EdDSA => Self::Ed,
+        }
+    }
+
+    /// A representative algorithm for building a decoding key of this family.
+    fn representative(self) -> jsonwebtoken::Algorithm {
+        match self {
+            Self::Hmac => jsonwebtoken::Algorithm::HS256,
+            Self::Rsa => jsonwebtoken::Algorithm::RS256,
+            Self::Ec => jsonwebtoken::Algorithm::ES256,
+            Self::Ed => jsonwebtoken::Algorithm::EdDSA,
+        }
+    }
+}
+
+/// Parsed JWT provider configuration with decoding keys pre-built per
+/// (provider index, kid, algorithm family). Building this once per
+/// [`crate::http_runtime::RuntimeState`] takes provider JSON parsing and PEM
+/// parsing off the per-request hot path.
+///
+/// Deliberately per-instance (no process-global caching): callers that mutate
+/// the environment — tests, or services that reload state — construct a fresh
+/// `RuntimeState` and therefore a fresh cache.
+pub struct JwtVerifierCache {
+    providers: Vec<JwtProviderConfig>,
+    keys: std::collections::HashMap<(usize, String, JwtAlgorithmFamily), jsonwebtoken::DecodingKey>,
+    load_failed: bool,
+}
+
+impl JwtVerifierCache {
+    /// Build the cache from the current environment
+    /// (`KRAB_JWT_PROVIDERS_JSON` / `KRAB_JWT_KEYS_JSON` / `KRAB_JWT_SECRET`).
+    /// A malformed provider configuration is remembered as a load failure and
+    /// surfaces as 503 on the request path, matching the previous per-request
+    /// behavior.
+    pub fn from_env() -> Self {
+        match load_jwt_providers() {
+            Ok(providers) => Self::from_providers(providers),
+            Err(err) => {
+                warn!(error = %err, "jwt_provider_configuration_load_failed");
+                Self {
+                    providers: Vec::new(),
+                    keys: std::collections::HashMap::new(),
+                    load_failed: true,
+                }
+            }
+        }
+    }
+
+    pub fn from_providers(providers: Vec<JwtProviderConfig>) -> Self {
+        let mut keys = std::collections::HashMap::new();
+        for (provider_index, provider) in providers.iter().enumerate() {
+            for (kid, material) in &provider.keys {
+                for family in JwtAlgorithmFamily::ALL {
+                    // Failure is expected for most (material, family) pairs —
+                    // an HMAC secret is not an RSA PEM. The request path warns
+                    // if a requested family ends up with no usable key.
+                    if let Ok(key) = decoding_key_for_algorithm(family.representative(), material) {
+                        keys.insert((provider_index, kid.clone(), family), key);
+                    }
+                }
+            }
+        }
+        Self {
+            providers,
+            keys,
+            load_failed: false,
+        }
+    }
+
+    pub fn providers(&self) -> &[JwtProviderConfig] {
+        &self.providers
+    }
+
+    pub fn load_failed(&self) -> bool {
+        self.load_failed
+    }
+
+    fn decoding_key(
+        &self,
+        provider_index: usize,
+        kid: &str,
+        algorithm: jsonwebtoken::Algorithm,
+    ) -> Option<&jsonwebtoken::DecodingKey> {
+        self.keys.get(&(
+            provider_index,
+            kid.to_string(),
+            JwtAlgorithmFamily::of(algorithm),
+        ))
+    }
+}
+
+/// Resolve which configured key id `select_key` would pick for this request,
+/// so the pre-built decoding key can be looked up under the same identity.
+fn effective_kid<'a>(provider: &'a JwtProviderConfig, kid: Option<&str>) -> Option<&'a str> {
+    match kid {
+        Some(k) => provider
+            .keys
+            .get_key_value(k)
+            .map(|(name, _)| name.as_str()),
+        None if require_kid() => None,
+        None => provider
+            .keys
+            .get_key_value("default")
+            .map(|(name, _)| name.as_str())
+            .or_else(|| provider.keys.keys().next().map(String::as_str)),
+    }
 }
 
 fn decoding_key_for_algorithm(
@@ -400,7 +546,17 @@ pub fn enforce_claim_policy(
         }
     }
 
-    for policy in load_route_policies()
+    // Fail closed on malformed policy JSON: returning an empty policy set here
+    // would silently drop every configured restriction, while the sibling
+    // KRAB_AUTH_REQUIRED_CLAIMS_JSON path below already rejects on bad JSON.
+    let route_policies = try_load_route_policies().map_err(|error| {
+        tracing::error!(
+            error = %error,
+            "auth_route_policies_json_malformed_failing_closed"
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    for policy in route_policies
         .into_iter()
         .filter(|p| path.starts_with(&p.prefix))
     {
@@ -500,7 +656,22 @@ pub fn authorize_with_static_bearer(req: &Request<Body>) -> Result<AuthContext, 
     })
 }
 
+/// Compatibility wrapper: builds a [`JwtVerifierCache`] from the environment
+/// on every call, matching the pre-cache behavior. Prefer
+/// [`authorize_with_jwt_cached`] with the cache held on
+/// [`crate::http_runtime::RuntimeState`] — that is what `auth_middleware`
+/// uses — so provider JSON and PEM key material are parsed once, not per
+/// request.
 pub fn authorize_with_jwt(req: &Request<Body>, path: &str) -> Result<AuthContext, StatusCode> {
+    let cache = JwtVerifierCache::from_env();
+    authorize_with_jwt_cached(req, path, &cache)
+}
+
+pub fn authorize_with_jwt_cached(
+    req: &Request<Body>,
+    path: &str,
+    cache: &JwtVerifierCache,
+) -> Result<AuthContext, StatusCode> {
     let bearer = req
         .headers()
         .get("authorization")
@@ -522,23 +693,23 @@ pub fn authorize_with_jwt(req: &Request<Body>, path: &str) -> Result<AuthContext
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let providers = load_jwt_providers().map_err(|err| {
-        warn!(error = %err, "jwt_provider_configuration_load_failed");
-        StatusCode::SERVICE_UNAVAILABLE
-    })?;
+    if cache.load_failed() {
+        warn!("jwt_provider_configuration_unavailable_rejecting_request");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     let mut accepted: Option<(JwtClaims, String)> = None;
-    for provider in providers {
-        let selected_key = match select_key(&provider.keys, header.kid.as_deref()) {
-            Some(key) => key,
+    for (provider_index, provider) in cache.providers().iter().enumerate() {
+        let selected_kid = match effective_kid(provider, header.kid.as_deref()) {
+            Some(kid) => kid,
             None => continue,
         };
-        let decoding_key = match decoding_key_for_algorithm(header.alg, selected_key) {
-            Ok(key) => key,
-            Err(err) => {
+        let decoding_key = match cache.decoding_key(provider_index, selected_kid, header.alg) {
+            Some(key) => key,
+            None => {
                 warn!(
                     provider = provider.name.as_deref().unwrap_or("provider"),
                     alg = ?header.alg,
-                    error = %err,
                     "jwt_provider_key_material_invalid_for_algorithm"
                 );
                 continue;
@@ -550,19 +721,22 @@ pub fn authorize_with_jwt(req: &Request<Body>, path: &str) -> Result<AuthContext
         validation.validate_exp = true;
         validation.validate_aud = false;
         validation.leeway = jwt_leeway_secs();
-        let token_data = match jsonwebtoken::decode::<JwtClaims>(bearer, &decoding_key, &validation)
+        let token_data = match jsonwebtoken::decode::<JwtClaims>(bearer, decoding_key, &validation)
         {
             Ok(data) => data,
             Err(_) => continue,
         };
 
-        if validate_provider_claims(&token_data.claims, &provider).is_err() {
+        if validate_provider_claims(&token_data.claims, provider).is_err() {
             continue;
         }
 
         accepted = Some((
             token_data.claims,
-            provider.name.unwrap_or_else(|| "provider".to_string()),
+            provider
+                .name
+                .clone()
+                .unwrap_or_else(|| "provider".to_string()),
         ));
         break;
     }
@@ -662,7 +836,7 @@ where
 
     let mode = state.runtime_state().auth_mode.clone();
     let authorized = if mode.eq_ignore_ascii_case("jwt") || mode.eq_ignore_ascii_case("oidc") {
-        authorize_with_jwt(&req, path)
+        authorize_with_jwt_cached(&req, path, &state.runtime_state().jwt_verifier_cache)
     } else {
         authorize_with_static_bearer(&req)
     };

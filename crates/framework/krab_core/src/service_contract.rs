@@ -57,27 +57,77 @@ impl Default for TopologyRuntime {
 }
 
 impl TopologyRuntime {
-    /// Build topology runtime from environment.
+    /// Build topology runtime from environment, tolerating invalid values.
     ///
     /// Consumed env vars:
     /// - KRAB_RUNTIME_TOPOLOGY=monolith|distributed
     /// - KRAB_RUNTIME_ENDPOINTS_JSON={"users":{"base_url":"http://127.0.0.1:3002","timeout_ms":1500,"max_retries":2}}
+    ///
+    /// Malformed values are swallowed with a `tracing::warn!` and replaced by
+    /// defaults. Startup paths should prefer [`TopologyRuntime::from_env_checked`],
+    /// which surfaces the same conditions as errors.
     pub fn from_env() -> Self {
         let mut out = Self::default();
 
         if let Ok(raw) = std::env::var("KRAB_RUNTIME_TOPOLOGY") {
-            if let Some(mode) = ServiceTopology::parse(&raw) {
-                out.mode = mode;
+            match ServiceTopology::parse(&raw) {
+                Some(mode) => out.mode = mode,
+                None => tracing::warn!(
+                    raw = %raw.trim(),
+                    "krab_runtime_topology_unrecognized_falling_back_to_monolith"
+                ),
             }
         }
 
         if let Ok(raw) = std::env::var("KRAB_RUNTIME_ENDPOINTS_JSON") {
-            if let Ok(endpoints) = serde_json::from_str::<HashMap<String, ServiceEndpoint>>(&raw) {
-                out.endpoints = endpoints;
+            match serde_json::from_str::<HashMap<String, ServiceEndpoint>>(&raw) {
+                Ok(endpoints) => out.endpoints = endpoints,
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "krab_runtime_endpoints_json_unparseable_ignoring"
+                ),
             }
         }
 
+        if out.mode == ServiceTopology::Distributed && out.endpoints.is_empty() {
+            tracing::warn!("krab_runtime_topology_distributed_with_empty_endpoint_map");
+        }
+
         out
+    }
+
+    /// Build topology runtime from environment, rejecting invalid values.
+    ///
+    /// Reads the same env vars as [`TopologyRuntime::from_env`] but returns an
+    /// error when:
+    /// - `KRAB_RUNTIME_TOPOLOGY` is set to an unrecognized value,
+    /// - `KRAB_RUNTIME_ENDPOINTS_JSON` is set but does not parse, or
+    /// - the resolved mode is `distributed`/`split` with an empty endpoint map.
+    pub fn from_env_checked() -> anyhow::Result<Self> {
+        let mut out = Self::default();
+
+        if let Ok(raw) = std::env::var("KRAB_RUNTIME_TOPOLOGY") {
+            out.mode = ServiceTopology::parse(&raw).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid KRAB_RUNTIME_TOPOLOGY='{}': expected one of monolith|single|single_service|distributed|split|split_services",
+                    raw.trim()
+                )
+            })?;
+        }
+
+        if let Ok(raw) = std::env::var("KRAB_RUNTIME_ENDPOINTS_JSON") {
+            out.endpoints = serde_json::from_str::<HashMap<String, ServiceEndpoint>>(&raw)
+                .map_err(|error| anyhow::anyhow!("invalid KRAB_RUNTIME_ENDPOINTS_JSON: {error}"))?;
+        }
+
+        if out.mode == ServiceTopology::Distributed && out.endpoints.is_empty() {
+            anyhow::bail!(
+                "KRAB_RUNTIME_TOPOLOGY resolves to 'distributed' but the endpoint map is empty; \
+                 set KRAB_RUNTIME_ENDPOINTS_JSON with at least one endpoint"
+            );
+        }
+
+        Ok(out)
     }
 
     pub fn endpoint_for(&self, domain: &str) -> Option<&ServiceEndpoint> {
@@ -198,5 +248,105 @@ mod tests {
 
         std::env::remove_var("KRAB_RUNTIME_TOPOLOGY");
         std::env::remove_var("KRAB_RUNTIME_ENDPOINTS_JSON");
+    }
+
+    fn clear_topology_env() {
+        std::env::remove_var("KRAB_RUNTIME_TOPOLOGY");
+        std::env::remove_var("KRAB_RUNTIME_ENDPOINTS_JSON");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn from_env_checked_accepts_valid_distributed_configuration() {
+        clear_topology_env();
+        std::env::set_var("KRAB_RUNTIME_TOPOLOGY", "split");
+        std::env::set_var(
+            "KRAB_RUNTIME_ENDPOINTS_JSON",
+            r#"{"users":{"base_url":"http://127.0.0.1:3002","timeout_ms":1200,"max_retries":1}}"#,
+        );
+
+        let runtime = TopologyRuntime::from_env_checked().expect("valid env must parse");
+        assert_eq!(runtime.mode, ServiceTopology::Distributed);
+        assert!(runtime.endpoint_for("users").is_some());
+        clear_topology_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn from_env_checked_defaults_to_monolith_when_env_is_absent() {
+        clear_topology_env();
+
+        let runtime = TopologyRuntime::from_env_checked().expect("absent env means defaults");
+        assert_eq!(runtime.mode, ServiceTopology::Monolith);
+        assert!(runtime.endpoints.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn from_env_checked_rejects_unrecognized_topology() {
+        clear_topology_env();
+        std::env::set_var("KRAB_RUNTIME_TOPOLOGY", "mesh");
+
+        let err = TopologyRuntime::from_env_checked()
+            .expect_err("unrecognized topology must be rejected")
+            .to_string();
+        assert!(
+            err.contains("invalid KRAB_RUNTIME_TOPOLOGY='mesh'"),
+            "{err}"
+        );
+        clear_topology_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn from_env_checked_rejects_malformed_endpoints_json() {
+        clear_topology_env();
+        std::env::set_var("KRAB_RUNTIME_ENDPOINTS_JSON", "{not json");
+
+        let err = TopologyRuntime::from_env_checked()
+            .expect_err("malformed endpoints JSON must be rejected")
+            .to_string();
+        assert!(err.contains("invalid KRAB_RUNTIME_ENDPOINTS_JSON"), "{err}");
+        clear_topology_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn from_env_checked_rejects_split_mode_with_empty_endpoint_map() {
+        clear_topology_env();
+        std::env::set_var("KRAB_RUNTIME_TOPOLOGY", "split");
+        std::env::set_var("KRAB_RUNTIME_ENDPOINTS_JSON", "{}");
+
+        let err = TopologyRuntime::from_env_checked()
+            .expect_err("distributed mode with no endpoints must be rejected")
+            .to_string();
+        assert!(err.contains("endpoint map is empty"), "{err}");
+        clear_topology_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn from_env_checked_rejects_split_mode_with_no_endpoints_var() {
+        clear_topology_env();
+        std::env::set_var("KRAB_RUNTIME_TOPOLOGY", "distributed");
+
+        let err = TopologyRuntime::from_env_checked()
+            .expect_err("distributed mode with no endpoint env must be rejected")
+            .to_string();
+        assert!(err.contains("endpoint map is empty"), "{err}");
+        clear_topology_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn lenient_from_env_swallows_malformed_values_with_defaults() {
+        clear_topology_env();
+        std::env::set_var("KRAB_RUNTIME_TOPOLOGY", "mesh");
+        std::env::set_var("KRAB_RUNTIME_ENDPOINTS_JSON", "{not json");
+
+        let runtime = TopologyRuntime::from_env();
+        assert_eq!(runtime.mode, ServiceTopology::Monolith);
+        assert!(runtime.endpoints.is_empty());
+        clear_topology_env();
     }
 }

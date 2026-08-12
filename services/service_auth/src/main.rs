@@ -661,7 +661,7 @@ fn build_app(state: AppState) -> Router {
 impl ApiService for AuthService {
     async fn start(&self) -> Result<()> {
         let state = AppState {
-            runtime: RuntimeState::new().with_protocol_config(
+            runtime: RuntimeState::try_new()?.with_protocol_config(
                 self.config
                     .protocol
                     .clone()
@@ -1171,7 +1171,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(graphql_attempt.status(), StatusCode::NOT_FOUND);
+        // As of 0.3.0, a request to a disabled route-family protocol is
+        // rejected up front with 400 PROTOCOL_NOT_SUPPORTED instead of falling
+        // through to a 404. service_auth exposes REST only, so the graphql
+        // family is disabled — the lockdown holds, now as an explicit rejection.
+        assert_eq!(graphql_attempt.status(), StatusCode::BAD_REQUEST);
 
         let rpc_attempt = app
             .oneshot(
@@ -1185,7 +1189,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(rpc_attempt.status(), StatusCode::NOT_FOUND);
+        // Same as the graphql path: the rpc family is disabled on this
+        // REST-only service and is now rejected with 400, not 404.
+        assert_eq!(rpc_attempt.status(), StatusCode::BAD_REQUEST);
 
         std::env::remove_var("KRAB_PROTOCOL_TOPOLOGY");
         std::env::remove_var("KRAB_PROTOCOL_EXPOSURE_MODE");

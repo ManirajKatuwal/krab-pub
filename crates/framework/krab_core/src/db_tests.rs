@@ -1,11 +1,12 @@
 #[cfg(test)]
 mod tests {
     use crate::db::{
-        detect_migration_drift, enforce_migration_governance, record_rollback_rehearsal,
-        rollback_to_version, run_versioned_migrations, DbPool, Migration, MigrationFailurePolicy,
-        MigrationGovernanceConfig,
+        detect_migration_drift, enforce_migration_governance, enforce_promotion_policy,
+        record_rollback_rehearsal, rollback_to_version, run_versioned_migrations, DbPool,
+        Migration, MigrationFailurePolicy, MigrationGovernanceConfig, PromotionConfig,
     };
     use anyhow::Result;
+    use serial_test::serial;
     use sqlx::postgres::PgPoolOptions;
 
     fn require_db_tests() -> bool {
@@ -27,7 +28,15 @@ mod tests {
     /// - otherwise: an unmistakable `SKIPPED` line goes to stderr before the
     ///   test returns early.
     async fn test_pool_or_skip(test_name: &str) -> Option<DbPool> {
-        let url = std::env::var("DATABASE_URL")
+        // `KRAB_TEST_DATABASE_URL` wins over `DATABASE_URL`: the secret-policy
+        // tests in `config.rs` legitimately set, clear, and overwrite
+        // `DATABASE_URL` while exercising sourcing rules, so in a full-suite
+        // run the ambient `DATABASE_URL` is unreliable by design. A dedicated
+        // variable nothing else touches keeps the live-database connection
+        // stable; `DATABASE_URL` and the localhost default remain fallbacks
+        // for single-test gate runs and CI compose files.
+        let url = std::env::var("KRAB_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
             .unwrap_or_else(|_| "postgres://postgres@localhost:5432/krab_test".to_string());
         match PgPoolOptions::new().max_connections(1).connect(&url).await {
             Ok(pool) => Some(pool),
@@ -49,7 +58,7 @@ mod tests {
     }
 
     async fn clean_test_db(pool: &DbPool) -> Result<()> {
-        sqlx::query("DROP TABLE IF EXISTS krab_migration_policy_audit, krab_migration_schema_ownership, krab_migration_rollback_rehearsals, krab_migrations, krab_migration_environment, user_audit_log, user_profiles, users")
+        sqlx::query("DROP TABLE IF EXISTS krab_migration_policy_audit, krab_migration_schema_ownership, krab_migration_rollback_rehearsals, krab_migrations, krab_migration_environment, user_audit_log, user_profiles, users, multi_stmt_items")
             .execute(pool)
             .await?;
         Ok(())
@@ -117,6 +126,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_migration_lifecycle() {
         let Some(pool) = test_pool_or_skip("test_migration_lifecycle").await else {
             return;
@@ -144,6 +154,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_migration_rollback() {
         let Some(pool) = test_pool_or_skip("test_migration_rollback").await else {
             return;
@@ -175,6 +186,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_drift_detection() {
         let Some(pool) = test_pool_or_skip("test_drift_detection").await else {
             return;
@@ -206,6 +218,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_governance_release_requires_rehearsal_artifact() {
         let Some(pool) =
             test_pool_or_skip("test_governance_release_requires_rehearsal_artifact").await
@@ -228,6 +241,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_governance_release_passes_with_rehearsal_artifact() {
         let Some(pool) =
             test_pool_or_skip("test_governance_release_passes_with_rehearsal_artifact").await
@@ -262,6 +276,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_legacy_checksum_rows_are_rewritten_not_flagged() {
         let Some(pool) =
             test_pool_or_skip("test_legacy_checksum_rows_are_rewritten_not_flagged").await
@@ -330,6 +345,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_true_checksum_mismatch_is_still_flagged() {
         let Some(pool) = test_pool_or_skip("test_true_checksum_mismatch_is_still_flagged").await
         else {
@@ -361,6 +377,158 @@ mod tests {
         assert!(
             rerun.is_err(),
             "a genuine checksum mismatch must still fail the migration run"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_multi_statement_migration_applies_and_rolls_back() {
+        let Some(pool) =
+            test_pool_or_skip("test_multi_statement_migration_applies_and_rolls_back").await
+        else {
+            return;
+        };
+        clean_test_db(&pool).await.expect("failed to clean db");
+
+        // A single migration whose body holds TWO statements. Under the
+        // prepared-statement protocol (`sqlx::query`) this fails at runtime;
+        // it must execute via the simple-query protocol (`sqlx::raw_sql`).
+        let migrations = vec![Migration {
+            version: 1,
+            name: "create_items_with_index",
+            sql: "CREATE TABLE multi_stmt_items (id BIGSERIAL PRIMARY KEY, label TEXT NOT NULL); \
+                  CREATE INDEX idx_multi_stmt_items_label ON multi_stmt_items(label);",
+            rollback_sql: Some(
+                "DROP INDEX IF EXISTS idx_multi_stmt_items_label; \
+                 DROP TABLE IF EXISTS multi_stmt_items;",
+            ),
+            critical: true,
+            destructive: false,
+        }];
+
+        let report = run_versioned_migrations(&pool, &migrations, MigrationFailurePolicy::Halt)
+            .await
+            .expect("multi-statement migration must apply");
+        assert_eq!(report.applied_versions, vec![1]);
+
+        // Both statements executed: table AND index exist.
+        let table_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_tables WHERE tablename = 'multi_stmt_items')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("failed to check table existence");
+        assert!(table_exists, "first statement (CREATE TABLE) must execute");
+
+        let index_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE indexname = 'idx_multi_stmt_items_label')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("failed to check index existence");
+        assert!(index_exists, "second statement (CREATE INDEX) must execute");
+
+        // Multi-statement rollback bodies must execute the same way.
+        rollback_to_version(&pool, &migrations, 0)
+            .await
+            .expect("multi-statement rollback must execute");
+
+        let table_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_tables WHERE tablename = 'multi_stmt_items')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("failed to re-check table existence");
+        assert!(!table_exists, "rollback must drop the table");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_governance_deny_records_audit_row_then_errors() {
+        let Some(pool) =
+            test_pool_or_skip("test_governance_deny_records_audit_row_then_errors").await
+        else {
+            return;
+        };
+        clean_test_db(&pool).await.expect("failed to clean db");
+
+        // Drive the deny through the real env knob, exactly as an operator
+        // would set it. Safe here: the whole db suite is #[serial].
+        std::env::set_var("DB_MIGRATION_ALLOW_APPLY", "false");
+        let from_env = MigrationGovernanceConfig::from_env();
+        std::env::remove_var("DB_MIGRATION_ALLOW_APPLY");
+        assert!(!from_env.allow_apply);
+
+        let cfg = MigrationGovernanceConfig {
+            service_name: "service_users".to_string(),
+            // "dev" is not a release environment, so the rehearsal gate stays
+            // out of the picture and the deny is attributable to allow_apply.
+            environment: "dev".to_string(),
+            ..from_env
+        };
+
+        let err = enforce_migration_governance(&pool, &cfg)
+            .await
+            .expect_err("DB_MIGRATION_ALLOW_APPLY=false must deny with an error, not Ok(())");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("DB_MIGRATION_ALLOW_APPLY"),
+            "deny error should name the governing variable: {message}"
+        );
+
+        // Record-then-deny: the audit row must exist despite the error.
+        let decision: String = sqlx::query_scalar(
+            "SELECT decision FROM krab_migration_policy_audit
+             WHERE service_name = $1 AND policy_name = 'migration_governance'
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind("service_users")
+        .fetch_one(&pool)
+        .await
+        .expect("audit row must be written before the deny error");
+        assert_eq!(decision, "deny");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_promotion_unknown_recorded_environment_errors() {
+        let Some(pool) =
+            test_pool_or_skip("test_promotion_unknown_recorded_environment_errors").await
+        else {
+            return;
+        };
+        clean_test_db(&pool).await.expect("failed to clean db");
+
+        // Plant a recorded environment outside the ladder, as a misconfigured
+        // deployment would ("production" instead of "prod"). This used to
+        // resolve to index 0 = "local", making any target look like a forward
+        // promotion.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS krab_migration_environment (environment TEXT PRIMARY KEY, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+        )
+        .execute(&pool)
+        .await
+        .expect("failed to create environment table");
+        sqlx::query("INSERT INTO krab_migration_environment (environment) VALUES ('production')")
+            .execute(&pool)
+            .await
+            .expect("failed to plant unknown environment");
+
+        let cfg = PromotionConfig {
+            environment: "prod".to_string(),
+            allow_apply: true,
+        };
+        let err = enforce_promotion_policy(&pool, &cfg)
+            .await
+            .expect_err("an unknown recorded environment must error, not pass as 'local'");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("production"),
+            "error should name the unknown environment: {message}"
+        );
+        assert!(
+            message.contains("staging"),
+            "error should list the known ladder: {message}"
         );
     }
 

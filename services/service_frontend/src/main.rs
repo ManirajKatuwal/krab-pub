@@ -817,9 +817,9 @@ fn render_home_page_localized(locale: &str) -> String {
     );
     let mut writer =
         ChunkedStreamWriter::new(1024, 2048).with_max_total_bytes(stream_budget_bytes());
-    writer.write("<!DOCTYPE html>");
-    writer.write_suspense_marker("home", SuspenseState::Pending);
-    writer.write("<div data-krab-hydration=\"home\">");
+    let _ = writer.write("<!DOCTYPE html>");
+    let _ = writer.write_suspense_marker("home", SuspenseState::Pending);
+    let _ = writer.write("<div data-krab-hydration=\"home\">");
     let mut rendered_html = guarded.render();
     if !hydration_preloads.is_empty() {
         rendered_html = rendered_html.replacen(
@@ -828,9 +828,9 @@ fn render_home_page_localized(locale: &str) -> String {
             1,
         );
     }
-    writer.write(&rendered_html);
-    writer.write("</div>");
-    writer.write_suspense_marker("home", SuspenseState::Resolved);
+    let _ = writer.write(&rendered_html);
+    let _ = writer.write("</div>");
+    let _ = writer.write_suspense_marker("home", SuspenseState::Resolved);
     writer.flush();
     let stream_telemetry = writer.telemetry_snapshot();
     tracing::debug!(
@@ -847,7 +847,16 @@ fn render_home_page_localized(locale: &str) -> String {
         stream_cancelled = stream_telemetry.stream_cancelled,
         cancel_reason = ?stream_telemetry.cancel_reason,
     );
-    writer.finish().concat()
+    let finished = writer.finish();
+    if !finished.is_complete() {
+        tracing::warn!(
+            route = "/",
+            budget_exceeded = finished.budget_exceeded,
+            cancelled = finished.cancelled,
+            "ssr_stream_truncated"
+        );
+    }
+    finished.concat()
 }
 
 async fn home_handler(headers: HeaderMap) -> Html<String> {
@@ -1125,7 +1134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
 
-    let topology_runtime = TopologyRuntime::from_env();
+    let topology_runtime = TopologyRuntime::from_env_checked()?;
     let auth_base_url = resolve_service_base_url(
         &topology_runtime,
         "auth",
@@ -1161,7 +1170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // `KRAB_REDIS_URL` set every replica reads and invalidates the same
     // entries. Without it this is a `MemoryStore` and behaves as before —
     // correct for one process, not for several.
-    let runtime = RuntimeState::new();
+    let runtime = RuntimeState::try_new()?;
     let isr_cache = IsrCache::with_store(runtime.store.clone());
 
     let state = AppState {
@@ -2154,6 +2163,103 @@ mod tests {
 
         std::env::remove_var("KRAB_CACHE_MAX_BODY_BYTES");
         std::env::remove_var("KRAB_CACHE_NAMESPACE");
+    }
+
+    /// Unlisted query params must not multiply cache entries: `/?a=1` and
+    /// `/?b=2` share one entry and serve identical HTML.
+    #[tokio::test]
+    async fn isr_cache_key_ignores_unlisted_query_params() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        std::env::remove_var("FRONTEND_ISR_QUERY_ALLOWLIST");
+
+        let state = test_state_with_protocol_client(std::time::Duration::from_secs(1));
+        let cache = state.isr_cache.clone();
+        let app = super::build_router(state);
+
+        let first = app
+            .clone()
+            .oneshot(Request::builder().uri("/?a=1").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            first.headers().get("x-cache").and_then(|v| v.to_str().ok()),
+            Some("MISS")
+        );
+        let first_html = first.into_body().collect().await.unwrap().to_bytes();
+
+        let second = app
+            .clone()
+            .oneshot(Request::builder().uri("/?b=2").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .headers()
+                .get("x-cache")
+                .and_then(|v| v.to_str().ok()),
+            Some("HIT"),
+            "a different unlisted query string must hit the same entry"
+        );
+        let second_html = second.into_body().collect().await.unwrap().to_bytes();
+
+        assert_eq!(
+            first_html, second_html,
+            "both query variants must serve identical HTML"
+        );
+        assert_eq!(
+            cache.len().await.unwrap(),
+            1,
+            "one cache entry per path, not per query string"
+        );
+    }
+
+    #[tokio::test]
+    async fn isr_cache_key_distinguishes_allowlisted_query_params() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        std::env::set_var("FRONTEND_ISR_QUERY_ALLOWLIST", "page");
+
+        let state = test_state_with_protocol_client(std::time::Duration::from_secs(1));
+        let cache = state.isr_cache.clone();
+        let app = super::build_router(state);
+
+        let x_cache = |uri: &str| {
+            let app = app.clone();
+            let uri = uri.to_string();
+            async move {
+                let response = app
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                response
+                    .headers()
+                    .get("x-cache")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string()
+            }
+        };
+
+        assert_eq!(x_cache("/?page=1").await, "MISS");
+        assert_eq!(
+            x_cache("/?page=1").await,
+            "HIT",
+            "the same allowlisted value must hit its entry"
+        );
+        assert_eq!(
+            x_cache("/?page=2").await,
+            "MISS",
+            "a different allowlisted value must get its own entry"
+        );
+        assert_eq!(cache.len().await.unwrap(), 2);
+
+        std::env::remove_var("FRONTEND_ISR_QUERY_ALLOWLIST");
     }
 
     #[tokio::test]

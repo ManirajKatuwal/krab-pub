@@ -284,7 +284,7 @@ impl HttpConfig {
 
 /// Unified application configuration loaded from environment variables.
 ///
-/// Call [`KrabConfig::from_env`] once at startup; pass the result (or
+/// Call [`KrabConfig::from_env_checked`] once at startup; pass the result (or
 /// specific sub-configs) through the dependency graph instead of reading
 /// `std::env::var` ad-hoc in individual modules.
 #[derive(Debug, Clone)]
@@ -334,6 +334,14 @@ fn parse_port_from_env(default_port: u16) -> Result<u16, ConfigError> {
 
 impl KrabConfig {
     /// Load all configuration from environment variables with typed defaults.
+    ///
+    /// Panics if `KRAB_PORT` holds a value that does not parse as a `u16`.
+    /// Startup paths must not panic — use [`KrabConfig::from_env_checked`]
+    /// and propagate the error instead.
+    #[deprecated(
+        since = "0.3.0",
+        note = "use from_env_checked; this panics on invalid KRAB_PORT"
+    )]
     pub fn from_env(default_service_name: &str, default_port: u16) -> Self {
         Self::from_env_checked(default_service_name, default_port)
             .expect("KrabConfig::from_env should only be used where invalid config is unrecoverable; prefer from_env_checked")
@@ -643,7 +651,7 @@ mod tests {
         std::env::set_var("KRAB_BEARER_TOKEN", "token");
         std::env::set_var("KRAB_CORS_ORIGINS", "https://app.example.com");
 
-        let cfg = KrabConfig::from_env("users", 3002);
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("KRAB_AUTH_MODE=static is not allowed"));
     }
@@ -657,7 +665,7 @@ mod tests {
         std::env::set_var("KRAB_AUTH_MODE", "jwt");
         std::env::set_var("KRAB_CORS_ORIGINS", "https://app.example.com");
 
-        let cfg = KrabConfig::from_env("users", 3002);
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("JWT/OIDC provider configuration required"));
     }
@@ -671,7 +679,7 @@ mod tests {
         std::env::set_var("KRAB_AUTH_MODE", "static");
         std::env::set_var("KRAB_BEARER_TOKEN", "token");
 
-        let cfg = KrabConfig::from_env("users", 3002);
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
         assert!(cfg.validate().is_ok());
     }
 
@@ -687,7 +695,7 @@ mod tests {
         std::env::set_var("KRAB_JWT_SECRET_FILE", "/run/secrets/krab_jwt_secret");
         std::env::set_var("KRAB_CORS_ORIGINS", "https://app.example.com");
 
-        let cfg = KrabConfig::from_env("users", 3002);
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
         assert!(cfg.validate().is_ok());
     }
 
@@ -703,7 +711,7 @@ mod tests {
         std::env::set_var("KRAB_JWT_SECRET", "secret-inline");
         std::env::set_var("KRAB_CORS_ORIGINS", "https://app.example.com");
 
-        let cfg = KrabConfig::from_env("users", 3002);
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("inline KRAB_JWT_SECRET/KRAB_JWT_KEYS_JSON is forbidden"));
     }
@@ -719,7 +727,7 @@ mod tests {
         std::env::set_var("KRAB_OIDC_AUDIENCE", "krab-api");
         std::env::set_var("KRAB_JWT_SECRET_FILE", "/run/secrets/krab_jwt_secret");
 
-        let cfg = KrabConfig::from_env("users", 3002);
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("KRAB_CORS_ORIGINS must be explicitly configured"));
     }
@@ -739,7 +747,7 @@ mod tests {
             "https://app.example.com,https://admin.example.com",
         );
 
-        let cfg = KrabConfig::from_env("users", 3002);
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
         assert!(cfg.validate().is_ok());
     }
 
@@ -760,6 +768,26 @@ mod tests {
             }
         );
         assert!(err.to_string().contains("invalid KRAB_PORT='invalid-port'"));
+        std::env::remove_var("KRAB_PORT");
+    }
+
+    /// The deprecated panicking wrapper must keep delegating to the checked
+    /// path so both constructors read identical configuration.
+    #[test]
+    #[serial]
+    #[allow(deprecated)]
+    fn deprecated_from_env_delegates_to_checked_variant() {
+        let _guard = env_lock();
+        clear_auth_env();
+        std::env::set_var("KRAB_PORT", "4711");
+
+        let via_deprecated = KrabConfig::from_env("users", 3002);
+        let via_checked =
+            KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
+
+        assert_eq!(via_deprecated.port, 4711);
+        assert_eq!(via_deprecated.port, via_checked.port);
+        assert_eq!(via_deprecated.service_name, via_checked.service_name);
         std::env::remove_var("KRAB_PORT");
     }
 
@@ -793,7 +821,7 @@ mod tests {
         std::env::set_var("DATABASE_URL", "postgres://localhost/krab");
         std::env::set_var("KRAB_REDIS_URL", "redis://localhost");
 
-        let cfg = KrabConfig::from_env("users", 3002);
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
         let report = cfg.validate_secrets_sources();
         assert!(report.is_clean(), "dev should allow inline secrets");
     }
@@ -806,7 +834,7 @@ mod tests {
         std::env::set_var("KRAB_ENVIRONMENT", "staging");
         std::env::set_var("DATABASE_URL", "postgres://staging/krab");
 
-        let cfg = KrabConfig::from_env("users", 3002);
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
         let report = cfg.validate_secrets_sources();
         assert!(!report.is_clean());
         assert!(
@@ -827,7 +855,7 @@ mod tests {
         std::env::set_var("KRAB_ENVIRONMENT", "prod");
         std::env::set_var("DATABASE_URL", "postgres://prod/krab");
 
-        let cfg = KrabConfig::from_env("users", 3002);
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
         let report = cfg.validate_secrets_sources();
         assert!(report.has_errors());
         let issue = report
@@ -847,7 +875,7 @@ mod tests {
         std::env::set_var("KRAB_ENVIRONMENT", "prod");
         std::env::set_var("DATABASE_URL_FILE", "/run/secrets/db_url");
 
-        let cfg = KrabConfig::from_env("users", 3002);
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
         let report = cfg.validate_secrets_sources();
         let db_issues: Vec<_> = report
             .issues
@@ -869,7 +897,7 @@ mod tests {
         std::env::set_var("DATABASE_URL", "postgres://prod/krab");
         std::env::set_var("KRAB_REDIS_URL", "redis://prod");
 
-        let cfg = KrabConfig::from_env("users", 3002);
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
         let report = cfg.validate_secrets_sources();
         assert!(report.issues.len() >= 2);
         for issue in &report.issues {
@@ -971,7 +999,7 @@ mod tests {
         std::env::set_var("KRAB_CORS_ORIGINS", "https://app.example.com");
         std::env::set_var("KRAB_JWT_SECRET", "inline-secret");
 
-        let cfg = KrabConfig::from_env("users", 3002);
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
         let err = cfg.validate_all().unwrap_err().to_string();
         assert!(err.contains("inline KRAB_JWT_SECRET/KRAB_JWT_KEYS_JSON is forbidden"));
     }
@@ -989,7 +1017,7 @@ mod tests {
         std::env::set_var("KRAB_JWT_SECRET_FILE", "/run/secrets/krab_jwt_secret");
         std::env::set_var("KRAB_BEARER_TOKEN", "still-not-allowed");
 
-        let cfg = KrabConfig::from_env("users", 3002);
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
         let err = cfg.validate_all().unwrap_err().to_string();
         assert!(err.contains("KRAB_BEARER_TOKEN must be unset/empty"));
     }
@@ -1008,7 +1036,7 @@ mod tests {
             "vault://kv/krab/providers-json",
         );
 
-        let cfg = KrabConfig::from_env("users", 3002);
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
         let err = cfg.validate_all().unwrap_err().to_string();
         assert!(
             err.contains("JWT/OIDC provider configuration required")
@@ -1035,7 +1063,7 @@ mod tests {
             r#"[{"name":"main","issuer":"https://issuer.example.com","keys":{"default":"k"}}]"#,
         );
 
-        let cfg = KrabConfig::from_env("users", 3002);
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
         let err = cfg.validate().unwrap_err().to_string();
         assert!(
             err.contains("must declare non-empty 'issuer' and 'audience'"),
@@ -1056,7 +1084,7 @@ mod tests {
             r#"[{"name":"main","audience":"krab-api","keys":{"default":"k"}}]"#,
         );
 
-        let cfg = KrabConfig::from_env("users", 3002);
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
         let err = cfg.validate().unwrap_err().to_string();
         assert!(
             err.contains("must declare non-empty 'issuer' and 'audience'"),
@@ -1077,7 +1105,7 @@ mod tests {
             r#"[{"name":"main","issuer":"https://issuer.example.com","audience":"krab-api","keys":{"default":"k"}}]"#,
         );
 
-        let cfg = KrabConfig::from_env("users", 3002);
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
         assert!(cfg.validate().is_ok());
     }
 
@@ -1113,7 +1141,7 @@ mod tests {
         std::env::set_var("KRAB_JWT_SECRET_FILE", "/run/secrets/krab_jwt_secret");
         std::env::set_var("KRAB_JWT_ALLOWED_ALGS", "HS256,RS256");
 
-        let cfg = KrabConfig::from_env("users", 3002);
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
         let err = cfg.validate().unwrap_err().to_string();
         assert!(
             err.contains("mixes HMAC (HS*) and asymmetric"),
@@ -1134,7 +1162,7 @@ mod tests {
         std::env::set_var("KRAB_JWT_SECRET_FILE", "/run/secrets/krab_jwt_secret");
         std::env::set_var("KRAB_JWT_ALLOWED_ALGS", "RS256,ES256");
 
-        let cfg = KrabConfig::from_env("users", 3002);
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
         assert!(cfg.validate().is_ok());
     }
 
@@ -1152,7 +1180,7 @@ mod tests {
             r#"[{"name":"main","keys":{"default":"k"}}]"#,
         );
 
-        let cfg = KrabConfig::from_env("users", 3002);
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
         assert!(cfg.validate().is_ok());
     }
 }

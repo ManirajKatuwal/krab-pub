@@ -29,10 +29,13 @@ pub(crate) async fn ws_chat_handler(ws: WebSocketUpgrade) -> impl axum::response
 
 pub(crate) async fn handle_ws_chat_socket(socket: WebSocket) {
     let room = ws_manager().room("chat").await;
-    room.connect().await;
+    // RAII connection tracking: the guard decrements on drop, so an aborted
+    // send task or a panic in the receive loop cannot leak the count. This also
+    // replaces the previous connect()-once / disconnect()-twice pairing, which
+    // over-decremented on every socket.
+    let _connection_guard = room.join();
     let mut subscription = room.subscribe();
     let (mut sender, mut receiver) = socket.split();
-    let room_for_sender = room.clone();
 
     let send_task = tokio::spawn(async move {
         while let Ok(message) = subscription.recv().await {
@@ -57,7 +60,6 @@ pub(crate) async fn handle_ws_chat_socket(socket: WebSocket) {
                 }
             }
         }
-        room_for_sender.disconnect().await;
     });
 
     while let Some(Ok(incoming)) = receiver.next().await {
@@ -77,5 +79,6 @@ pub(crate) async fn handle_ws_chat_socket(socket: WebSocket) {
     }
 
     send_task.abort();
-    room.disconnect().await;
+    // `_connection_guard` drops here, decrementing the room's connection count
+    // exactly once for this socket.
 }

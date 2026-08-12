@@ -56,9 +56,13 @@ mod tests {
             "KRAB_JWT_REQUIRE_KID",
             "KRAB_AUTH_OPEN_PATHS",
             "KRAB_TRUST_PROXY_HEADERS",
+            "KRAB_TRUSTED_PROXY_HOPS",
             "KRAB_RATE_LIMIT_CAPACITY",
             "KRAB_RATE_LIMIT_REFILL_PER_SEC",
             "KRAB_RATE_LIMIT_FAIL_OPEN",
+            "KRAB_HTTP_REQUEST_TIMEOUT_SECS",
+            "KRAB_HTTP_MAX_CONCURRENCY",
+            "KRAB_PROTOCOL_TENANT_HINT_UNTRUSTED",
         ] {
             std::env::remove_var(key);
         }
@@ -525,6 +529,47 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// A typo in `KRAB_AUTH_ROUTE_POLICIES_JSON` used to parse to an empty
+    /// policy set — every configured restriction silently vanished, fail-open.
+    /// A configured-but-unparseable policy set must reject the request.
+    #[tokio::test]
+    #[serial]
+    async fn test_malformed_route_policy_json_fails_closed() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+        std::env::set_var(
+            "KRAB_AUTH_ROUTE_POLICIES_JSON",
+            // Trailing comma makes this invalid JSON. The prefix deliberately
+            // does not match the request path: the parse failure alone must
+            // reject, before any prefix filtering.
+            r#"[{"prefix":"/api/reports","all_scopes":["audit.read"],}]"#,
+        );
+
+        let app = test_app();
+        let claims = json!({
+            "sub": "user",
+            "scope": "audit.read",
+            "exp": 9999999999i64
+        });
+        let token = generate_token(claims);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("x-forwarded-for", "10.10.0.8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     /// `service_auth_middleware` reads the `AuthContext` extension that
     /// `auth_middleware` inserts. The layers used to run in the wrong order
     /// (scope check before auth), so a request with a perfectly valid token
@@ -683,6 +728,369 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "with an explicit open-path list omitting it, /metrics must require auth"
         );
+    }
+
+    fn multi_protocol_config() -> crate::protocol::ProtocolConfig {
+        crate::protocol::ProtocolConfig {
+            exposure_mode: crate::protocol::ExposureMode::Multi,
+            enabled_protocols: vec![
+                crate::protocol::ProtocolKind::Rest,
+                crate::protocol::ProtocolKind::Graphql,
+                crate::protocol::ProtocolKind::Rpc,
+            ],
+            default_protocol: crate::protocol::ProtocolKind::Rest,
+            topology: crate::protocol::DeploymentTopology::SingleService,
+            policy: crate::protocol::ProtocolPolicy::default(),
+            allow_runtime_switch_header: false,
+        }
+    }
+
+    /// A route family whose protocol is disabled used to pass through the
+    /// protocol middleware unresolved, exposing the disabled surface. It must
+    /// now be rejected with PROTOCOL_NOT_SUPPORTED.
+    #[tokio::test]
+    #[serial]
+    async fn test_disabled_route_family_is_rejected() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+
+        let config = crate::protocol::ProtocolConfig {
+            exposure_mode: crate::protocol::ExposureMode::Single,
+            enabled_protocols: vec![crate::protocol::ProtocolKind::Rest],
+            default_protocol: crate::protocol::ProtocolKind::Rest,
+            topology: crate::protocol::DeploymentTopology::SingleService,
+            policy: crate::protocol::ProtocolPolicy::default(),
+            allow_runtime_switch_header: false,
+        };
+        let state = TestState {
+            runtime: RuntimeState::new().with_protocol_config(config),
+        };
+        let app = apply_common_http_layers(
+            Router::new().route("/api/v1/graphql", axum::routing::post(|| async { "gql" })),
+            state.clone(),
+        )
+        .with_state(state);
+
+        let token = generate_token(json!({
+            "sub": "user",
+            "exp": 9999999999i64
+        }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/graphql")
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("x-forwarded-for", "10.10.0.60")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "a disabled route family must be rejected, not passed through"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed.get("code").and_then(|v| v.as_str()),
+            Some("PROTOCOL_NOT_SUPPORTED")
+        );
+    }
+
+    /// Protocol resolution now runs INSIDE auth (it needs AuthContext for
+    /// tenant policy), while metrics stays outside auth. Metrics must still
+    /// label requests with the resolved protocol, learned from the response
+    /// extension the protocol middleware mirrors back.
+    #[tokio::test]
+    #[serial]
+    async fn test_metrics_label_resolved_protocol_after_reorder() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+
+        let state = TestState {
+            runtime: RuntimeState::new().with_protocol_config(multi_protocol_config()),
+        };
+        let app = apply_common_http_layers(
+            Router::new().route("/api/v1/graphql", axum::routing::post(|| async { "gql" })),
+            state.clone(),
+        )
+        .with_state(state.clone());
+
+        let token = generate_token(json!({
+            "sub": "user",
+            "exp": 9999999999i64
+        }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/graphql")
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("x-forwarded-for", "10.10.0.61")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-krab-protocol")
+                .and_then(|v| v.to_str().ok()),
+            Some("graphql")
+        );
+        // Index 1 is graphql; index 3 is "unknown", which is where the count
+        // would land if metrics could no longer see the resolved protocol.
+        assert_eq!(
+            state.runtime.protocol_request_totals[1].load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "metrics must label the request as graphql"
+        );
+        assert_eq!(
+            state.runtime.protocol_request_totals[3].load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the request must not be counted as protocol=unknown"
+        );
+    }
+
+    /// The 429 from the global rate limiter must carry the new
+    /// `rate_limited` wire category.
+    #[tokio::test]
+    #[serial]
+    async fn test_rate_limited_response_body_category() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+        std::env::set_var("KRAB_RATE_LIMIT_CAPACITY", "1");
+        std::env::set_var("KRAB_RATE_LIMIT_REFILL_PER_SEC", "1");
+
+        let app = test_app();
+
+        // Capacity 1 and a 1-second window: of three back-to-back requests
+        // from the same IP, at least two share a window, so at least one is
+        // rate limited even if a window boundary is crossed mid-test.
+        let mut limited_body = None;
+        for _ in 0..3 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .header("x-forwarded-for", "10.10.9.9")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap();
+                limited_body = Some(body);
+                break;
+            }
+        }
+
+        let body = limited_body.expect("one of three requests must be rate limited");
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed.get("category").and_then(|v| v.as_str()),
+            Some("rate_limited")
+        );
+        assert_eq!(
+            parsed.get("code").and_then(|v| v.as_str()),
+            Some("TOO_MANY_REQUESTS")
+        );
+    }
+
+    /// A handler that overruns `KRAB_HTTP_REQUEST_TIMEOUT_SECS` must produce
+    /// a timeout status, and the shed response must still pass through the
+    /// security-headers layer.
+    #[tokio::test]
+    #[serial]
+    async fn test_request_timeout_produces_408_with_security_headers() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+        std::env::set_var("KRAB_AUTH_OPEN_PATHS", "/slow");
+        std::env::set_var("KRAB_HTTP_REQUEST_TIMEOUT_SECS", "1");
+
+        let state = TestState {
+            runtime: RuntimeState::new(),
+        };
+        let app = apply_common_http_layers(
+            Router::new().route(
+                "/slow",
+                axum::routing::get(|| async {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    "too-late"
+                }),
+            ),
+            state.clone(),
+        )
+        .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/slow")
+                    .header("x-forwarded-for", "10.10.0.62")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-content-type-options")
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff"),
+            "timeout responses must still pass through the security-headers layer"
+        );
+    }
+
+    /// With `KRAB_HTTP_MAX_CONCURRENCY=1`, two concurrent requests to a slow
+    /// handler are serialized by the concurrency limit.
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_limit_serializes_requests() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+        std::env::set_var("KRAB_AUTH_OPEN_PATHS", "/slow");
+        std::env::set_var("KRAB_HTTP_MAX_CONCURRENCY", "1");
+
+        let state = TestState {
+            runtime: RuntimeState::new(),
+        };
+        let app = apply_common_http_layers(
+            Router::new().route(
+                "/slow",
+                axum::routing::get(|| async {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    "done"
+                }),
+            ),
+            state.clone(),
+        )
+        .with_state(state);
+
+        let request = |ip: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri("/slow")
+                        .header("x-forwarded-for", ip)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let started = std::time::Instant::now();
+        let (first, second) = tokio::join!(request("10.10.0.63"), request("10.10.0.64"));
+        let elapsed = started.elapsed();
+
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
+        assert!(
+            elapsed >= Duration::from_millis(550),
+            "with max concurrency 1 the two 300ms requests must run serially, took {elapsed:?}"
+        );
+    }
+
+    /// The JWT verifier cache is built once per `RuntimeState`: rotating the
+    /// env secret mid-flight must not affect an existing state (no
+    /// per-request provider reload), while a freshly built state picks up
+    /// the new secret.
+    #[tokio::test]
+    #[serial]
+    async fn test_jwt_verifier_cache_reused_across_requests() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+
+        let (app, _state) = test_app_and_state();
+        let token = generate_token(json!({
+            "sub": "user",
+            "exp": 9999999999i64
+        }));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("x-forwarded-for", "10.10.0.65")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Rotate the env secret. The existing state's cache must keep
+        // verifying with the material it was built from.
+        std::env::set_var("KRAB_JWT_SECRET", "rotated-secret");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("x-forwarded-for", "10.10.0.66")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the cached provider must be reused; a per-request env reload would reject this token"
+        );
+
+        // A fresh state (fresh cache) sees the rotated secret and rejects
+        // the old token.
+        let fresh_app = test_app();
+        let response = fresh_app
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("x-forwarded-for", "10.10.0.67")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

@@ -27,7 +27,23 @@ This document is the public API contract for currently exposed HTTP and GraphQL 
 | `BAD_REQUEST` / `VALIDATION_ERROR` | 400 |
 | `CONFLICT` | 409 |
 | `TOO_MANY_REQUESTS` | 429 |
+| `PROTOCOL_NOT_SUPPORTED` | 400 |
 | `INTERNAL_SERVER_ERROR` | 500 |
+
+The error envelope also carries a machine-readable `category`. As of **0.3.0**
+the category set gained `rate_limited` (429) and `unauthenticated` (401), and
+HTTP status derives from the category alone rather than from special-cased code
+strings. Two consequences for clients on the 0.2.x → 0.3.0 upgrade:
+
+- An `ApiError` built with `category=authz` and `code=UNAUTHORIZED` now maps to
+  **403**; use the `unauthenticated` category (401) for authentication failures.
+- A `code=TOO_MANY_REQUESTS` under any category other than `rate_limited` no
+  longer forces **429**; rate limiting now uses the `rate_limited` category.
+
+A request to a route family whose protocol is disabled by configuration returns
+**400 `PROTOCOL_NOT_SUPPORTED`** (previously it reached the handler). Requests
+rejected before protocol resolution (401/429) are labeled `protocol="unknown"`
+in metrics and traces.
 
 ## 2. Standard service endpoints
 

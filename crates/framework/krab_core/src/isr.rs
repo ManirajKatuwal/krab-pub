@@ -138,6 +138,31 @@ impl IsrEntry {
 /// the same store (rate limiter counters, sessions).
 const DEFAULT_NAMESPACE: &str = "krab:isr";
 
+/// Separator between the namespace and the path in stored keys.
+///
+/// A control character that cannot appear in a namespace or URL path. With the
+/// previous `':'` separator, namespace `"krab:isr"` produced the key prefix
+/// `"krab:isr:"`, which also prefix-matched every key of a sibling namespace
+/// such as `"krab:isr:site"` — so `invalidate_all` on one cache wiped the
+/// other. `'\u{1}'` cannot occur inside a namespace-plus-separator string, so
+/// a namespace can never prefix-match a sibling.
+///
+/// Changing the separator orphans entries written under the old format: they
+/// simply miss and repopulate (one-time cold start, absorbed by the render
+/// lease). The orphaned old-format keys age out via their TTL; old `Static`
+/// entries (no TTL) linger in Redis until a manual cleanup but are never read.
+const KEY_SEPARATOR: char = '\u{1}';
+
+/// Separator for render-lease keys, distinct from [`KEY_SEPARATOR`] so leases
+/// never show up in entry listings (`len`, `stale_paths`, `invalidate_*`).
+const LEASE_SEPARATOR: char = '\u{2}';
+
+/// How long a cold-miss render lease is held before it expires on its own.
+///
+/// Long enough to cover a slow first render, short enough that a crashed
+/// winner does not block regeneration for more than one burst.
+const RENDER_LEASE_TTL: Duration = Duration::from_secs(10);
+
 /// How long a `Revalidate` entry is retained beyond its `max_age`.
 ///
 /// ISR serves stale content while revalidating in the background, so the stored
@@ -238,11 +263,27 @@ impl IsrCache {
     }
 
     /// Invalidate every path matching a prefix. Returns how many were removed.
+    ///
+    /// Matching is segment-aware: `invalidate_prefix("/blog")` removes
+    /// `/blog` and `/blog/…` but not `/blog-archive`. A prefix ending in `'/'`
+    /// (or the empty prefix, i.e. [`invalidate_all`](Self::invalidate_all))
+    /// keeps plain prefix semantics.
     pub async fn invalidate_prefix(&self, prefix: &str) -> Result<usize> {
-        let keys = self.store.keys_with_prefix(&self.key(prefix)).await?;
+        let full_prefix = self.key(prefix);
+        let keys = self.store.keys_with_prefix(&full_prefix).await?;
+        let boundary_exempt = prefix.is_empty() || prefix.ends_with('/');
 
         let mut removed = 0;
         for key in keys {
+            if !boundary_exempt {
+                let on_segment_boundary = key
+                    .strip_prefix(&full_prefix)
+                    .map(|rest| rest.is_empty() || rest.starts_with('/'))
+                    .unwrap_or(false);
+                if !on_segment_boundary {
+                    continue;
+                }
+            }
             if self.store.delete(&key).await? {
                 removed += 1;
             }
@@ -296,9 +337,75 @@ impl IsrCache {
             .map(|entry| (entry.html.clone(), entry.is_stale())))
     }
 
-    fn key(&self, path: &str) -> String {
-        format!("{}:{}", self.namespace, path)
+    /// Serve with cold-miss single-flight.
+    ///
+    /// A bare `get` on a cold key lets every concurrent request render the
+    /// page (a cold-miss stampede). This variant takes a short-TTL render
+    /// lease on a miss so exactly one caller per replica-set wins:
+    ///
+    /// - [`IsrServeOutcome::Hit`] — a cached entry (possibly stale) to serve.
+    /// - [`IsrServeOutcome::MissAcquired`] — this caller holds the lease; it
+    ///   must render, [`put`](Self::put) the result, and then
+    ///   [`release_lease`](Self::release_lease).
+    /// - [`IsrServeOutcome::MissLocked`] — another caller is already
+    ///   rendering; either render anyway (safe fallback) or briefly poll
+    ///   [`get`](Self::get) for the winner's entry.
+    ///
+    /// If the lease write fails, this fails open to `MissAcquired`: a degraded
+    /// store must never stop pages from rendering.
+    pub async fn serve_or_lease(&self, path: &str) -> Result<IsrServeOutcome> {
+        if let Some(entry) = self.get(path).await? {
+            return Ok(IsrServeOutcome::Hit(entry));
+        }
+
+        match self
+            .store
+            .set_if_absent(&self.lease_key(path), "1", RENDER_LEASE_TTL)
+            .await
+        {
+            Ok(true) => Ok(IsrServeOutcome::MissAcquired),
+            Ok(false) => Ok(IsrServeOutcome::MissLocked),
+            Err(error) => {
+                tracing::warn!(
+                    event = "isr_render_lease_failed",
+                    path,
+                    %error,
+                    "lease store unavailable; failing open to render"
+                );
+                Ok(IsrServeOutcome::MissAcquired)
+            }
+        }
     }
+
+    /// Release the cold-miss render lease for a path.
+    ///
+    /// Call after the winning render's [`put`](Self::put) (or after a failed
+    /// render) so the next miss does not have to wait out the lease TTL. The
+    /// lease also expires on its own, so failing to release is safe.
+    pub async fn release_lease(&self, path: &str) -> Result<bool> {
+        self.store.delete(&self.lease_key(path)).await
+    }
+
+    fn key(&self, path: &str) -> String {
+        format!("{}{}{}", self.namespace, KEY_SEPARATOR, path)
+    }
+
+    fn lease_key(&self, path: &str) -> String {
+        format!("{}{}{}", self.namespace, LEASE_SEPARATOR, path)
+    }
+}
+
+/// Outcome of [`IsrCache::serve_or_lease`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IsrServeOutcome {
+    /// A cached entry exists; serve it (check [`IsrEntry::is_stale`] to decide
+    /// whether to also start background revalidation).
+    Hit(IsrEntry),
+    /// Cold miss and this caller won the render lease: render, `put`, then
+    /// `release_lease`.
+    MissAcquired,
+    /// Cold miss and another caller holds the render lease.
+    MissLocked,
 }
 
 /// Store TTL for a policy. `Duration::ZERO` means no expiry.
@@ -527,12 +634,183 @@ mod tests {
     async fn an_undecodable_stored_value_is_treated_as_a_miss() {
         let store = Arc::new(MemoryStore::new());
         store
-            .set("krab:isr:/broken", "not json", Duration::ZERO)
+            .set("krab:isr\u{1}/broken", "not json", Duration::ZERO)
             .await
             .unwrap();
 
         let cache = IsrCache::with_store(store);
         assert!(cache.get("/broken").await.unwrap().is_none());
+    }
+
+    /// Regression for the separator over-match: with the old `':'` separator,
+    /// namespace `"krab:isr"` produced prefix `"krab:isr:"`, which also
+    /// matched every `"krab:isr:site"` key — `invalidate_all` on the default
+    /// cache wiped the sibling namespace.
+    #[tokio::test]
+    async fn invalidate_all_leaves_sibling_namespaces_untouched() {
+        let store = Arc::new(MemoryStore::new());
+        let default_ns = IsrCache::with_store(store.clone());
+        let site = IsrCache::with_store(store).with_namespace("krab:isr:site");
+
+        default_ns.put("/a", "A", IsrPolicy::Static).await.unwrap();
+        site.put("/a", "site-A", IsrPolicy::Static).await.unwrap();
+
+        assert_eq!(default_ns.invalidate_all().await.unwrap(), 1);
+        assert!(default_ns.is_empty().await.unwrap());
+        assert_eq!(
+            site.len().await.unwrap(),
+            1,
+            "invalidating namespace \"krab:isr\" must not reach \"krab:isr:site\""
+        );
+        assert_eq!(site.get("/a").await.unwrap().unwrap().html, "site-A");
+    }
+
+    #[tokio::test]
+    async fn invalidate_prefix_respects_path_segment_boundaries() {
+        let cache = IsrCache::new();
+        cache
+            .put("/blog", "index", IsrPolicy::Static)
+            .await
+            .unwrap();
+        cache.put("/blog/a", "A", IsrPolicy::Static).await.unwrap();
+        cache
+            .put("/blog-archive", "old", IsrPolicy::Static)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cache.invalidate_prefix("/blog").await.unwrap(),
+            2,
+            "only /blog and /blog/a sit on the /blog segment boundary"
+        );
+        assert!(
+            cache.get("/blog-archive").await.unwrap().is_some(),
+            "/blog-archive merely shares characters with /blog and must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_prefix_with_trailing_slash_keeps_plain_prefix_semantics() {
+        let cache = IsrCache::new();
+        cache.put("/blog/a", "A", IsrPolicy::Static).await.unwrap();
+        cache
+            .put("/blog/ab", "AB", IsrPolicy::Static)
+            .await
+            .unwrap();
+
+        assert_eq!(cache.invalidate_prefix("/blog/a").await.unwrap(), 1);
+        assert!(cache.get("/blog/ab").await.unwrap().is_some());
+        assert_eq!(cache.invalidate_prefix("/blog/").await.unwrap(), 1);
+        assert!(cache.is_empty().await.unwrap());
+    }
+
+    /// The cold-miss stampede fix: N concurrent requests on a cold key must
+    /// run the renderer exactly once; everyone else either waits out the
+    /// winner or observes the lease.
+    #[tokio::test]
+    async fn concurrent_cold_serves_run_the_renderer_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = IsrCache::with_store(Arc::new(MemoryStore::new()));
+        let renders = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+
+        for _ in 0..16 {
+            let cache = cache.clone();
+            let renders = renders.clone();
+            tasks.push(tokio::spawn(async move {
+                match cache.serve_or_lease("/cold").await.unwrap() {
+                    IsrServeOutcome::Hit(entry) => entry.html,
+                    IsrServeOutcome::MissAcquired => {
+                        // The winner renders and populates.
+                        renders.fetch_add(1, Ordering::SeqCst);
+                        cache
+                            .put("/cold", "<h1>rendered</h1>", IsrPolicy::Static)
+                            .await
+                            .unwrap();
+                        cache.release_lease("/cold").await.unwrap();
+                        "<h1>rendered</h1>".to_string()
+                    }
+                    IsrServeOutcome::MissLocked => {
+                        // Losers poll briefly for the winner's entry.
+                        for _ in 0..100 {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            if let Some(entry) = cache.get("/cold").await.unwrap() {
+                                return entry.html;
+                            }
+                        }
+                        panic!("winner never populated the cache");
+                    }
+                }
+            }));
+        }
+
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), "<h1>rendered</h1>");
+        }
+        assert_eq!(
+            renders.load(Ordering::SeqCst),
+            1,
+            "a cold-miss burst must render exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn releasing_the_lease_lets_the_next_miss_acquire_it() {
+        let cache = IsrCache::new();
+
+        assert_eq!(
+            cache.serve_or_lease("/x").await.unwrap(),
+            IsrServeOutcome::MissAcquired
+        );
+        assert_eq!(
+            cache.serve_or_lease("/x").await.unwrap(),
+            IsrServeOutcome::MissLocked
+        );
+
+        // A failed render releases without a put; the next caller retries.
+        assert!(cache.release_lease("/x").await.unwrap());
+        assert_eq!(
+            cache.serve_or_lease("/x").await.unwrap(),
+            IsrServeOutcome::MissAcquired
+        );
+    }
+
+    /// Lease keys use a separator outside the entry keyspace, so they must be
+    /// invisible to listings and counts.
+    #[tokio::test]
+    async fn render_leases_do_not_appear_as_cache_entries() {
+        let cache = IsrCache::new();
+        assert_eq!(
+            cache.serve_or_lease("/leased").await.unwrap(),
+            IsrServeOutcome::MissAcquired
+        );
+
+        assert!(cache.is_empty().await.unwrap());
+        assert!(cache.stale_paths().await.unwrap().is_empty());
+        assert_eq!(cache.invalidate_all().await.unwrap(), 0);
+        // The lease survives invalidate_all (it is not an entry) …
+        assert_eq!(
+            cache.serve_or_lease("/leased").await.unwrap(),
+            IsrServeOutcome::MissLocked
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_or_lease_returns_hit_after_populate() {
+        let cache = IsrCache::new();
+        cache
+            .put("/warm", "<p>warm</p>", IsrPolicy::Static)
+            .await
+            .unwrap();
+
+        match cache.serve_or_lease("/warm").await.unwrap() {
+            IsrServeOutcome::Hit(entry) => {
+                assert_eq!(entry.html, "<p>warm</p>");
+                assert!(!entry.is_stale());
+            }
+            other => panic!("expected a hit, got {other:?}"),
+        }
     }
 
     #[test]

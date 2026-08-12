@@ -218,15 +218,19 @@ impl ProtocolConfig {
 
         let mut policy = ProtocolPolicy::default();
 
+        // Malformed policy JSON must not silently drop every restriction:
+        // log loudly here, and `validate()` reports it as a startup error.
         if let Ok(raw) = std::env::var("KRAB_PROTOCOL_RESTRICTED_OPS_JSON") {
-            if let Some(restricted_operations) = parse_protocol_map_json(&raw) {
-                policy.restricted_operations = restricted_operations;
+            match parse_protocol_map_json(&raw) {
+                Some(restricted_operations) => policy.restricted_operations = restricted_operations,
+                None => tracing::error!("protocol_restricted_ops_json_malformed"),
             }
         }
 
         if let Ok(raw) = std::env::var("KRAB_PROTOCOL_TENANT_OVERRIDES_JSON") {
-            if let Some(tenant_overrides) = parse_protocol_map_json(&raw) {
-                policy.tenant_overrides = tenant_overrides;
+            match parse_protocol_map_json(&raw) {
+                Some(tenant_overrides) => policy.tenant_overrides = tenant_overrides,
+                None => tracing::error!("protocol_tenant_overrides_json_malformed"),
             }
         }
 
@@ -278,6 +282,34 @@ impl ProtocolConfig {
                         protocol.as_str()
                     ));
                 }
+            }
+        }
+
+        // Policy env vars that failed to parse never made it into
+        // `self.policy`, so the loops above cannot see them. Re-check the raw
+        // sources: bad JSON silently dropping every restriction (fail-open)
+        // and an unknown protocol name silently becoming deny-all are both
+        // config mistakes that must fail startup, not pass validation.
+        for env_key in [
+            "KRAB_PROTOCOL_RESTRICTED_OPS_JSON",
+            "KRAB_PROTOCOL_TENANT_OVERRIDES_JSON",
+        ] {
+            let Ok(raw) = std::env::var(env_key) else {
+                continue;
+            };
+            match serde_json::from_str::<HashMap<String, Vec<String>>>(&raw) {
+                Ok(map) => {
+                    for (entry, protocols) in map {
+                        for name in protocols {
+                            if ProtocolKind::parse(&name).is_none() {
+                                errors.push(format!(
+                                    "{env_key}: entry '{entry}' names unknown protocol '{name}'"
+                                ));
+                            }
+                        }
+                    }
+                }
+                Err(error) => errors.push(format!("{env_key} is not valid JSON: {error}")),
             }
         }
 

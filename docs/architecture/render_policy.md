@@ -10,7 +10,7 @@ Krab route behavior is expressed with `RouteRenderPolicy`:
 > depending on which instance answers. Build it over the shared store instead:
 >
 > ```rust,ignore
-> let runtime = RuntimeState::new();               // reads KRAB_REDIS_URL
+> let runtime = RuntimeState::try_new()?;           // reads KRAB_REDIS_URL, fails closed outside dev
 > let isr_cache = IsrCache::with_store(runtime.store.clone());
 > ```
 >

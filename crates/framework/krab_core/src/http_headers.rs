@@ -2,7 +2,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
-    STRICT_TRANSPORT_SECURITY, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
+    STRICT_TRANSPORT_SECURITY, VARY, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
 };
 use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode};
 use axum::middleware::Next;
@@ -60,6 +60,14 @@ pub fn cors_allow_headers_value() -> &'static str {
     "authorization,content-type,x-request-id,x-trace-id"
 }
 
+/// Mark the response as varying by request `Origin` so shared caches key on
+/// it — required whenever the `Access-Control-Allow-Origin` decision depends
+/// on the request origin.
+fn append_vary_origin(resp: &mut Response) {
+    resp.headers_mut()
+        .append(VARY, HeaderValue::from_static("origin"));
+}
+
 fn cors_preflight_response(origin: &str) -> Option<Response> {
     let origin_header = HeaderValue::from_str(origin).ok()?;
     let methods_header = HeaderValue::from_str(cors_allow_methods_value()).ok()?;
@@ -73,6 +81,7 @@ fn cors_preflight_response(origin: &str) -> Option<Response> {
         .insert(ACCESS_CONTROL_ALLOW_METHODS, methods_header);
     resp.headers_mut()
         .insert(ACCESS_CONTROL_ALLOW_HEADERS, headers_header);
+    append_vary_origin(&mut resp);
     Some(resp)
 }
 
@@ -96,6 +105,7 @@ fn append_cors_headers(resp: &mut Response, origin: &str) -> bool {
         .insert(ACCESS_CONTROL_ALLOW_METHODS, methods_header);
     resp.headers_mut()
         .insert(ACCESS_CONTROL_ALLOW_HEADERS, headers_header);
+    append_vary_origin(resp);
     true
 }
 
@@ -103,6 +113,7 @@ pub async fn cors_middleware<S>(State(state): State<S>, req: Request<Body>, next
 where
     S: Clone + Send + Sync + 'static + HasRuntimeState,
 {
+    let has_origin_header = req.headers().contains_key("origin");
     let request_origin = req
         .headers()
         .get("origin")
@@ -118,7 +129,10 @@ where
     )
     .map(|s| s.to_string());
 
-    if req.method() == Method::OPTIONS {
+    // An OPTIONS request without an Origin header is not a CORS preflight —
+    // it falls through to the router like any other request. Only OPTIONS
+    // carrying an Origin is treated as preflight and answered here.
+    if req.method() == Method::OPTIONS && has_origin_header {
         match allowed_origin {
             Some(origin) => {
                 if let Some(resp) = cors_preflight_response(&origin) {
@@ -132,6 +146,7 @@ where
             None => {
                 let mut resp = Response::new(Body::empty());
                 *resp.status_mut() = StatusCode::FORBIDDEN;
+                append_vary_origin(&mut resp);
                 return resp;
             }
         }
@@ -144,4 +159,149 @@ where
         }
     }
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, VARY};
+    use axum::http::{Method, Request, StatusCode};
+    use axum::middleware;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    use super::cors_middleware;
+    use crate::http::{HasRuntimeState, RuntimeState};
+
+    #[derive(Clone)]
+    struct TestState {
+        runtime: RuntimeState,
+    }
+
+    impl HasRuntimeState for TestState {
+        fn runtime_state(&self) -> &RuntimeState {
+            &self.runtime
+        }
+    }
+
+    /// Router with only the CORS middleware applied, configured with a fixed
+    /// origin allowlist so the tests do not depend on process env.
+    fn cors_app(allowed: &[&str]) -> Router {
+        let mut runtime = RuntimeState::new();
+        runtime.cors_origins = allowed.iter().map(|s| s.to_string()).collect();
+        runtime.cors_allow_any_origin = false;
+        let state = TestState { runtime };
+
+        Router::new()
+            .route(
+                "/",
+                axum::routing::get(|| async { "get-ok" }).options(|| async { "options-ok" }),
+            )
+            .layer(middleware::from_fn_with_state(
+                state,
+                cors_middleware::<TestState>,
+            ))
+    }
+
+    fn vary_values(resp: &axum::response::Response) -> Vec<String> {
+        resp.headers()
+            .get_all(VARY)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(|v| v.to_ascii_lowercase())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn options_without_origin_is_not_cors_and_reaches_the_router() {
+        let app = cors_app(&["https://app.example.com"]);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+
+        // The route's own OPTIONS handler answered — not the middleware's 403.
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+    }
+
+    #[tokio::test]
+    async fn preflight_with_allowed_origin_carries_acao_and_vary_origin() {
+        let app = cors_app(&["https://app.example.com"]);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/")
+                    .header("origin", "https://app.example.com")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get(ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://app.example.com")
+        );
+        assert!(vary_values(&resp).contains(&"origin".to_string()));
+    }
+
+    #[tokio::test]
+    async fn main_path_with_allowed_origin_carries_acao_and_vary_origin() {
+        let app = cors_app(&["https://app.example.com"]);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/")
+                    .header("origin", "https://app.example.com")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://app.example.com")
+        );
+        assert!(vary_values(&resp).contains(&"origin".to_string()));
+    }
+
+    #[tokio::test]
+    async fn preflight_with_disallowed_origin_is_403_with_vary_origin() {
+        let app = cors_app(&["https://app.example.com"]);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/")
+                    .header("origin", "https://evil.example.com")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(resp.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+        assert!(vary_values(&resp).contains(&"origin".to_string()));
+    }
 }

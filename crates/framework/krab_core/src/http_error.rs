@@ -8,9 +8,13 @@ use serde_json::Value;
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCategory {
     Validation,
+    /// The request carries no acceptable credentials (HTTP 401).
+    Unauthenticated,
     Authz,
     NotFound,
     Conflict,
+    /// The caller exceeded a rate limit (HTTP 429).
+    RateLimited,
     Internal,
 }
 
@@ -18,9 +22,11 @@ impl ErrorCategory {
     pub fn default_status(&self) -> StatusCode {
         match self {
             Self::Validation => StatusCode::BAD_REQUEST,
+            Self::Unauthenticated => StatusCode::UNAUTHORIZED,
             Self::Authz => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Conflict => StatusCode::CONFLICT,
+            Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -63,14 +69,11 @@ impl ApiError {
 
 impl axum::response::IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let mut status = self.category.default_status();
-
-        if self.category == ErrorCategory::Authz && self.code == "UNAUTHORIZED" {
-            status = StatusCode::UNAUTHORIZED;
-        } else if self.code == "TOO_MANY_REQUESTS" {
-            status = StatusCode::TOO_MANY_REQUESTS;
-        }
-
+        // Status comes from the category alone. The magic-string overrides on
+        // `code == "UNAUTHORIZED"` / `code == "TOO_MANY_REQUESTS"` are gone:
+        // use `ErrorCategory::Unauthenticated` (401) and
+        // `ErrorCategory::RateLimited` (429) instead.
+        let status = self.category.default_status();
         (status, Json(self)).into_response()
     }
 }

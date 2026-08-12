@@ -55,6 +55,48 @@ fn test_config_validation_single_mode_one_protocol() {
     assert!(errors.iter().any(|e| e.contains("single exposure mode")));
 }
 
+fn valid_rest_config() -> ProtocolConfig {
+    ProtocolConfig {
+        exposure_mode: ExposureMode::Multi,
+        enabled_protocols: vec![ProtocolKind::Rest],
+        default_protocol: ProtocolKind::Rest,
+        topology: DeploymentTopology::SingleService,
+        policy: ProtocolPolicy::default(),
+        allow_runtime_switch_header: false,
+    }
+}
+
+/// Malformed policy JSON used to parse to `None` and silently drop every
+/// restriction (fail-open). `validate()` must surface it as a startup error.
+#[test]
+#[serial_test::serial]
+fn test_config_validation_rejects_malformed_policy_json() {
+    std::env::set_var("KRAB_PROTOCOL_RESTRICTED_OPS_JSON", "{not json");
+    let result = valid_rest_config().validate();
+    std::env::remove_var("KRAB_PROTOCOL_RESTRICTED_OPS_JSON");
+
+    let errors = result.expect_err("validation should fail");
+    assert!(errors
+        .iter()
+        .any(|e| e.contains("KRAB_PROTOCOL_RESTRICTED_OPS_JSON") && e.contains("not valid JSON")));
+}
+
+/// An unknown protocol name inside valid JSON used to become an empty list
+/// (silent deny-all) with no diagnostic.
+#[test]
+#[serial_test::serial]
+fn test_config_validation_rejects_unknown_protocol_name_in_policy_json() {
+    std::env::set_var(
+        "KRAB_PROTOCOL_TENANT_OVERRIDES_JSON",
+        r#"{"tenant-a":["grpc"]}"#,
+    );
+    let result = valid_rest_config().validate();
+    std::env::remove_var("KRAB_PROTOCOL_TENANT_OVERRIDES_JSON");
+
+    let errors = result.expect_err("validation should fail");
+    assert!(errors.iter().any(|e| e.contains("unknown protocol 'grpc'")));
+}
+
 #[test]
 fn test_config_validation_tenant_override_protocol_must_be_enabled() {
     let mut tenant_overrides = HashMap::new();

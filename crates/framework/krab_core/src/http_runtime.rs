@@ -38,6 +38,11 @@ pub struct RuntimeState {
     pub protocol_request_totals: Arc<[AtomicU64; 4]>,
     pub response_class_protocol_totals: Arc<[AtomicU64; 12]>,
     pub protocol_config: Option<crate::protocol::ProtocolConfig>,
+    /// Parsed JWT providers with pre-built decoding keys, constructed once at
+    /// state construction instead of per request. Per-instance on purpose:
+    /// tests (and services) that mutate the environment build a fresh
+    /// `RuntimeState` and get a fresh cache.
+    pub jwt_verifier_cache: Arc<crate::http_auth::JwtVerifierCache>,
 }
 
 impl Default for RuntimeState {
@@ -47,34 +52,89 @@ impl Default for RuntimeState {
 }
 
 impl RuntimeState {
+    /// Lenient constructor: a configured-but-broken `KRAB_REDIS_URL` warns and
+    /// falls back to an in-process [`MemoryStore`] in every environment. Boot
+    /// paths should prefer [`RuntimeState::try_new`], which fails closed
+    /// outside dev.
     pub fn new() -> Self {
-        let http_cfg = crate::config::HttpConfig::from_env();
-
-        let store: Arc<dyn DistributedStore> = {
-            #[cfg(feature = "redis-store")]
-            {
-                if let Ok(redis_url) = std::env::var("KRAB_REDIS_URL") {
-                    if !redis_url.trim().is_empty() {
-                        match RedisStore::from_url(redis_url.trim()) {
-                            Ok(redis) => Arc::new(redis),
-                            Err(err) => {
-                                tracing::warn!(error = %err, "failed_to_initialize_redis_store_falling_back_to_memory");
-                                Arc::new(MemoryStore::new())
-                            }
-                        }
-                    } else {
-                        Arc::new(MemoryStore::new())
-                    }
-                } else {
-                    Arc::new(MemoryStore::new())
-                }
-            }
-
-            #[cfg(not(feature = "redis-store"))]
-            {
+        let store: Arc<dyn DistributedStore> = match Self::build_store() {
+            Ok(store) => store,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed_to_initialize_redis_store_falling_back_to_memory");
                 Arc::new(MemoryStore::new())
             }
         };
+        Self::from_store(store)
+    }
+
+    /// Fallible constructor for service boot paths. When `KRAB_REDIS_URL` is
+    /// set and the Redis store cannot be initialized, this returns an error in
+    /// `staging`, `prod`, and unknown environments (unknown fails closed,
+    /// mirroring the config posture); in `dev` it warns and falls back to an
+    /// in-process [`MemoryStore`].
+    pub fn try_new() -> anyhow::Result<Self> {
+        let store: Arc<dyn DistributedStore> = match Self::build_store() {
+            Ok(store) => store,
+            Err(err) => {
+                let environment = crate::config::Environment::from_env();
+                match environment {
+                    crate::config::Environment::Dev => {
+                        tracing::warn!(
+                            error = %err,
+                            environment = %environment.as_str(),
+                            "failed_to_initialize_redis_store_falling_back_to_memory"
+                        );
+                        Arc::new(MemoryStore::new())
+                    }
+                    _ => {
+                        return Err(err.context(format!(
+                            "KRAB_REDIS_URL is set but the redis store failed to initialize; \
+                             refusing to fall back to an in-process store in '{}'",
+                            environment.as_str()
+                        )));
+                    }
+                }
+            }
+        };
+        Ok(Self::from_store(store))
+    }
+
+    /// Build the distributed store from the environment. `Err` means a Redis
+    /// store was requested via `KRAB_REDIS_URL` but could not be initialized;
+    /// how to react (warn-and-fallback vs fail) is the caller's policy.
+    fn build_store() -> anyhow::Result<Arc<dyn DistributedStore>> {
+        #[cfg(feature = "redis-store")]
+        {
+            if let Ok(redis_url) = std::env::var("KRAB_REDIS_URL") {
+                if !redis_url.trim().is_empty() {
+                    let redis = RedisStore::from_url(redis_url.trim())?;
+                    return Ok(Arc::new(redis));
+                }
+            }
+        }
+
+        // Compiled WITHOUT `redis-store`, but the operator set `KRAB_REDIS_URL`:
+        // the in-process store cannot honor that intent. Surface it as an init
+        // error so `try_new` fails closed outside dev exactly as it does for a
+        // broken URL — a silent per-replica downgrade is the more dangerous
+        // outcome (revocation and rate limits stop being shared).
+        #[cfg(not(feature = "redis-store"))]
+        {
+            if let Ok(redis_url) = std::env::var("KRAB_REDIS_URL") {
+                if !redis_url.trim().is_empty() {
+                    anyhow::bail!(
+                        "KRAB_REDIS_URL is set but this binary was compiled without the \
+                         `redis-store` feature and cannot use a shared Redis store"
+                    );
+                }
+            }
+        }
+
+        Ok(Arc::new(MemoryStore::new()))
+    }
+
+    fn from_store(store: Arc<dyn DistributedStore>) -> Self {
+        let http_cfg = crate::config::HttpConfig::from_env();
 
         Self {
             request_count: Arc::new(AtomicU64::new(0)),
@@ -129,6 +189,7 @@ impl RuntimeState {
                 AtomicU64::new(0),
             ]),
             protocol_config: None,
+            jwt_verifier_cache: Arc::new(crate::http_auth::JwtVerifierCache::from_env()),
         }
     }
 
@@ -390,4 +451,93 @@ pub(crate) fn metrics_prometheus_impl(runtime: &RuntimeState) -> Response {
         HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
     );
     response
+}
+
+#[cfg(test)]
+mod runtime_state_tests {
+    #[allow(unused_imports)]
+    use super::RuntimeState;
+
+    /// A broken `KRAB_REDIS_URL` must abort startup outside dev: silently
+    /// downgrading a shared store to an in-process one breaks rate limiting
+    /// and revocation across replicas. Unknown environments fail closed like
+    /// prod, mirroring the config posture.
+    #[cfg(feature = "redis-store")]
+    #[test]
+    #[serial_test::serial]
+    fn try_new_fails_closed_outside_dev_with_bad_redis_url() {
+        std::env::set_var("KRAB_REDIS_URL", "definitely-not-a-redis-url");
+
+        for environment in ["prod", "staging", "some-unknown-env"] {
+            std::env::set_var("KRAB_ENVIRONMENT", environment);
+            let result = RuntimeState::try_new();
+            assert!(
+                result.is_err(),
+                "try_new must fail in '{environment}' when the redis store cannot initialize"
+            );
+        }
+
+        std::env::remove_var("KRAB_REDIS_URL");
+        std::env::remove_var("KRAB_ENVIRONMENT");
+    }
+
+    /// In dev the same misconfiguration warns and falls back to the
+    /// in-process store, keeping the local loop unbroken.
+    #[cfg(feature = "redis-store")]
+    #[test]
+    #[serial_test::serial]
+    fn try_new_warns_and_falls_back_in_dev_with_bad_redis_url() {
+        std::env::set_var("KRAB_ENVIRONMENT", "dev");
+        std::env::set_var("KRAB_REDIS_URL", "definitely-not-a-redis-url");
+
+        let result = RuntimeState::try_new();
+
+        std::env::remove_var("KRAB_REDIS_URL");
+        std::env::remove_var("KRAB_ENVIRONMENT");
+
+        assert!(result.is_ok(), "dev must fall back to the memory store");
+    }
+
+    /// Without `KRAB_REDIS_URL`, `try_new` succeeds in every environment on
+    /// the in-process store.
+    #[test]
+    #[serial_test::serial]
+    fn try_new_succeeds_without_redis_url() {
+        std::env::remove_var("KRAB_REDIS_URL");
+        std::env::set_var("KRAB_ENVIRONMENT", "prod");
+
+        let result = RuntimeState::try_new();
+
+        std::env::remove_var("KRAB_ENVIRONMENT");
+
+        assert!(result.is_ok());
+    }
+
+    /// A binary compiled WITHOUT `redis-store` but told to use Redis is
+    /// misconfigured: `try_new` must fail closed outside dev rather than
+    /// silently serve on an in-process store. This build (no default features)
+    /// exercises exactly that configuration.
+    #[cfg(not(feature = "redis-store"))]
+    #[test]
+    #[serial_test::serial]
+    fn try_new_fails_closed_when_redis_requested_but_feature_absent() {
+        std::env::set_var("KRAB_REDIS_URL", "redis://127.0.0.1:6379");
+
+        for environment in ["prod", "staging", "some-unknown-env"] {
+            std::env::set_var("KRAB_ENVIRONMENT", environment);
+            assert!(
+                RuntimeState::try_new().is_err(),
+                "try_new must fail in '{environment}' when redis is requested but not compiled in"
+            );
+        }
+
+        std::env::set_var("KRAB_ENVIRONMENT", "dev");
+        assert!(
+            RuntimeState::try_new().is_ok(),
+            "dev must fall back to the memory store"
+        );
+
+        std::env::remove_var("KRAB_REDIS_URL");
+        std::env::remove_var("KRAB_ENVIRONMENT");
+    }
 }

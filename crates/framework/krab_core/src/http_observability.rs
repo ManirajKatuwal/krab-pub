@@ -64,15 +64,38 @@ where
     S: Clone + Send + Sync + 'static + HasRuntimeState,
 {
     let runtime = state.runtime_state();
-    let protocol_index = protocol_metric_index(resolved_protocol(&req));
+    // Protocol resolution now runs INSIDE the auth layer (it needs the
+    // AuthContext for trusted tenant policy), so on the request path this
+    // middleware sees no resolved protocol yet. The resolution middleware
+    // mirrors the resolved `ProtocolKind` into the response extensions;
+    // prefer that, falling back to the request extension for callers that
+    // layer this middleware differently.
+    let request_protocol = resolved_protocol(&req);
 
     runtime.request_count.fetch_add(1, Ordering::Relaxed);
-    runtime.protocol_request_totals[protocol_index].fetch_add(1, Ordering::Relaxed);
     runtime.inflight_requests.fetch_add(1, Ordering::Relaxed);
+
+    // Decrement in a drop guard, not after the await: when the client
+    // disconnects mid-request hyper drops this future, and a plain
+    // `fetch_sub` after `next.run` would never execute — the gauge (exported
+    // to Prometheus) would drift upward permanently.
+    struct InflightGuard(std::sync::Arc<std::sync::atomic::AtomicU64>);
+    impl Drop for InflightGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    let _inflight = InflightGuard(runtime.inflight_requests.clone());
 
     let response = next.run(req).await;
 
-    runtime.inflight_requests.fetch_sub(1, Ordering::Relaxed);
+    let protocol = response
+        .extensions()
+        .get::<crate::protocol::ProtocolKind>()
+        .copied()
+        .or(request_protocol);
+    let protocol_index = protocol_metric_index(protocol);
+    runtime.protocol_request_totals[protocol_index].fetch_add(1, Ordering::Relaxed);
 
     let code = response.status().as_u16();
     if let Some(class_index) = response_status_class_index(code) {
@@ -106,7 +129,7 @@ where
 {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    let protocol = protocol_label(&req);
+    let request_protocol = protocol_label(&req);
     let operation = operation_label(&method, &path);
     let selection_source = selection_source_label(&req, &path);
     let request_id = req
@@ -121,6 +144,13 @@ where
 
     let start = Instant::now();
     let resp = next.run(req).await;
+    // Protocol resolution runs inside the auth layer; the resolved protocol
+    // reaches this outer middleware via the response extensions.
+    let protocol = resp
+        .extensions()
+        .get::<crate::protocol::ProtocolKind>()
+        .map(|p| p.as_str())
+        .unwrap_or(request_protocol);
     let status = resp.status();
     let elapsed = start.elapsed();
     let elapsed_ms = elapsed.as_millis();

@@ -34,8 +34,8 @@ read it directly, `entry.age()` is unchanged and is the better call.
 **To actually get shared caching**, build it over your store instead of
 `IsrCache::new()`:
 
-```rust
-let runtime = RuntimeState::new();                  // reads KRAB_REDIS_URL
+```rust,ignore
+let runtime = RuntimeState::try_new()?;             // reads KRAB_REDIS_URL, fails closed outside dev
 let isr_cache = IsrCache::with_store(runtime.store.clone());
 ```
 
@@ -43,8 +43,45 @@ let isr_cache = IsrCache::with_store(runtime.store.clone());
 documented rather than implied. If you deploy a single instance, no change is
 needed beyond the `.await`s.
 
-**If you implement `DistributedStore` yourself**, add `delete` and
-`keys_with_prefix`. Prefix scans must not block: use `SCAN`, not `KEYS`.
+**If you implement `DistributedStore` yourself**, add `delete`,
+`keys_with_prefix`, and (new in 0.3.0) `set_if_absent`. Prefix scans must not
+block: use `SCAN`, not `KEYS`.
+
+### 0.3.0 — cleaning up orphaned ISR cache keys (Redis-backed ISR only)
+
+The ISR key separator changed from `:` to the control byte ``, so entries
+written under the old format are never read again and repopulate automatically
+under the new format. TTL'd entries (`Revalidate`, `OnDemand`) age out on their
+own. **`Static` entries have no TTL and will linger in Redis unread** until
+deleted. This is a memory leak only — never a correctness issue. Skip this
+entirely if you do not use `KRAB_REDIS_URL` with ISR.
+
+Old keys have the shape `<namespace>:<path>` and paths always begin with `/`
+(default namespace is `krab:isr`). **Preview first:**
+
+```sh
+redis-cli --scan --pattern 'krab:isr:/*'
+```
+
+When the list looks right, delete in a non-blocking pass:
+
+```sh
+redis-cli --scan --pattern 'krab:isr:/*' | xargs -r -L 100 redis-cli del
+```
+
+Safety caveats:
+
+- Use `--scan` (SCAN), never `KEYS` — `KEYS` blocks the single Redis thread
+  across the whole keyspace.
+- The `/` after `krab:isr:` is load-bearing: it matches old colon-separated
+  entries (`krab:isr:/blog/x`) while **excluding** new-format sub-namespace keys
+  such as `krab:isr:site/blog/x`. Do **not** broaden to `krab:isr:*` —
+  that glob would also match live new-format keys of any namespace containing a
+  colon.
+- For a custom namespace (e.g. `krab:isr:site`), use
+  `--pattern 'krab:isr:site:/*'`.
+- Deleting old keys is safe at any time, including while serving: the running
+  framework only reads ``-separated keys.
 
 ### Unreleased — login credentials become Argon2id hashes
 
