@@ -77,6 +77,14 @@ cargo publish --workspace --dry-run
 features, so it compiles a fraction of the surface. The `--all-features` run is
 the one that matters.
 
+> **Run the publish dry-run on the host, not in a Linux container mounted onto a
+> Windows checkout.** `cargo publish` refuses to package a dirty tree, and Linux
+> git reads a CRLF working tree against an LF index as 155 modified files — the
+> gate fails with a list of `krab_core` sources that have no real changes.
+> `git diff --ignore-cr-at-eol --stat` comes back empty, which is how you tell
+> the difference. Every other gate in this list is unaffected, because only this
+> one consults git.
+
 And the two that need a browser:
 
 ```sh
