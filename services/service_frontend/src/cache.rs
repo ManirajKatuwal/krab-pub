@@ -90,40 +90,134 @@ pub fn isr_query_allowlist() -> Vec<String> {
 /// pages render from the path). Invalidation and revalidation both operate on
 /// this same normalized key, and ETags derive from the cached HTML, so both
 /// stay consistent with it.
+#[allow(dead_code)]
 pub fn normalized_cache_key(uri: &axum::http::Uri) -> String {
+    normalized_cache_key_with_locale(uri, "en")
+}
+
+pub fn normalized_cache_key_with_locale(uri: &axum::http::Uri, locale: &str) -> String {
     let path = uri.path();
-    let Some(query) = uri.query() else {
-        return path.to_string();
+    let query_part = match uri.query() {
+        Some(query) => {
+            let allowlist = isr_query_allowlist();
+            if allowlist.is_empty() {
+                None
+            } else {
+                let mut kept: Vec<(&str, &str)> = query
+                    .split('&')
+                    .filter(|pair| !pair.is_empty())
+                    .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
+                    .filter(|(name, _)| allowlist.iter().any(|allowed| allowed == name))
+                    .collect();
+                if kept.is_empty() {
+                    None
+                } else {
+                    kept.sort_unstable();
+                    let joined = kept
+                        .iter()
+                        .map(|(name, value)| {
+                            if value.is_empty() {
+                                (*name).to_string()
+                            } else {
+                                format!("{name}={value}")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("&");
+                    Some(joined)
+                }
+            }
+        }
+        None => None,
     };
 
-    let allowlist = isr_query_allowlist();
-    if allowlist.is_empty() {
-        return path.to_string();
-    }
+    // Escaped unconditionally, not just when a locale suffix is appended: an
+    // unescaped path can contain the `@` that separates path from locale, and
+    // then `/blog/foo@ne` under locale `en` and `/blog/foo` under locale `ne`
+    // are the same key — the multi-locale poisoning this keying exists to
+    // prevent. Escaping `%` as well keeps the mapping injective, so the
+    // parser below can invert it.
+    let escaped_path = escape_cache_key_segment(path);
+    let base = match query_part {
+        Some(q) => format!("{escaped_path}?{q}"),
+        None => escaped_path,
+    };
 
-    let mut kept: Vec<(&str, &str)> = query
-        .split('&')
-        .filter(|pair| !pair.is_empty())
-        .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
-        .filter(|(name, _)| allowlist.iter().any(|allowed| allowed == name))
-        .collect();
-    if kept.is_empty() {
-        return path.to_string();
+    if locale.is_empty() || locale == "en" {
+        base
+    } else {
+        // Locales carry `@` too (`ca@valencia`, POSIX modifiers), so the
+        // suffix is escaped on the same terms as the path.
+        let escaped_locale = escape_cache_key_segment(locale);
+        match base.split_once('?') {
+            Some((p, query)) => format!("{p}@{escaped_locale}?{query}"),
+            None => format!("{base}@{escaped_locale}"),
+        }
     }
-    kept.sort_unstable();
+}
 
-    let joined = kept
-        .iter()
-        .map(|(name, value)| {
-            if value.is_empty() {
-                (*name).to_string()
-            } else {
-                format!("{name}={value}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("&");
-    format!("{path}?{joined}")
+/// Make a path or locale safe to join with `@` in a cache key.
+///
+/// `%` first so the mapping stays injective: the only `%` left in the output
+/// introduces an escape, so [`unescape_cache_key_segment`] can decode
+/// left-to-right without ambiguity.
+fn escape_cache_key_segment(raw: &str) -> String {
+    if !raw.contains('%') && !raw.contains('@') {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(raw.len() + 8);
+    for ch in raw.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '@' => out.push_str("%40"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn unescape_cache_key_segment(escaped: &str) -> String {
+    if !escaped.contains('%') {
+        return escaped.to_string();
+    }
+    let mut out = String::with_capacity(escaped.len());
+    let mut rest = escaped;
+    while let Some(idx) = rest.find('%') {
+        out.push_str(&rest[..idx]);
+        let tail = &rest[idx..];
+        if let Some(stripped) = tail.strip_prefix("%40") {
+            out.push('@');
+            rest = stripped;
+        } else if let Some(stripped) = tail.strip_prefix("%25") {
+            out.push('%');
+            rest = stripped;
+        } else {
+            // Not one of ours — a percent-encoded byte from the request URI,
+            // which `uri.path()` hands over still encoded. Pass it through.
+            out.push('%');
+            rest = &tail[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Inverse of the keying in [`normalized_cache_key_with_locale`].
+///
+/// Splits from the right because the delimiter is the last raw `@` in the key:
+/// escaping guarantees there is at most one.
+pub fn parse_cache_key_path_and_locale(key: &str) -> (String, String) {
+    let key_without_query = key.split('?').next().unwrap_or(key);
+    match key_without_query.rsplit_once('@') {
+        Some((path, locale)) => (
+            unescape_cache_key_segment(path),
+            unescape_cache_key_segment(locale),
+        ),
+        None => (
+            unescape_cache_key_segment(key_without_query),
+            "en".to_string(),
+        ),
+    }
 }
 
 /// How long a request that lost the cold-miss render lease polls for the
@@ -205,9 +299,10 @@ fn serve_isr_hit(state: &AppState, cache_key: &str, path: &str, entry: IsrEntry)
 
 pub async fn cache_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
-    // Path plus allowlisted query params only — raw URIs gave every distinct
-    // query string its own entry (unbounded cardinality).
-    let cache_key = normalized_cache_key(req.uri());
+    let locale = crate::resolve_locale(req.headers());
+    // Path plus allowlisted query params and locale dimension — preventing
+    // unbounded query cardinality and cross-locale cache poisoning.
+    let cache_key = normalized_cache_key_with_locale(req.uri(), &locale);
     let method = req.method().clone();
 
     let authority = cache_authority(&method, &path);
@@ -484,6 +579,78 @@ mod cache_key_tests {
 
         let uri: Uri = "/blog?utm_source=x&utm_medium=y".parse().unwrap();
         assert_eq!(normalized_cache_key(&uri), "/blog");
+
+        std::env::remove_var("FRONTEND_ISR_QUERY_ALLOWLIST");
+    }
+
+    #[test]
+    fn a_path_containing_an_at_sign_cannot_collide_with_a_locale_suffix() {
+        std::env::remove_var("FRONTEND_ISR_QUERY_ALLOWLIST");
+
+        // The pair that used to produce one shared entry: a path whose own
+        // text ends in `@ne` under the default locale, and the same path
+        // without it under locale `ne`.
+        let spoofed: Uri = "/blog/foo@ne".parse().unwrap();
+        let spoofed_key = normalized_cache_key_with_locale(&spoofed, "en");
+
+        let genuine: Uri = "/blog/foo".parse().unwrap();
+        let genuine_key = normalized_cache_key_with_locale(&genuine, "ne");
+
+        assert_ne!(
+            spoofed_key, genuine_key,
+            "an `@` in the path must not be readable as the locale delimiter"
+        );
+
+        // And each key still says what it means.
+        assert_eq!(
+            parse_cache_key_path_and_locale(&spoofed_key),
+            ("/blog/foo@ne".to_string(), "en".to_string())
+        );
+        assert_eq!(
+            parse_cache_key_path_and_locale(&genuine_key),
+            ("/blog/foo".to_string(), "ne".to_string())
+        );
+    }
+
+    #[test]
+    fn cache_keys_round_trip_through_the_parser() {
+        std::env::remove_var("FRONTEND_ISR_QUERY_ALLOWLIST");
+
+        for (path, locale) in [
+            ("/blog/foo", "en"),
+            ("/blog/foo", "ne"),
+            ("/blog/foo@ne", "en"),
+            ("/blog/foo@ne", "ne"),
+            // `uri.path()` hands percent-encoding over untouched, so the
+            // escaping has to survive a `%` that was already there.
+            ("/blog/caf%C3%A9", "ne"),
+            ("/blog/user%40host", "ne"),
+            // POSIX-style locale modifiers carry an `@` of their own.
+            ("/blog/foo", "ca@valencia"),
+        ] {
+            let uri: Uri = path.parse().unwrap();
+            let key = normalized_cache_key_with_locale(&uri, locale);
+            let expected_locale = if locale == "en" { "en" } else { locale };
+            assert_eq!(
+                parse_cache_key_path_and_locale(&key),
+                (path.to_string(), expected_locale.to_string()),
+                "key {key:?} for ({path:?}, {locale:?}) did not round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn the_locale_suffix_survives_an_allowlisted_query() {
+        std::env::set_var("FRONTEND_ISR_QUERY_ALLOWLIST", "page");
+
+        let uri: Uri = "/blog@ne?page=2&utm_source=x".parse().unwrap();
+        let key = normalized_cache_key_with_locale(&uri, "ne");
+
+        assert_eq!(key, "/blog%40ne@ne?page=2");
+        assert_eq!(
+            parse_cache_key_path_and_locale(&key),
+            ("/blog@ne".to_string(), "ne".to_string())
+        );
 
         std::env::remove_var("FRONTEND_ISR_QUERY_ALLOWLIST");
     }

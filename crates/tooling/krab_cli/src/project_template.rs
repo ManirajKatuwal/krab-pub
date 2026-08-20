@@ -50,6 +50,38 @@ impl DependencySource {
     /// `crate_dir` is the crate's location relative to the repository root; it
     /// is only consulted for [`DependencySource::Path`].
     fn render(&self, crate_name: &str, crate_dir: &str, features: &[&str]) -> String {
+        self.render_with_defaults(crate_name, crate_dir, features, true)
+    }
+
+    /// Render one dependency line, opting out of the dependency's own default
+    /// features.
+    ///
+    /// Only `krab_client` needs this so far: its defaults include
+    /// `demo-islands`, whose bundled `Counter`/`Toggle`/`Likes` register
+    /// themselves in the same `inventory` island registry a generated project
+    /// uses, so a template that names its own `Counter` gets two entries and
+    /// `hydrate()` may bind the demo one over the template's SSR markup.
+    fn render_no_default_features(
+        &self,
+        crate_name: &str,
+        crate_dir: &str,
+        features: &[&str],
+    ) -> String {
+        self.render_with_defaults(crate_name, crate_dir, features, false)
+    }
+
+    fn render_with_defaults(
+        &self,
+        crate_name: &str,
+        crate_dir: &str,
+        features: &[&str],
+        default_features: bool,
+    ) -> String {
+        let defaults = if default_features {
+            String::new()
+        } else {
+            ", default-features = false".to_string()
+        };
         let features = if features.is_empty() {
             String::new()
         } else {
@@ -63,11 +95,13 @@ impl DependencySource {
 
         match self {
             DependencySource::Registry => {
-                format!("{crate_name} = {{ version = \"{FRAMEWORK_VERSION}\"{features} }}")
+                format!(
+                    "{crate_name} = {{ version = \"{FRAMEWORK_VERSION}\"{defaults}{features} }}"
+                )
             }
             DependencySource::Path(root) => {
                 let path = path_for_toml(&root.join(crate_dir));
-                format!("{crate_name} = {{ path = \"{path}\"{features} }}")
+                format!("{crate_name} = {{ path = \"{path}\"{defaults}{features} }}")
             }
         }
     }
@@ -149,6 +183,17 @@ futures-util = "0.3"
 "#,
             render_policy_doc: false,
             extra_features: &["rest"],
+        },
+        ProjectTemplate::Fullstack => TemplateMetadata {
+            flag: "fullstack",
+            description: "Full-stack SSR with WASM island hydration and server functions",
+            starter_scope: Some(
+                "This starter provides full-stack server-side rendering (SSR), client-side WASM island hydration, static asset serving, and server functions out of the box.",
+            ),
+            axum_dep: "",
+            extra_deps: "",
+            render_policy_doc: false,
+            extra_features: &[],
         },
         ProjectTemplate::Default => TemplateMetadata {
             flag: "default",
@@ -391,49 +436,22 @@ fn write_project_from_template(
         "# Keeps public/ in git so the Dockerfile's `COPY public/ public/` survives a clone.\n",
     )?;
 
-    let cargo_toml = format!(
-        r#"[package]
-name = "{name}"
-version = "0.1.0"
-edition = "2021"
-# The floor of the dependency set below, not a preference: `axum 0.8` declares
-# `rust-version = "{msrv}"`. Because the versions below float to the latest
-# compatible release, a dependency raising its own MSRV raises this one — Cargo
-# will say so by name. Keep the Dockerfile's toolchain at or above this.
-rust-version = "{msrv}"
-description = "{template_desc}"
-
-[dependencies]
-{krab_core_dep}
-{krab_macros_dep}
-tokio = {{ version = "1.0", features = ["full"] }}
-{axum_dep}serde = {{ version = "1.0", features = ["derive"] }}
-serde_json = "1.0"
-tracing = "0.1"
-tracing-subscriber = {{ version = "0.3", features = ["json", "env-filter"] }}
-{extra_deps}
-"#,
-        msrv = GENERATED_PROJECT_MSRV,
-        template_desc = metadata.description,
-        krab_core_dep = deps.render(
-            "krab_core",
-            "crates/framework/krab_core",
-            metadata.extra_features
-        ),
-        // `view!`, `#[island]`, and `#[server]` are the framework's headline
-        // features and live in `krab_macros`. It was absent from every
-        // generated manifest, so a scaffolded project could not use any of
-        // them without the user working out the dependency themselves.
-        krab_macros_dep = deps.render("krab_macros", "crates/framework/krab_macros", &[]),
-        axum_dep = metadata.axum_dep,
-        extra_deps = metadata.extra_deps
-    );
+    let cargo_toml = if matches!(template, ProjectTemplate::Fullstack) {
+        generate_fullstack_cargo_toml(name, metadata, deps)
+    } else {
+        generate_standard_cargo_toml(name, metadata, deps)
+    };
     fs::write(path.join("Cargo.toml"), cargo_toml)?;
+
+    if *template == ProjectTemplate::Fullstack {
+        fs::write(path.join("src/lib.rs"), generate_fullstack_lib(name))?;
+    }
 
     let main_rs = match template {
         ProjectTemplate::Saas => generate_saas_main(name),
         ProjectTemplate::EdgeSsr => generate_edge_ssr_main(name),
         ProjectTemplate::EventStream => generate_event_stream_main(name),
+        ProjectTemplate::Fullstack => generate_fullstack_main(name),
         ProjectTemplate::Default => generate_default_main(name),
     };
     fs::write(path.join("src/main.rs"), main_rs)?;
@@ -448,7 +466,7 @@ tracing-subscriber = {{ version = "0.3", features = ["json", "env-filter"] }}
         fs::write(path.join("docs/render_policy.md"), doc)?;
     }
 
-    let project_toml = generate_project_toml(name);
+    let project_toml = generate_project_toml(name, template);
     fs::write(path.join("krab.toml"), project_toml)?;
 
     let ci_yaml = generate_ci_workflow(name);
@@ -886,6 +904,388 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {{
     )
 }
 
+fn rust_crate_name(name: &str) -> String {
+    name.replace('-', "_")
+}
+
+fn generate_standard_cargo_toml(
+    name: &str,
+    metadata: TemplateMetadata,
+    deps: &DependencySource,
+) -> String {
+    format!(
+        r#"[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2021"
+# The floor of the dependency set below, not a preference: `axum 0.8` declares
+# `rust-version = "{msrv}"`. Because the versions below float to the latest
+# compatible release, a dependency raising its own MSRV raises this one — Cargo
+# will say so by name. Keep the Dockerfile's toolchain at or above this.
+rust-version = "{msrv}"
+description = "{template_desc}"
+
+[dependencies]
+{krab_core_dep}
+{krab_macros_dep}
+tokio = {{ version = "1.0", features = ["full"] }}
+{axum_dep}serde = {{ version = "1.0", features = ["derive"] }}
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = {{ version = "0.3", features = ["json", "env-filter"] }}
+{extra_deps}
+"#,
+        msrv = GENERATED_PROJECT_MSRV,
+        template_desc = metadata.description,
+        krab_core_dep = deps.render(
+            "krab_core",
+            "crates/framework/krab_core",
+            metadata.extra_features
+        ),
+        krab_macros_dep = deps.render("krab_macros", "crates/framework/krab_macros", &[]),
+        axum_dep = metadata.axum_dep,
+        extra_deps = metadata.extra_deps
+    )
+}
+
+fn generate_fullstack_cargo_toml(
+    name: &str,
+    metadata: TemplateMetadata,
+    deps: &DependencySource,
+) -> String {
+    format!(
+        r#"[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2021"
+# The floor of the dependency set below, not a preference: `axum 0.8` declares
+# `rust-version = "{msrv}"`. Because the versions below float to the latest
+# compatible release, a dependency raising its own MSRV raises this one — Cargo
+# will say so by name. Keep the Dockerfile's toolchain at or above this.
+rust-version = "{msrv}"
+description = "{template_desc}"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "{name}"
+path = "src/main.rs"
+
+[dependencies]
+{krab_core_base_dep}
+{krab_macros_dep}
+serde = {{ version = "1.0", features = ["derive"] }}
+serde_json = "1.0"
+
+# Server-side only. `rest` pulls axum, which does not build for wasm32, so the
+# native and browser dependency sets are declared separately rather than
+# feature-gated in one list.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+{krab_core_native_dep}
+axum = "0.8"
+tokio = {{ version = "1.0", features = ["full"] }}
+tower-http = {{ version = "0.6", features = ["fs"] }}
+tracing = "0.1"
+tracing-subscriber = {{ version = "0.3", features = ["json", "env-filter"] }}
+
+# Browser only. `krab_client` takes `default-features = false` on purpose: its
+# defaults include the deprecated `demo-islands` bundle, whose `Counter` /
+# `Toggle` / `Likes` register in the same island registry your own `#[island]`
+# components do, so leaving it on shadows a component of the same name.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+{krab_core_wasm_dep}
+{krab_client_wasm_dep}
+inventory = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+
+[features]
+default = []
+web = []
+
+# rustc 1.97 emits bulk-memory and nontrapping-fptoint by default; the binaryen
+# wasm-pack bundles (version 117) rejects them unless told they exist.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
+"#,
+        msrv = GENERATED_PROJECT_MSRV,
+        template_desc = metadata.description,
+        krab_core_base_dep = deps.render("krab_core", "crates/framework/krab_core", &[]),
+        krab_macros_dep = deps.render("krab_macros", "crates/framework/krab_macros", &[]),
+        krab_core_native_dep = deps.render("krab_core", "crates/framework/krab_core", &["rest"]),
+        krab_core_wasm_dep = deps.render("krab_core", "crates/framework/krab_core", &["web"]),
+        krab_client_wasm_dep = deps.render_no_default_features(
+            "krab_client",
+            "crates/framework/krab_client",
+            &["web"]
+        ),
+    )
+}
+
+/// Import block for the generated `src/main.rs`, sorted the way rustfmt sorts.
+///
+/// The crate's own `use {crate_name}::..` line lands in a name-dependent
+/// position — `use axum_ish::..` sorts before `krab_core`, `use my_app::..`
+/// after it. Emitting it at a fixed offset made every generated project fail
+/// `cargo fmt --all --check`, which `generated-project.yaml` runs on all four
+/// templates. Byte order over the whole `use` line matches rustfmt here: every
+/// path segment is lowercase ASCII, and `{{` (0x7B) sorting after the letters is
+/// what puts `use axum::{{Json, Router}};` last among the `axum` lines.
+fn fullstack_main_imports(crate_name: &str) -> String {
+    let mut lines = vec![
+        "use axum::response::Html;".to_string(),
+        "use axum::routing::{get, post};".to_string(),
+        "use axum::{Json, Router};".to_string(),
+        "use krab_core::config::KrabConfig;".to_string(),
+        "use krab_core::telemetry::init_tracing;".to_string(),
+        format!("use {crate_name}::{{greet_server_handler, render_home_page}};"),
+        "use serde_json::json;".to_string(),
+        "use std::net::SocketAddr;".to_string(),
+        "use tower_http::services::ServeDir;".to_string(),
+    ];
+    lines.sort();
+    lines.join("\n")
+}
+
+fn generate_fullstack_main(name: &str) -> String {
+    let crate_name = rust_crate_name(name);
+    let imports = fullstack_main_imports(&crate_name);
+    format!(
+        r#"{imports}
+
+// `krab gen` inserts module declarations (for example `mod routes;`) directly
+// below this marker — leave the line in place.
+// krab:modules
+
+async fn index() -> Html<String> {{
+    Html(render_home_page("{name}"))
+}}
+
+async fn health() -> Json<serde_json::Value> {{
+    Json(json!({{ "service": "{name}", "status": "ok" }}))
+}}
+
+async fn ready() -> Json<serde_json::Value> {{
+    Json(json!({{ "service": "{name}", "status": "ready" }}))
+}}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {{
+    init_tracing("{name}");
+    let cfg = KrabConfig::from_env_checked("{name}", 3000)?;
+    cfg.validate_all()?;
+    let addr: SocketAddr = format!("{{}}:{{}}", cfg.host, cfg.port).parse()?;
+
+    // Serve WASM artifacts and static assets. `fallback` ensures /pkg requests
+    // resolve whether output is placed under dist/ (from `krab build`) or pkg/ (direct wasm-pack).
+    let pkg_service = ServeDir::new("dist").fallback(ServeDir::new("pkg"));
+    let public_service = ServeDir::new("public");
+
+    let app = Router::new()
+        .route("/", get(index))
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/api/rpc/greet_server", post(greet_server_handler))
+        .nest_service("/pkg", pkg_service)
+        .nest_service("/public", public_service);
+    // krab:routes
+    // `krab gen route <name>` registers generated routers at the marker above,
+    // as `let app = app.merge(...);` statements. The marker sits on the router
+    // that is handed to `axum::serve`, and nothing is layered onto it
+    // afterwards, so generated routes are treated exactly like the ones above.
+
+    tracing::info!(service = "{name}", %addr, "listening");
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}}
+{tests}"#,
+        tests = generate_health_smoke_test("health", Some(name))
+    )
+}
+
+fn generate_fullstack_lib(name: &str) -> String {
+    let clean_name = rust_crate_name(name);
+    format!(
+        r#"//! Full-stack SSR + Islands + Server Functions for {name}.
+
+#![allow(non_snake_case)]
+
+use krab_core::action::create_action;
+use krab_core::server_fn::ServerFnError;
+use krab_core::signal::*;
+use krab_core::{{IntoNode, Node, Render}};
+use krab_macros::{{island, server, view}};
+use serde::{{Deserialize, Serialize}};
+
+// ---------------------------------------------------------------------------
+// Server functions
+// ---------------------------------------------------------------------------
+
+/// Server function responding to client-side RPC calls.
+///
+/// Mounted at `POST /api/rpc/greet_server` on the server. On wasm32, calling
+/// this function automatically issues an HTTP POST request to that endpoint.
+#[server]
+pub async fn greet_server(name: String) -> Result<String, ServerFnError> {{
+    let trimmed = name.trim();
+    if trimmed.is_empty() {{
+        return Err(ServerFnError::validation("name must not be empty"));
+    }}
+    Ok(format!("Hello, {{trimmed}}! Response from server function."))
+}}
+
+// ---------------------------------------------------------------------------
+// Islands
+// ---------------------------------------------------------------------------
+
+/// Props for [`Counter`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CounterProps {{
+    pub initial: i32,
+    pub step: i32,
+}}
+
+/// Interactive counter island.
+///
+/// Server-renders with hydration markers and hydrates in the browser.
+/// Dispatches an action calling the [`greet_server`] server function on click.
+#[island]
+pub fn Counter(props: CounterProps) -> Node {{
+    let (count, _set_count) = create_signal(props.initial);
+    let _set_count_inc = _set_count.clone();
+    let _set_count_dec = _set_count;
+    let step = props.step;
+
+    let _greet = create_action(|name: String| async move {{ greet_server(name).await }});
+
+    view! {{
+        <div class="island counter-island" data-testid="counter-island">
+            <p class="counter-display">
+                "Count: "
+                <strong data-testid="count-value">
+                    {{ move || count.get().to_string().into_node() }}
+                </strong>
+            </p>
+            <div class="counter-actions">
+                <button
+                    class="btn btn-inc"
+                    data-action="increment"
+                    on:click={{
+                        move |_| {{
+                            _set_count_inc.update(|c| *c += step);
+                            _greet.dispatch("Krab User".to_string());
+                        }}
+                    }}
+                >
+                    {{ format!("+{{step}}") }}
+                </button>
+                <button
+                    class="btn btn-dec"
+                    data-action="decrement"
+                    on:click={{ move |_| _set_count_dec.update(|c| *c -= step) }}
+                >
+                    {{ format!("-{{step}}") }}
+                </button>
+            </div>
+        </div>
+    }}
+}}
+
+// ---------------------------------------------------------------------------
+// Client entry point (WASM hydration)
+// ---------------------------------------------------------------------------
+
+/// Boot the browser hydration runtime and client router.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn krab_boot() {{
+    krab_client::hydrate();
+    krab_client::router::start();
+}}
+
+// ---------------------------------------------------------------------------
+// Page rendering
+// ---------------------------------------------------------------------------
+
+/// The module script that initializes WASM and boots hydration.
+const BOOT_SCRIPT: &str = "import init, {{ krab_boot }} from '/pkg/{clean_name}.js';\n\
+     init().then(function () {{ krab_boot(); }});";
+
+/// Build the home page [`Node`].
+pub fn home_page_node(service_name: &str) -> Node {{
+    let counter = Counter(CounterProps {{
+        initial: 0,
+        step: 1,
+    }});
+
+    view! {{
+        <html lang="en">
+            <head>
+                <meta charset="utf-8"/>
+                <meta name="viewport" content="width=device-width, initial-scale=1"/>
+                <title>{{ format!("{{service_name}} — Krab Fullstack") }}</title>
+                <style>
+                    "body {{ font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }}\
+                     .island {{ border: 2px dashed #e2e8f0; border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; background: #f8fafc; }}\
+                     .counter-actions {{ display: flex; gap: 0.5rem; margin: 1rem 0; }}\
+                     .btn {{ padding: 0.5rem 1rem; font-size: 1rem; border-radius: 4px; border: 1px solid #cbd5e1; background: #fff; cursor: pointer; }}\
+                     .btn:hover {{ background: #f1f5f9; }}"
+                </style>
+            </head>
+            <body>
+                <header>
+                    <h1>"🦀 " {{ service_name.to_string() }}</h1>
+                    <p>"Full-stack server-side rendering with WASM island hydration."</p>
+                </header>
+                <main data-krab-router-outlet="main" tabindex="-1">
+                    <h2>"Interactive Island"</h2>
+                    <p>"The counter below is rendered on the server and hydrated in WebAssembly:"</p>
+                    {{ counter }}
+                </main>
+                <script type="module">
+                    {{ BOOT_SCRIPT.to_string() }}
+                </script>
+            </body>
+        </html>
+    }}
+}}
+
+/// Render the home page document to an HTML string.
+pub fn render_home_page(service_name: &str) -> String {{
+    format!("<!doctype html>{{}}", home_page_node(service_name).render())
+}}
+
+#[cfg(test)]
+mod tests {{
+    use super::*;
+
+    #[test]
+    fn home_page_renders_hydration_markers_and_boot_script() {{
+        let html = render_home_page("{name}");
+        assert!(html.contains("counter-island"));
+        assert!(html.contains("/pkg/{clean_name}.js"));
+        assert!(html.contains("krab_boot"));
+    }}
+
+    #[tokio::test]
+    async fn greet_server_validates_input() {{
+        let result = greet_server("Ferris".to_string()).await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            "Hello, Ferris! Response from server function."
+        );
+
+        let empty = greet_server("   ".to_string()).await;
+        assert!(empty.is_err());
+    }}
+}}
+"#
+    )
+}
+
 /// Generate the SaaS-oriented starter with runtime state, auth-ready HTTP layers, and tenant APIs.
 fn generate_saas_main(name: &str) -> String {
     format!(
@@ -1237,12 +1637,12 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       # `src/main.rs` carries a smoke test over the `/health` handler the
       # Kubernetes liveness probe in deploy/kubernetes.yaml polls.
       - name: Run tests
-        run: cargo test --all-features
+        run: cargo test
         env:
           KRAB_ENVIRONMENT: dev
           KRAB_AUTH_MODE: static
@@ -1260,6 +1660,7 @@ fn generate_deploy_manifest(name: &str, template: &ProjectTemplate) -> String {
         ProjectTemplate::Saas => ("3", "512Mi"),
         ProjectTemplate::EdgeSsr => ("2", "256Mi"),
         ProjectTemplate::EventStream => ("2", "384Mi"),
+        ProjectTemplate::Fullstack => ("2", "256Mi"),
         ProjectTemplate::Default => ("1", "128Mi"),
     };
 
@@ -1377,11 +1778,23 @@ CMD ["/app/{name}"]
     )
 }
 
-fn generate_project_toml(name: &str) -> String {
+fn generate_project_toml(name: &str, template: &ProjectTemplate) -> String {
+    let clean_name = rust_crate_name(name);
+    let client_section = if *template == ProjectTemplate::Fullstack {
+        format!(
+            r#"client_package = "{name}"
+client_crate_dir = "."
+client_artifact_stem = "{clean_name}"
+"#
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         r#"[project]
 frontend_bin = "{name}"
-public_dir = "public"
+{client_section}public_dir = "public"
 dist_dir = "dist"
 server_paths = ["src"]
 public_paths = ["public"]
@@ -1467,6 +1880,13 @@ mod tests {
             );
         }
 
+        if *template == ProjectTemplate::Fullstack {
+            assert!(
+                project_dir.join("src/lib.rs").exists(),
+                "expected src/lib.rs to be generated for fullstack template"
+            );
+        }
+
         // Directories the scaffolder never populated used to be created anyway;
         // they disappeared on clone and misled users into thinking they were
         // wired up. `src/routes/` is created on demand by `krab gen route`.
@@ -1511,11 +1931,12 @@ mod tests {
         Ok(())
     }
 
-    const ALL_TEMPLATES: [ProjectTemplate; 4] = [
+    const ALL_TEMPLATES: [ProjectTemplate; 5] = [
         ProjectTemplate::Default,
         ProjectTemplate::Saas,
         ProjectTemplate::EdgeSsr,
         ProjectTemplate::EventStream,
+        ProjectTemplate::Fullstack,
     ];
 
     /// Feature names `krab_core` actually declares, read from its manifest.
@@ -1546,11 +1967,61 @@ mod tests {
             .expect("generated Cargo.toml unreadable");
         let parsed: toml::Value = toml::from_str(&raw)
             .unwrap_or_else(|e| panic!("generated Cargo.toml is not valid TOML: {e}\n{raw}"));
-        parsed
+        let mut table = parsed
             .get("dependencies")
             .and_then(|d| d.as_table())
-            .expect("generated Cargo.toml has no [dependencies]")
-            .clone()
+            .cloned()
+            .unwrap_or_default();
+        if let Some(target) = parsed.get("target").and_then(|t| t.as_table()) {
+            if let Some(native) = target
+                .get("cfg(not(target_arch = \"wasm32\"))")
+                .and_then(|n| n.get("dependencies"))
+                .and_then(|d| d.as_table())
+            {
+                for (k, v) in native {
+                    table.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+        }
+        table
+    }
+
+    fn collect_all_krab_core_features(project_dir: &Path) -> Vec<String> {
+        let raw = fs::read_to_string(project_dir.join("Cargo.toml"))
+            .expect("generated Cargo.toml unreadable");
+        let parsed: toml::Value = toml::from_str(&raw)
+            .unwrap_or_else(|e| panic!("generated Cargo.toml is not valid TOML: {e}\n{raw}"));
+        let mut features = Vec::new();
+
+        if let Some(deps) = parsed.get("dependencies").and_then(|d| d.as_table()) {
+            if let Some(kc) = deps.get("krab_core").and_then(|d| d.as_table()) {
+                if let Some(arr) = kc.get("features").and_then(|f| f.as_array()) {
+                    for f in arr {
+                        if let Some(s) = f.as_str() {
+                            features.push(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(target) = parsed.get("target").and_then(|t| t.as_table()) {
+            for (_, target_val) in target {
+                if let Some(deps) = target_val.get("dependencies").and_then(|d| d.as_table()) {
+                    if let Some(kc) = deps.get("krab_core").and_then(|d| d.as_table()) {
+                        if let Some(arr) = kc.get("features").and_then(|f| f.as_array()) {
+                            for f in arr {
+                                if let Some(s) = f.as_str() {
+                                    features.push(s.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        features
     }
 
     /// The `saas` template used to emit `features = ["db, rest"]` — a single
@@ -1563,25 +2034,16 @@ mod tests {
 
         for template in ALL_TEMPLATES {
             let (_temp, project_dir) = generate_fixture("demo-features", &template)?;
-            let deps = generated_dependencies(&project_dir);
-
-            let requested = deps
-                .get("krab_core")
-                .and_then(|d| d.get("features"))
-                .and_then(|f| f.as_array())
-                .unwrap_or_else(|| panic!("{template:?}: krab_core features is not an array"));
+            let requested = collect_all_krab_core_features(&project_dir);
 
             assert!(
                 !requested.is_empty(),
                 "{template:?}: krab_core has no features; it has no default features either"
             );
 
-            for feature in requested {
-                let name = feature
-                    .as_str()
-                    .unwrap_or_else(|| panic!("{template:?}: non-string feature {feature:?}"));
+            for name in requested {
                 assert!(
-                    declared.iter().any(|d| d == name),
+                    declared.iter().any(|d| d == &name),
                     "{template:?}: requests krab_core feature {name:?}, which krab_core does \
                      not declare. Declared: {declared:?}"
                 );
@@ -1692,7 +2154,7 @@ mod tests {
         assert!(workflow.contains("EmbarkStudios/cargo-deny-action@v2"));
         assert!(!workflow.contains("cargo install cargo-deny"));
         assert!(workflow.contains("cargo fmt --all --check"));
-        assert!(workflow.contains("cargo test --all-features"));
+        assert!(workflow.contains("cargo test"));
     }
 
     /// The `saas` workflow carried a step that asserted nothing: `cargo test
@@ -1829,6 +2291,30 @@ mod tests {
         assert!(main_rs.contains("/api/events"));
         assert!(main_rs.contains("/api/ws"));
         assert!(main_rs.contains("tokio_stream"));
+        Ok(())
+    }
+
+    #[test]
+    fn fullstack_template_smoke_generates_expected_files() -> Result<()> {
+        let (_temp_dir, project_dir) =
+            generate_fixture("demo-fullstack", &ProjectTemplate::Fullstack)?;
+        assert_common_scaffold(&project_dir, "demo-fullstack", &ProjectTemplate::Fullstack)?;
+
+        let lib_rs = fs::read_to_string(project_dir.join("src/lib.rs"))?;
+        assert!(lib_rs.contains("#[island]"));
+        assert!(lib_rs.contains("#[server]"));
+        assert!(lib_rs.contains("krab_boot"));
+        assert!(lib_rs.contains("render_home_page"));
+
+        let main_rs = fs::read_to_string(project_dir.join("src/main.rs"))?;
+        assert!(main_rs.contains("demo_fullstack"));
+        assert!(main_rs.contains("greet_server_handler"));
+        assert!(main_rs.contains("ServeDir::new(\"dist\")"));
+        assert!(main_rs.contains("/api/rpc/greet_server"));
+
+        let krab_toml = fs::read_to_string(project_dir.join("krab.toml"))?;
+        assert!(krab_toml.contains("client_package = \"demo-fullstack\""));
+        assert!(krab_toml.contains("client_artifact_stem = \"demo_fullstack\""));
         Ok(())
     }
 
@@ -2042,6 +2528,7 @@ mod tests {
             (ProjectTemplate::Saas, "health_handler"),
             (ProjectTemplate::EdgeSsr, "health_handler"),
             (ProjectTemplate::EventStream, "health_handler"),
+            (ProjectTemplate::Fullstack, "health"),
         ] {
             let (_temp, project_dir) = generate_fixture("demo-smoke", &template)?;
             let main_rs = fs::read_to_string(project_dir.join("src/main.rs"))?;
@@ -2264,6 +2751,7 @@ mod tests {
             ProjectTemplate::Default,
             ProjectTemplate::Saas,
             ProjectTemplate::EventStream,
+            ProjectTemplate::Fullstack,
         ] {
             let (_temp, project_dir) = generate_fixture("demo-nodocs", &template)?;
             assert!(

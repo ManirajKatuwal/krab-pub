@@ -381,14 +381,15 @@ async fn issue_token_pair(
     let refresh_token = encode_hs256(&key_ring.active_kid, secret, &refresh_claims)?;
 
     let refresh_ttl = Duration::from_secs(cfg.refresh_ttl_secs.max(1));
-    let _ = runtime
+    runtime
         .store
         .set(
             &format!("auth:refresh:live:{}", refresh_jti),
             "1",
             refresh_ttl,
         )
-        .await;
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to persist refresh token: {e}"))?;
 
     Ok(TokenPair {
         token_type: "Bearer",
@@ -504,7 +505,12 @@ async fn refresh_handler(
     }
 
     let ttl = ttl_from_exp(claims.exp);
-    let _ = state.runtime.store.set(&used_key, "1", ttl).await;
+    if let Err(err) = state.runtime.store.set(&used_key, "1", ttl).await {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"store_unavailable","detail":err.to_string()})),
+        );
+    }
 
     let scopes = claims
         .scope
@@ -548,18 +554,30 @@ async fn revoke_handler(
     };
 
     let ttl = ttl_from_exp(claims.exp);
-    let _ = state
+    if let Err(err) = state
         .runtime
         .store
         .set(&format!("auth:revoked:{}", claims.jti), "1", ttl)
-        .await;
+        .await
+    {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"store_unavailable","detail":err.to_string()})),
+        );
+    }
 
     if claims.token_use == "refresh" {
-        let _ = state
+        if let Err(err) = state
             .runtime
             .store
             .set(&format!("auth:refresh:used:{}", claims.jti), "1", ttl)
-            .await;
+            .await
+        {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"store_unavailable","detail":err.to_string()})),
+            );
+        }
     }
 
     (

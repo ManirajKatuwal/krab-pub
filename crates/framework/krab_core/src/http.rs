@@ -80,6 +80,40 @@ pub(crate) fn u64_env_lenient(name: &str, default: u64) -> u64 {
     }
 }
 
+/// What the concurrency limit does with requests it has no permit for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OverloadMode {
+    /// Wait for a permit. Excess requests are bounded by the request timeout.
+    Queue,
+    /// Fail fast with `503 Service Unavailable`.
+    Shed,
+}
+
+/// Read `KRAB_HTTP_OVERLOAD_MODE`, trimming and reporting anything unknown.
+///
+/// The value used to be lowercased and compared raw, so `"shed "` — or a typo
+/// — selected `queue` in silence. That is the worst shape for this particular
+/// knob: a service configured to shed keeps queueing, and nothing says so
+/// until the load the setting exists for actually arrives.
+pub(crate) fn overload_mode_from_env() -> OverloadMode {
+    let Ok(raw) = std::env::var("KRAB_HTTP_OVERLOAD_MODE") else {
+        return OverloadMode::Queue;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "queue" => OverloadMode::Queue,
+        "shed" => OverloadMode::Shed,
+        _ => {
+            warn!(
+                env_var = "KRAB_HTTP_OVERLOAD_MODE",
+                value = %raw,
+                default = "queue",
+                "env_value_invalid_using_default"
+            );
+            OverloadMode::Queue
+        }
+    }
+}
+
 pub fn apply_common_http_layers<S>(router: Router<S>, state: S) -> Router<S>
 where
     S: Clone + Send + Sync + 'static + HasRuntimeState,
@@ -101,10 +135,44 @@ where
     //   out through the security-headers layer and the rest of the stack.
     let request_timeout_secs = u64_env_lenient("KRAB_HTTP_REQUEST_TIMEOUT_SECS", 30);
     let max_concurrency = u64_env_lenient("KRAB_HTTP_MAX_CONCURRENCY", 1024);
+    let overload_mode = overload_mode_from_env();
 
     let mut router = router;
     if max_concurrency > 0 {
-        router = router.layer(ConcurrencyLimitLayer::new(max_concurrency as usize));
+        if overload_mode == OverloadMode::Shed {
+            let shed_layer = tower::ServiceBuilder::new()
+                .layer(axum::error_handling::HandleErrorLayer::new(
+                    |err: tower::BoxError| async move {
+                        if err.is::<tower::load_shed::error::Overloaded>() {
+                            // 503, not 429: the caller did nothing wrong, the
+                            // service ran out of capacity. `.env.example`,
+                            // `docs/reference/environment.md` and the
+                            // changelog all describe shed mode as
+                            // `503 Service Unavailable`, and load balancer and
+                            // alert policies key off that difference.
+                            ApiError::new(
+                                ErrorCategory::Unavailable,
+                                "SERVICE_OVERLOADED",
+                                "Service concurrency limit reached; request dropped by load shedder",
+                            )
+                            .into_response()
+                        } else {
+                            ApiError::new(
+                                ErrorCategory::Internal,
+                                "INTERNAL_SERVER_ERROR",
+                                "Unhandled server error",
+                            )
+                            .into_response()
+                        }
+                    },
+                ))
+                .layer(tower::load_shed::LoadShedLayer::new())
+                .layer(ConcurrencyLimitLayer::new(max_concurrency as usize));
+
+            router = router.layer(shed_layer);
+        } else {
+            router = router.layer(ConcurrencyLimitLayer::new(max_concurrency as usize));
+        }
     }
     if request_timeout_secs > 0 {
         // Outside the concurrency limit so time spent waiting for a permit

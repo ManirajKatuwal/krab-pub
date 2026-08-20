@@ -163,6 +163,7 @@ pub(crate) fn normalize_service_base_url(name: &str, default_url: &str) -> Strin
         .unwrap_or_else(|| default_url.to_string())
 }
 
+#[allow(dead_code)]
 pub(crate) fn env_trimmed(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()

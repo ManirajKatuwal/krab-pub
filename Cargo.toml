@@ -13,6 +13,20 @@ members = [
 ]
 resolver = "2"
 
+# The version `[Unreleased]` in CHANGELOG.md will ship as.
+#
+# Deprecations and docs have to name the release they take effect in *before*
+# that release exists — `#[deprecated(since = ..)]` and the "As of X" notes in
+# docs/reference/api.md. Nothing else in the tree knows what the next version
+# is, so those references were free to name a version that never shipped, and
+# a `since` naming the wrong release is worse than no `since` at all.
+#
+# `scripts/check_workspace_layout.py` enforces that every such reference names
+# either this or the current version. `release: X` bumps
+# `[workspace.package] version` to this value and moves this one forward.
+[workspace.metadata.krab]
+next_version = "0.5.0"
+
 [workspace.package]
 version = "0.4.0"
 edition = "2021"

@@ -40,8 +40,8 @@ cp .env.example .env
 cargo run
 ```
 
-Four templates are available via `--template`: `default` (shown here), `saas`,
-`edge-ssr`, and `event-stream`.
+Five templates are available via `--template`: `default` (shown here), `saas`,
+`edge-ssr`, `event-stream`, and `fullstack`.
 
 You get a service on `http://127.0.0.1:3000` with `/`, `/health`, and `/ready`,
 plus a `krab.toml`, a `Dockerfile`, a Kubernetes manifest, and a CI workflow.

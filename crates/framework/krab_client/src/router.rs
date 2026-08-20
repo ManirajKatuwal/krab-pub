@@ -6,7 +6,7 @@
 //!
 //! # How it works
 //!
-//! [`start`] — exported to JavaScript as `start_router`, and available on
+//! `start` — exported to JavaScript as `start_router`, and available on
 //! `wasm32` with the `web` feature — installs two listeners:
 //!
 //! - a capturing `click` listener on `document`, which intercepts anchors that

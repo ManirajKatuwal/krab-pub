@@ -11,7 +11,7 @@ mod tests {
     use std::time::Duration;
     use tower::ServiceExt;
 
-    use crate::http::{apply_common_http_layers, RuntimeState};
+    use crate::http::{apply_common_http_layers, OverloadMode, RuntimeState};
 
     #[derive(Clone)]
     struct TestState {
@@ -62,6 +62,7 @@ mod tests {
             "KRAB_RATE_LIMIT_FAIL_OPEN",
             "KRAB_HTTP_REQUEST_TIMEOUT_SECS",
             "KRAB_HTTP_MAX_CONCURRENCY",
+            "KRAB_HTTP_OVERLOAD_MODE",
             "KRAB_PROTOCOL_TENANT_HINT_UNTRUSTED",
         ] {
             std::env::remove_var(key);
@@ -1020,6 +1021,120 @@ mod tests {
             elapsed >= Duration::from_millis(550),
             "with max concurrency 1 the two 300ms requests must run serially, took {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_load_shed_mode_drops_excess_requests_with_503() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+        std::env::set_var("KRAB_AUTH_OPEN_PATHS", "/slow_shed");
+        std::env::set_var("KRAB_HTTP_MAX_CONCURRENCY", "1");
+        std::env::set_var("KRAB_HTTP_OVERLOAD_MODE", "shed");
+
+        let entered = Arc::new(Notify::new());
+        let entered_clone = entered.clone();
+        let release = Arc::new(Notify::new());
+        let release_clone = release.clone();
+
+        let state = TestState {
+            runtime: RuntimeState::new(),
+        };
+        let app = apply_common_http_layers(
+            Router::new().route(
+                "/slow_shed",
+                axum::routing::get(move || {
+                    let entered = entered_clone.clone();
+                    let release = release_clone.clone();
+                    async move {
+                        entered.notify_one();
+                        release.notified().await;
+                        "done"
+                    }
+                }),
+            ),
+            state.clone(),
+        )
+        .with_state(state);
+
+        let notify_enter_wait = entered.notified();
+        let app1 = app.clone();
+        let handle1 = tokio::spawn(async move {
+            app1.oneshot(
+                Request::builder()
+                    .uri("/slow_shed")
+                    .header("x-forwarded-for", "10.10.0.65")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        });
+
+        // Wait until request 1 is holding the single permit inside the handler
+        notify_enter_wait.await;
+
+        let app2 = app.clone();
+        let res2 = app2
+            .oneshot(
+                Request::builder()
+                    .uri("/slow_shed")
+                    .header("x-forwarded-for", "10.10.0.66")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Release request 1
+        release.notify_one();
+        let res1 = handle1.await.unwrap();
+
+        assert_eq!(res1.status(), StatusCode::OK);
+        // 503 and not 429: shed mode reports that the *service* is out of
+        // capacity, which is what `.env.example` and
+        // `docs/reference/environment.md` promise and what LB and alert
+        // policies match on. `KRAB_HTTP_OVERLOAD_MODE` is cleared by
+        // `reset_auth_env`, so a failure here cannot leak shed mode into the
+        // serial tests that follow.
+        assert_eq!(res2.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    #[serial]
+    fn test_overload_mode_env_is_trimmed_and_validated() {
+        let _guard = env_lock();
+        reset_auth_env();
+
+        assert_eq!(crate::http::overload_mode_from_env(), OverloadMode::Queue);
+
+        for raw in ["shed", " shed ", "SHED", "\t Shed\n"] {
+            std::env::set_var("KRAB_HTTP_OVERLOAD_MODE", raw);
+            assert_eq!(
+                crate::http::overload_mode_from_env(),
+                OverloadMode::Shed,
+                "{raw:?} must select shed mode"
+            );
+        }
+
+        // Unknown values fall back to queue rather than to shed: a typo must
+        // not turn shedding on, and it must not turn it off silently either —
+        // the fallback logs `env_value_invalid_using_default`.
+        for raw in ["queue", " ", "", "sched", "drop"] {
+            std::env::set_var("KRAB_HTTP_OVERLOAD_MODE", raw);
+            assert_eq!(
+                crate::http::overload_mode_from_env(),
+                OverloadMode::Queue,
+                "{raw:?} must fall back to queue mode"
+            );
+        }
+
+        reset_auth_env();
     }
 
     /// The JWT verifier cache is built once per `RuntimeState`: rotating the

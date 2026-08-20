@@ -31,7 +31,7 @@ the services that are built and gated live in [`services/`](../../services/).
 
 | Use case | Track guide | Generate with | Exercises |
 | --- | --- | --- | --- |
-| **Islands + RPC** | **`examples/reference_apps/islands_rpc` — vendored code, no generation step** | — | **`view!`, `#[island]`, `#[server]`, SSR + hydration end to end** |
+| **Islands + RPC** | **`examples/reference_apps/islands_rpc` — vendored code, no generation step** | `krab new fullstack-app --template fullstack` | **`view!`, `#[island]`, `#[server]`, SSR + hydration end to end** |
 | Content site | `examples/reference_apps/content_site` | `krab new content-site --template default` | static routes, render policy, deployment basics |
 | SaaS dashboard | `examples/reference_apps/saas_dashboard` | `krab new saas-dashboard --template saas` | auth-ready HTTP layers, tenant API scaffolding, release checks |
 | Edge-rendered app | `examples/reference_apps/edge_rendered` | `krab new edge-rendered --template edge-ssr` | explicit route render policy, ISR metadata, edge eligibility |

@@ -68,6 +68,13 @@ jobs:
       # both at once, which hides a driver that only builds because the other
       # one pulled something in. SQLite support previously lived in
       # service_users, so the framework-level SQLite path was never compiled.
+      #
+      # These two steps are compile-isolation checks, not database coverage:
+      # this job provides no Postgres, so `db_tests` skips and reports `ok`.
+      # The database-backed assertions run in `db-lifecycle.yaml`, which owns
+      # a service container and sets `KRAB_REQUIRE_DB_TESTS=1` so a skip there
+      # is a hard failure. Do not read a green here as the ledger, drift, or
+      # governance paths having been exercised.
       - name: krab_core tests (db-postgres only)
         run: cargo test -p krab_core --features db-postgres
 

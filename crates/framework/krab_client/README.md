@@ -38,7 +38,7 @@ stay alive for the life of the page.
 
 ```toml
 [dependencies]
-krab_client = "0.3"
+krab_client = "0.4"
 ```
 
 ## Features
@@ -61,7 +61,7 @@ the browser bundle later hydrates:
 
 ```toml
 [dependencies]
-krab_client = { version = "0.3", default-features = false }
+krab_client = { version = "0.4", default-features = false }
 ```
 
 ## Documentation

@@ -156,6 +156,17 @@ pub(super) fn run_db_drift_check(diagnostics: bool) -> Result<()> {
 }
 
 pub(super) fn run_db_rollback_rehearsal(out: &PathBuf, diagnostics: bool) -> Result<()> {
+    // `KRAB_REQUIRE_DB_TESTS=1` is not optional here. Without it,
+    // `test_migration_rollback` prints "this test executed NOTHING" and
+    // reports `ok` when no database is reachable, so this function would go on
+    // to write `rollback_rehearsal: ok` — an evidence file, trusted by
+    // RELEASE_POLICY as proof of rehearsal, produced by a rehearsal that never
+    // ran. The artifact outlives the run and carries no trace of the skip,
+    // which makes it worse than no artifact at all.
+    //
+    // With the flag, an unreachable database panics, cargo exits non-zero,
+    // and this returns before writing anything. A rehearsal that did not
+    // rehearse is a failure by definition.
     run_command_logged(
         "db rollback rehearsal test",
         Command::new("cargo")
@@ -166,7 +177,8 @@ pub(super) fn run_db_rollback_rehearsal(out: &PathBuf, diagnostics: bool) -> Res
             .arg("db-postgres rest")
             .arg("test_migration_rollback")
             .arg("--")
-            .arg("--nocapture"),
+            .arg("--nocapture")
+            .env("KRAB_REQUIRE_DB_TESTS", "1"),
         diagnostics,
     )?;
 

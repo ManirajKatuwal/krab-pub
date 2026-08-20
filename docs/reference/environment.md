@@ -83,6 +83,7 @@ variable marked **secret** has them.
 | `KRAB_AUTH_BOOTSTRAP_PASSWORD` | No | — | **Secret.** Bootstrap account password, as an Argon2id PHC hash. Plaintext is accepted in `dev`/`local` only and hashed at startup |
 | `KRAB_AUTH_LOGIN_USERS_JSON` | No | — | **Secret.** JSON object of `username` → Argon2id PHC hash. Generate entries with `krab auth hash-password --username <name>` |
 | `KRAB_SERVICE_AUTH_SCOPE` | No | `service:internal` | Scope required for service-to-service calls |
+| `KRAB_FRONTEND_DOWNSTREAM_BEARER_TOKEN` | No | — | **Secret.** Downstream bearer token for frontend to authenticate calls to backend services |
 | `KRAB_AUTH_BASE_URL` | No | `http://127.0.0.1:3001` | Auth service base URL for inter-service calls. Overridden by runtime topology when set |
 | `KRAB_USERS_BASE_URL` | No | `http://127.0.0.1:3002` | Users service base URL for inter-service calls. Overridden by runtime topology when set |
 
@@ -114,6 +115,7 @@ Required when `KRAB_AUTH_MODE=jwt`.
 | `KRAB_CORS_ORIGINS` | No | — | Comma-separated allowed origins. Unset means no cross-origin allowance |
 | `KRAB_HTTP_REQUEST_TIMEOUT_SECS` | No | `30` | Per-request timeout applied innermost in the common HTTP stack; overruns return 408. `0` disables |
 | `KRAB_HTTP_MAX_CONCURRENCY` | No | `1024` | Maximum concurrently processed requests. Excess requests queue (backpressure) and are bounded by the request timeout. `0` disables |
+| `KRAB_HTTP_OVERLOAD_MODE` | No | `queue` | Concurrency overload strategy: `queue` (wait in queue bounded by timeout) or `shed` (fast-fail excess requests with 503 Service Unavailable). Trimmed and case-insensitive; an unrecognised value falls back to `queue` and logs `env_value_invalid_using_default` |
 
 ## Database
 

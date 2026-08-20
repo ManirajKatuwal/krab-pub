@@ -38,9 +38,9 @@ use crate::cache::{cache_middleware, is_finalized_ssr_snapshot};
 #[cfg(test)]
 use crate::frontend_env::normalize_service_base_url;
 use crate::frontend_env::{
-    bool_env, env_trimmed, hydration_budget_for_route, hydration_preload_links_html,
-    isr_revalidate_duration, normalize_public_base_url, resolve_service_base_url,
-    stream_budget_bytes, u64_env, HydrationMode,
+    bool_env, hydration_budget_for_route, hydration_preload_links_html, isr_revalidate_duration,
+    normalize_public_base_url, resolve_service_base_url, stream_budget_bytes, u64_env,
+    HydrationMode,
 };
 use crate::protocol_client::ProtocolAwareClient;
 use crate::render_policy::page_render_policy;
@@ -84,7 +84,7 @@ fn i18n_for(locale: &str) -> I18n {
     I18n::new(i18n_bundle(), "en").with_locale(locale)
 }
 
-fn resolve_locale(headers: &HeaderMap) -> String {
+pub(crate) fn resolve_locale(headers: &HeaderMap) -> String {
     let supported = i18n_bundle().supported_locales().to_vec();
     let from_header = headers
         .get(axum::http::header::ACCEPT_LANGUAGE)
@@ -93,14 +93,14 @@ fn resolve_locale(headers: &HeaderMap) -> String {
     from_header.unwrap_or_else(|| "en".to_string())
 }
 
-fn render_isr_path(path: &str) -> Option<String> {
+pub(crate) fn render_isr_path(path: &str, locale: &str) -> Option<String> {
     let policy = page_render_policy(path)?;
     if !policy.is_isr() {
         return None;
     }
 
     if path == "/" {
-        return Some(render_home_page());
+        return Some(render_home_page_localized(locale));
     }
     if path == "/about" {
         return Some(render_about_page());
@@ -122,7 +122,10 @@ async fn trigger_isr_revalidation(state: AppState, cache_key: String, path: Stri
         }
     }
 
-    if let Some(html) = render_isr_path(&path) {
+    let (path_part, locale) = crate::cache::parse_cache_key_path_and_locale(&cache_key);
+    let path_to_render = if path.is_empty() { &path_part } else { &path };
+
+    if let Some(html) = render_isr_path(path_to_render, &locale) {
         if is_finalized_ssr_snapshot(&html) {
             // Background revalidation: nothing is waiting on this, so a store
             // failure is logged and the stale entry stays until the next attempt.
@@ -157,7 +160,8 @@ async fn trigger_isr_revalidation(state: AppState, cache_key: String, path: Stri
     in_progress.remove(&cache_key);
 }
 
-fn render_home_page() -> String {
+#[allow(dead_code)]
+pub(crate) fn render_home_page() -> String {
     render_home_page_localized("en")
 }
 
@@ -859,23 +863,39 @@ fn render_home_page_localized(locale: &str) -> String {
     finished.concat()
 }
 
-async fn home_handler(headers: HeaderMap) -> Html<String> {
+async fn home_handler(
+    headers: HeaderMap,
+) -> Result<Html<String>, (axum::http::StatusCode, &'static str)> {
     let locale = resolve_locale(&headers);
-    let html = tokio::task::spawn_blocking(move || render_home_page_localized(&locale))
-        .await
-        .unwrap();
-    Html(html)
+    match tokio::task::spawn_blocking(move || render_home_page_localized(&locale)).await {
+        Ok(html) => Ok(Html(html)),
+        Err(err) => {
+            tracing::error!(%err, "render_home_page_localized_panic");
+            Err((
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "render_task_failed",
+            ))
+        }
+    }
 }
 
-async fn localized_home_handler(Path(params): Path<HashMap<String, String>>) -> Html<String> {
+async fn localized_home_handler(
+    Path(params): Path<HashMap<String, String>>,
+) -> Result<Html<String>, (axum::http::StatusCode, &'static str)> {
     let locale = params
         .get("locale")
         .map(|s| s.to_string())
         .unwrap_or_else(|| "en".to_string());
-    let html = tokio::task::spawn_blocking(move || render_home_page_localized(&locale))
-        .await
-        .unwrap();
-    Html(html)
+    match tokio::task::spawn_blocking(move || render_home_page_localized(&locale)).await {
+        Ok(html) => Ok(Html(html)),
+        Err(err) => {
+            tracing::error!(%err, "render_home_page_localized_panic");
+            Err((
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "render_task_failed",
+            ))
+        }
+    }
 }
 
 async fn robots_txt_handler() -> ([(&'static str, &'static str); 1], String) {
@@ -1159,7 +1179,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let users_contract_bundle = users_contract::build_users_adapter(
         &topology_runtime,
         users_base_url.clone(),
-        env_trimmed("KRAB_FRONTEND_DOWNSTREAM_BEARER_TOKEN"),
+        krab_core::config::read_env_or_file("KRAB_FRONTEND_DOWNSTREAM_BEARER_TOKEN")
+            .ok()
+            .flatten(),
     );
     tracing::info!(
         event = "users_contract_adapter_selected",

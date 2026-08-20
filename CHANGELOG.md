@@ -16,6 +16,95 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ## [Unreleased]
 
+### Added
+
+- `KRAB_HTTP_OVERLOAD_MODE=queue|shed`: support for fast-failing excess concurrent HTTP
+  requests with `503 Service Unavailable` (`SERVICE_OVERLOADED`) via `tower/load-shed`.
+- Signal WASM microtask drain chain depth limiter (`DRAIN_CHAIN_DEPTH`) bounded at
+  `MAX_FLUSH_DEPTH = 64`, cutting off runaway self-writing and mutually recursive signal
+  loops. It counts consecutive drain generations that keep queueing more effects — the
+  browser analogue of the native `FLUSH_DEPTH` frame count — so a wide fan-out of
+  independent effect writes in one flush is delivered in full.
+- `ErrorCategory::Unavailable` (HTTP 503), distinct from `RateLimited` (429): the service
+  is out of capacity rather than the caller being over quota.
+- `krab_client` headless browser integration suite `cycle_browser.rs` covering WASM signal self-writes,
+  infinite loop cutoff, wide effect fan-out delivery, and scoped effect disposal.
+- `krab new <name> --template fullstack` scaffolds a complete full-stack Krab
+  application with server-side rendering (SSR), client-side WASM island hydration
+  via `krab_client`, `#[server]` functions, and static file serving (`/pkg` and
+  `/public` via `tower-http`) out of the box. Dual-target dependencies (native
+  axum/tokio/rest and wasm32 web/hydration) and wasm-pack build configurations
+  are generated automatically.
+
+### Changed
+
+- **Breaking:** `krab_core::http::ErrorCategory` is now `#[non_exhaustive]`. Rust callers
+  that `match` on a category need a wildcard arm. Taken in the same release as the
+  `Unavailable` addition so that every future category is a non-breaking addition;
+  constructing the existing variants is unaffected.
+- `KRAB_HTTP_OVERLOAD_MODE` is trimmed and validated. An unrecognised value falls back to
+  `queue` and logs `env_value_invalid_using_default` instead of selecting it silently.
+
+### Governance
+
+- `krab db rehearsal` now requires a reachable database (`KRAB_REQUIRE_DB_TESTS=1`) and
+  writes no evidence file when the rehearsal does not run. It previously recorded
+  `rollback_rehearsal: ok` when the underlying test skipped for want of a database —
+  an artifact RELEASE_POLICY trusts as proof of rehearsal, produced by a rehearsal that
+  never happened.
+- `db-lifecycle.yaml` runs `krab_core`'s `db_tests` against its Postgres service. Ten of
+  those eleven tests — migration ledger, checksum rewriting, drift policy, governance
+  gating, promotion rules — previously ran against a real database nowhere in CI; only
+  the rollback rehearsal did. `ops-hardening.yaml`'s per-driver steps are documented as
+  compile-isolation checks, which is all they ever were.
+- `db-lifecycle.yaml` sets `KRAB_REQUIRE_DB_TESTS=1`. The job provides Postgres, so a skip
+  there means the service container broke; the gate no longer degrades silently to green.
+- `[workspace.metadata.krab] next_version` declares the version `[Unreleased]` will ship
+  as, and `scripts/check_workspace_layout.py` fails any `#[deprecated(since = ..)]` or
+  `docs/reference/api.md` "As of X" reference naming a release beyond it. Those references
+  have to name a release before it exists, so a renumbered release used to leave them
+  silently false — and a `since` naming the wrong version is worse than none.
+
+### Security
+
+- `h2` bumped to 0.4.16 for [RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258)
+  (unbounded queueing of empty DATA frames in the `hyper` stack). Lockfile only.
+
+### Deprecated
+
+- `krab_core::db::postgres::run_migrations`, superseded by `run_versioned_migrations`.
+  It only creates an unused `_krab_migrations` table. Removed in 0.6.0.
+
+### Fixed
+
+- `KRAB_HTTP_OVERLOAD_MODE=shed` now answers `503 Service Unavailable` as documented; it
+  was returning `429 Too Many Requests`, which load balancer and alert policies keyed on
+  503 would not match.
+- `service_frontend` ISR cache keys escape `@` and `%` in the path and locale, so a request
+  path that itself contains `@` can no longer be read as a locale suffix — the multi-locale
+  poisoning the locale dimension was added to prevent. Existing cached entries miss once
+  under the new key format.
+- `krab new --template fullstack` output passes `cargo fmt --all --check`: the crate's own
+  `use` line is now emitted in sorted position rather than at a fixed offset.
+- `krab new --template fullstack` takes `krab_client` with `default-features = false`, so
+  the deprecated `demo-islands` `Counter` no longer collides with the template's own
+  `Counter` in the island registry.
+- `krab dev` builds the client with `cargo build --lib`, so a single-crate project with both
+  a `[[bin]]` and a `cdylib` no longer tries to compile its axum/tokio binary for
+  `wasm32-unknown-unknown`, and it looks for the wasm artifact under the crate name cargo
+  actually emits (`demo_fullstack.wasm`, not `demo-fullstack.wasm`).
+- `service_auth` token revocation and refresh marker persistence now fail closed with
+  `503 Service Unavailable` on store errors instead of silently swallowing failures.
+- `service_frontend` ISR cache keying and revalidation now incorporate the locale dimension,
+  preventing multi-locale cache poisoning and English revalidation overwrites.
+- `service_frontend` request-path `spawn_blocking` task failures map to 500 error responses
+  instead of panicking worker threads.
+- `KRAB_FRONTEND_DOWNSTREAM_BEARER_TOKEN` routed through `krab_core::config::read_env_or_file`.
+
+### Removed
+
+- Removed unused `SignalId` from `krab_core::signal`.
+
 ---
 
 ## [0.4.0] — 2026-08-12

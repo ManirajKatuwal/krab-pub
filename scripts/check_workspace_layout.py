@@ -12,6 +12,13 @@ Also checks that each `krab_*` entry in `[workspace.dependencies]` carries a
 duplicated by necessity and drifts silently — a stale pin only surfaces at
 `cargo publish`, which is the worst possible moment to find out.
 
+Finally, checks that every forward version reference — `#[deprecated(since =
+..)]` in Rust sources and the "As of **X**" notes in
+`docs/reference/api.md` — names either the current version or the declared
+`[workspace.metadata.krab] next_version`. Those references have to name a
+release before it exists, so nothing stops them naming one that never ships,
+and a `since` pointing at the wrong release is worse than no `since` at all.
+
 The rules above are the enforced layout standard; the version-pin check
 implements the publication preconditions in `RELEASE_POLICY.md`.
 """
@@ -127,6 +134,90 @@ def check_inter_crate_versions(manifest_text: str):
     return failures
 
 
+# `#[deprecated(since = "0.5.0")]`, in any spacing rustfmt produces.
+DEPRECATED_SINCE_RE = re.compile(r"""since\s*=\s*["'](?P<version>[0-9]+\.[0-9]+\.[0-9]+)["']""")
+# `As of **0.5.0**` / `As of 0.5.0` in the API reference.
+DOC_AS_OF_RE = re.compile(r"As of \*{0,2}(?P<version>[0-9]+\.[0-9]+\.[0-9]+)\*{0,2}")
+
+# Scanned for `since = "..."`. Generated and vendored trees are excluded: the
+# CLI's project templates embed version strings for the *generated* project,
+# which follow their own numbering.
+SOURCE_ROOTS = ("crates/framework", "crates/tooling", "services")
+SOURCE_EXCLUDES = ("project_template.rs",)
+
+API_DOC = pathlib.Path("docs/reference/api.md")
+
+
+def check_forward_version_references(manifest_text: str):
+    """Return failures for version references naming an unplanned release.
+
+    A reference may name any already-released version — those are history —
+    or `next_version`, the release `[Unreleased]` becomes. Naming anything
+    beyond that is a claim about a release nobody has planned.
+    """
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        print("WARN: tomllib unavailable (Python < 3.11); skipping version-reference check")
+        return []
+
+    parsed = tomllib.loads(manifest_text)
+    current = parsed.get("workspace", {}).get("package", {}).get("version")
+    next_version = (
+        parsed.get("workspace", {}).get("metadata", {}).get("krab", {}).get("next_version")
+    )
+    if not next_version:
+        return [
+            "[workspace.metadata.krab] has no `next_version`. Declare the "
+            "version `[Unreleased]` will ship as, so deprecations and docs "
+            "cannot name a release that never happens"
+        ]
+    if next_version == current:
+        return [
+            f"[workspace.metadata.krab] next_version is {next_version!r}, the "
+            f"version already in [workspace.package]. After a release, move it "
+            f"forward to the next planned version"
+        ]
+
+    def parts(version: str):
+        return tuple(int(component) for component in version.split("."))
+
+    # Past versions are history and must stay as written: `since = "0.3.0"` on
+    # something actually deprecated in 0.3.0 is correct forever. The only
+    # unreachable claim is one naming a release *beyond* the next planned one,
+    # which is either a typo or a leftover from a renumbered release.
+    ceiling = parts(next_version)
+    failures = []
+
+    for root in SOURCE_ROOTS:
+        for path in sorted((ROOT / root).rglob("*.rs")):
+            if path.name in SOURCE_EXCLUDES:
+                continue
+            for match in DEPRECATED_SINCE_RE.finditer(path.read_text(encoding="utf-8")):
+                found = match.group("version")
+                if parts(found) > ceiling:
+                    rel = path.relative_to(ROOT).as_posix()
+                    failures.append(
+                        f"{rel}: `since = {found!r}` is beyond next_version "
+                        f"({next_version}), so it names a release that is not "
+                        f"planned. Fix the annotation, or move next_version "
+                        f"forward in [workspace.metadata.krab]"
+                    )
+
+    doc = ROOT / API_DOC
+    if doc.is_file():
+        for match in DOC_AS_OF_RE.finditer(doc.read_text(encoding="utf-8")):
+            found = match.group("version")
+            if parts(found) > ceiling:
+                failures.append(
+                    f"{API_DOC.as_posix()}: 'As of {found}' is beyond "
+                    f"next_version ({next_version}), so it names a release "
+                    f"that is not planned"
+                )
+
+    return failures
+
+
 def check_root_manifest_is_metadata_only(manifest_text: str):
     """Return failures for crate-level sections in the root Cargo.toml.
 
@@ -165,6 +256,7 @@ def main() -> int:
     manifest_text = MANIFEST.read_text(encoding="utf-8")
     members = parse_members(manifest_text)
     failures.extend(check_inter_crate_versions(manifest_text))
+    failures.extend(check_forward_version_references(manifest_text))
     failures.extend(check_root_manifest_is_metadata_only(manifest_text))
 
     if not members:

@@ -26,7 +26,7 @@
 //!
 //! ## Replicas
 //!
-//! [`IsrCache::new`] is backed by [`MemoryStore`](crate::store::MemoryStore) —
+//! [`IsrCache::new`] is backed by [`MemoryStore`] —
 //! per-process, and therefore **only correct for a single replica**. Under more
 //! than one, each process keeps its own copy and
 //! [`invalidate_prefix`](IsrCache::invalidate_prefix) clears exactly one of

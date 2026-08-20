@@ -28,6 +28,7 @@ This document is the public API contract for currently exposed HTTP and GraphQL 
 | `CONFLICT` | 409 |
 | `TOO_MANY_REQUESTS` | 429 |
 | `PROTOCOL_NOT_SUPPORTED` | 400 |
+| `SERVICE_OVERLOADED` | 503 |
 | `INTERNAL_SERVER_ERROR` | 500 |
 
 The error envelope also carries a machine-readable `category`. As of **0.3.0**
@@ -39,6 +40,18 @@ strings. Two consequences for clients on the 0.2.x → 0.3.0 upgrade:
   **403**; use the `unauthenticated` category (401) for authentication failures.
 - A `code=TOO_MANY_REQUESTS` under any category other than `rate_limited` no
   longer forces **429**; rate limiting now uses the `rate_limited` category.
+
+As of **0.5.0** `ErrorCategory` is `#[non_exhaustive]`. A Rust client that
+matches on it needs a wildcard arm; in exchange, every future category is a
+non-breaking addition. This is a one-time cost taken in the same release that
+adds `unavailable`, rather than a cost repeated on each new category.
+
+As of **0.5.0** the category set gains `unavailable` (503), used for
+`SERVICE_OVERLOADED` when `KRAB_HTTP_OVERLOAD_MODE=shed` drops a request the
+service has no capacity for. It is deliberately distinct from `rate_limited`
+(429), which says the *caller* asked for too much; load balancer and alerting
+policies that retry or fail over on 503 need the difference. Clients that match
+exhaustively on `category` gain one variant.
 
 A request to a route family whose protocol is disabled by configuration returns
 **400 `PROTOCOL_NOT_SUPPORTED`** (previously it reached the handler). Requests
@@ -318,3 +331,17 @@ contract as any other `GET` on the route.
 - REST routes are versioned by path prefix: `/api/v1/...`
 - GraphQL versioning is schema-driven
 - Breaking changes require migration guidance and release notes in [`CHANGELOG.md`](../../CHANGELOG.md)
+
+### Rust API deprecations
+
+| Item | Deprecated in | Removed in | Replacement |
+|---|---|---|---|
+| `krab_core::db::postgres::run_migrations` | 0.5.0 | 0.6.0 | `krab_core::db::postgres::run_versioned_migrations` |
+| `krab_client` feature `demo-islands` (`Counter`, `Toggle`, `Likes`) | 0.4.0 | 0.6.0 | Define islands in your own crate with `#[island]` |
+
+`run_migrations` only ever applied one bootstrap migration creating a
+`_krab_migrations` table that nothing in the framework reads; the real ledger,
+checksums, rollback SQL and failure policy all belong to
+`run_versioned_migrations`. Callers should pass their own `&[Migration]` slice
+and a `MigrationFailurePolicy`. See
+[`database.md`](database.md) for the migration contract.

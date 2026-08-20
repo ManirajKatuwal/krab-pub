@@ -596,6 +596,19 @@ pub async fn connect_with_config(cfg: &DbConfig) -> Result<DbPool> {
     }
 }
 
+/// Create a legacy `_krab_migrations` bookkeeping table and nothing else.
+///
+/// Superseded by [`run_versioned_migrations`], which owns the real
+/// `krab_migrations` ledger, checksums, rollback SQL and failure policy. The
+/// single bootstrap migration this applies is unused by the rest of the
+/// framework; calling it only writes a table nobody reads.
+///
+/// Kept through 0.5.x because it shipped in the 0.4.0 public API. Removed in
+/// 0.6.0 — see `docs/reference/api.md`.
+#[deprecated(
+    since = "0.5.0",
+    note = "use run_versioned_migrations; this only creates an unused `_krab_migrations` table and is removed in 0.6.0"
+)]
 pub async fn run_migrations(pool: &DbPool) -> Result<()> {
     let _ = run_versioned_migrations(
         pool,

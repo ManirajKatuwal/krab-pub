@@ -29,7 +29,7 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 tower-http = { workspace = true, optional = true, features = ["compression-gzip", "cors", "request-id", "trace", "limit", "timeout"] }
-tower = { workspace = true, optional = true, features = ["util", "limit"] }
+tower = { workspace = true, optional = true, features = ["util", "limit", "load-shed"] }
 jsonwebtoken = { version = "9", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 # Content types for static assets. Came in with `krab_core::static_assets`, which
