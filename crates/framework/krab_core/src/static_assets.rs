@@ -20,6 +20,18 @@ use std::path::{Component, Path, PathBuf};
 /// caller should return 404 rather than reporting why a path was refused, which
 /// would confirm the existence of files outside the root.
 ///
+/// # This blocks the calling thread
+///
+/// Resolving symlinks means real syscalls, and there is no non-blocking way to
+/// ask the filesystem what a path actually points at. An `async` handler that
+/// calls this directly does that work on an executor worker, so under load a
+/// burst of asset requests stalls unrelated requests scheduled on the same
+/// worker. Call it from `tokio::task::spawn_blocking`, or serve the directory
+/// with `tower_http::services::ServeDir`, which reads through `tokio::fs` and
+/// is already off the executor. What is *not* an acceptable fix is dropping the
+/// canonicalisation for a lexical prefix check — see below, the syscalls are
+/// the control.
+///
 /// ```
 /// use krab_core::static_assets::resolve_static_pkg_path;
 ///
@@ -45,8 +57,21 @@ pub fn resolve_static_pkg_path(
         return None;
     }
 
+    // Both resolutions happen on every call, deliberately, and neither is
+    // cached. Caching the root looks free — a configured static root does not
+    // move — but the usual atomic deploy points that root at `releases/<id>`
+    // through a symlink and repoints it on the next release. A memoised
+    // canonical root would go on serving out of the retired release, including
+    // files that release was pulled to remove, and would 404 every asset once
+    // the directory is reaped. Re-resolving means the guard compares against
+    // what the filesystem says now, not what it said at boot.
     let canonical_root = std::fs::canonicalize(static_root).ok()?;
     let candidate = canonical_root.join(requested);
+    // The check the lexical guard above cannot make. `requested` is known to
+    // hold no `..` by this point, but any component of it can still be a
+    // symlink pointing anywhere on the disk, and a symlink is what an attacker
+    // plants once the obvious `../` is refused. Resolving the candidate for
+    // real and comparing is the only thing that sees it.
     let canonical_candidate = std::fs::canonicalize(candidate).ok()?;
 
     if canonical_candidate.starts_with(&canonical_root) {
@@ -122,6 +147,69 @@ mod tests {
 
         // A `..` that does not lead the path is still a `..`.
         assert!(resolve_static_pkg_path(&root, "assets/../../secret.txt").is_none());
+    }
+
+    /// Symlink creation is privileged on Windows unless Developer Mode is on,
+    /// so this reports failure rather than panicking and the caller skips.
+    #[cfg(unix)]
+    fn link_file(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn link_file(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    /// The guard's whole reason for touching the filesystem. Every other
+    /// rejection test here is satisfied by lexical inspection alone, so a
+    /// refactor that swapped canonicalisation for path normalisation would
+    /// leave this module green while reopening the hole: `escape.txt` is one
+    /// ordinary component with no `..` in it, and it resolves outside the root.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn resolve_static_pkg_path_rejects_symlink_escaping_root() {
+        let base = std::env::temp_dir().join("krab_core_static_root_symlink");
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).expect("failed to create static root");
+        std::fs::create_dir_all(&outside).expect("failed to create outside dir");
+
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, "do not serve me").expect("failed to create outside file");
+
+        let link = root.join("escape.txt");
+        let _ = std::fs::remove_file(&link);
+        if link_file(&secret, &link).is_err() {
+            // Creating a symlink on Windows needs elevation, so an
+            // unprivileged developer box cannot run the one assertion that
+            // makes this test worth having. Skipping there is tolerable;
+            // skipping *silently* is not, and skipping anywhere else is a bug.
+            //
+            // A test that returns `ok` without asserting is the same defect
+            // `KRAB_REQUIRE_DB_TESTS` exists to prevent in `db_tests.rs`: the
+            // gate stays green whether or not it verified anything. So the
+            // skip is loud, and it is impossible off Windows — where CI runs.
+            if !cfg!(windows) {
+                panic!(
+                    "symlink creation failed on a non-Windows host: this test asserted NOTHING and the traversal guard is unverified"
+                );
+            }
+            eprintln!(
+                "SKIPPED resolve_static_pkg_path_rejects_symlink_escaping_root: needs elevation on Windows; asserts on Linux CI"
+            );
+            return;
+        }
+
+        // Prove the link resolves before asserting it is refused — a dangling
+        // link would make the assertion below pass for the wrong reason.
+        assert_eq!(
+            std::fs::canonicalize(&link).ok(),
+            std::fs::canonicalize(&secret).ok(),
+            "symlink did not resolve to the file outside the root"
+        );
+
+        assert!(resolve_static_pkg_path(&root, "escape.txt").is_none());
     }
 
     #[test]

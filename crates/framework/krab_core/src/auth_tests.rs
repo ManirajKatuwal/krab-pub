@@ -55,6 +55,7 @@ mod tests {
             "KRAB_AUTH_REQUIRE_TENANT_MATCH",
             "KRAB_JWT_REQUIRE_KID",
             "KRAB_AUTH_OPEN_PATHS",
+            "KRAB_METRICS_PUBLIC",
             "KRAB_TRUST_PROXY_HEADERS",
             "KRAB_TRUSTED_PROXY_HOPS",
             "KRAB_RATE_LIMIT_CAPACITY",
@@ -700,9 +701,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    /// `/metrics` sits on the default open-path list for backward
-    /// compatibility, but operators must be able to close it:
-    /// `KRAB_AUTH_OPEN_PATHS` replaces the whole list when set.
+    /// `/metrics` is closed by default, and an explicit open-path list that
+    /// omits it must keep it closed too — `KRAB_AUTH_OPEN_PATHS` replaces the
+    /// whole list when set, and only `KRAB_METRICS_PUBLIC` reopens metrics.
     #[tokio::test]
     #[serial]
     async fn test_open_paths_env_can_close_metrics() {
@@ -1208,28 +1209,70 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// Metrics used to be on the default open-path list, so an unconfigured
+    /// service published its route inventory, traffic shape, error counts and
+    /// latency histograms to anyone who asked. The default is now closed.
     #[tokio::test]
     #[serial]
-    async fn test_metrics_stays_open_by_default() {
+    async fn test_metrics_requires_auth_by_default() {
         let _guard = env_lock();
         reset_auth_env();
         std::env::set_var("KRAB_AUTH_MODE", "jwt");
         std::env::set_var("KRAB_JWT_SECRET", "secret");
 
-        let app = test_app();
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/metrics")
-                    .header("x-forwarded-for", "10.10.0.51")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        for uri in ["/metrics", "/metrics/prometheus"] {
+            let app = test_app();
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("x-forwarded-for", "10.10.0.51")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
 
-        // The test router has no /metrics route; the point is that the auth
-        // layer passes the request through (404 from routing, not 401).
-        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{uri} must not be anonymously reachable without an explicit opt-in"
+            );
+        }
+    }
+
+    /// The documented single-step restore for anyone scraping the old default.
+    #[tokio::test]
+    #[serial]
+    async fn test_metrics_public_env_restores_anonymous_scraping() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+        std::env::set_var("KRAB_METRICS_PUBLIC", "true");
+
+        for uri in ["/metrics", "/metrics/prometheus"] {
+            let app = test_app();
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("x-forwarded-for", "10.10.0.52")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            // The test router has no metrics route; the point is that the auth
+            // layer passes the request through (404 from routing, not 401).
+            assert_ne!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "KRAB_METRICS_PUBLIC=true must reopen {uri}"
+            );
+        }
+
+        std::env::remove_var("KRAB_METRICS_PUBLIC");
     }
 }

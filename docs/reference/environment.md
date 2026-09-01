@@ -66,7 +66,8 @@ variable marked **secret** has them.
 | `KRAB_AUTH_MODE` | **Yes** | — | `static` \| `jwt`. `static` is for local and dev only |
 | `KRAB_BEARER_TOKEN` | Conditional | — | **Secret.** Shared token when `KRAB_AUTH_MODE=static` |
 | `KRAB_AUTH_PUBLIC_PATHS` | No | — | Comma-separated paths exempt from auth, **in addition to** the open-path list. Trailing `*` is a prefix match. Everything else is deny-by-default on protected routers |
-| `KRAB_AUTH_OPEN_PATHS` | No | built-in list | Comma-separated patterns **replacing** the built-in open (no-auth) path list (`/`, `/health`, `/ready`, auth endpoints, `/metrics`, `/metrics/prometheus`, `/blog/*`, `/pkg/*`, …). Trailing `*` is a prefix match. Set it to close default-open paths such as `/metrics`; an explicitly empty value closes them all. Unset keeps the backward-compatible defaults |
+| `KRAB_AUTH_OPEN_PATHS` | No | built-in list | Comma-separated patterns **replacing** the built-in open (no-auth) path list (`/`, `/health`, `/ready`, auth endpoints, `/blog/*`, `/pkg/*`, …). Trailing `*` is a prefix match. Set it to close default-open paths; an explicitly empty value closes them all. Unset keeps the built-in defaults. Does **not** govern the metrics endpoints — see `KRAB_METRICS_PUBLIC` |
+| `KRAB_METRICS_PUBLIC` | No | `false` | Allow anonymous `GET /metrics` and `/metrics/prometheus`. **Off by default:** metrics publish route names, traffic shape, error rates, and latency distributions. Prefer authenticating your scraper or binding metrics to a network only it can reach; set `true` only when that surface is deliberately public. Applies on top of `KRAB_AUTH_OPEN_PATHS`, so it reopens metrics whether or not that list is set |
 | `KRAB_AUTH_ADMIN_ROLE` | No | `admin` | Role name granting admin routes |
 | `KRAB_AUTH_ADMIN_SCOPE` | No | `admin` | Scope name granting admin routes |
 | `KRAB_AUTH_REQUIRED_ROLES` | No | — | Comma-separated roles required on protected routes |

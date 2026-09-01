@@ -1262,10 +1262,19 @@ mod tests {
         );
     }
 
+    /// The endpoint exists and serves Prometheus text — but not to anonymous
+    /// callers. This asserted a plain 200 while `/metrics/prometheus` was on
+    /// the default open-path list; that default was the leak, so the test that
+    /// locked it in had to go with it. Both halves are asserted here so the
+    /// contract cannot regress in either direction: closed without the flag,
+    /// and still serving the expected payload with it.
+    /// No `#[serial]`: this file has no serialised tests, so the attribute
+    /// would only order this one against an empty set. `KRAB_METRICS_PUBLIC`
+    /// is touched by no other test here, and it is cleared on both exits.
     #[tokio::test]
-    async fn contract_metrics_prometheus_exposed() {
-        let app = test_app();
-        let response = app
+    async fn contract_metrics_prometheus_requires_auth_and_opens_with_flag() {
+        std::env::remove_var("KRAB_METRICS_PUBLIC");
+        let response = test_app()
             .oneshot(
                 Request::builder()
                     .uri("/metrics/prometheus")
@@ -1274,11 +1283,27 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "metrics must not be anonymous by default"
+        );
 
+        std::env::set_var("KRAB_METRICS_PUBLIC", "true");
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("krab_requests_total"));
+        std::env::remove_var("KRAB_METRICS_PUBLIC");
     }
 
     #[tokio::test]

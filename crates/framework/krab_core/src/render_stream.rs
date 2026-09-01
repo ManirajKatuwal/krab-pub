@@ -1,3 +1,13 @@
+//! Chunked streaming SSR: byte-budgeted output, suspense-boundary markers,
+//! and flush timing.
+//!
+//! Server-only — the module is `#[cfg(not(target_arch = "wasm32"))]` at its
+//! declaration in `lib.rs`. The `Instant` below is the reason it has to be:
+//! `Instant::now()` compiles for `wasm32-unknown-unknown` but panics when
+//! called, so keeping the clock means keeping the module off that target.
+//! Anything added here may assume a server clock and a server allocator;
+//! nothing here may be reached from the browser bundle.
+
 use crate::Render;
 use std::collections::HashMap;
 use std::time::Instant;

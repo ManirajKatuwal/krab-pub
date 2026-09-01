@@ -66,8 +66,16 @@ All services expose:
 |---|---|---|
 | `GET` | `/health` | Liveness check |
 | `GET` | `/ready` | Readiness check |
-| `GET` | `/metrics` | JSON metrics snapshot |
-| `GET` | `/metrics/prometheus` | Prometheus metrics format |
+| `GET` | `/metrics` | JSON metrics snapshot — **requires auth** unless `KRAB_METRICS_PUBLIC=true` |
+| `GET` | `/metrics/prometheus` | Prometheus metrics format — **requires auth** unless `KRAB_METRICS_PUBLIC=true` |
+
+As of **0.5.0** the two metrics endpoints are no longer anonymous by default: a
+route inventory with per-route volumes, error counts and latency histograms is
+reconnaissance, and on a low-traffic service enough to infer individual user
+activity. Scrapers must authenticate, or the operator opts back in with
+`KRAB_METRICS_PUBLIC=true` (see
+[`environment.md`](environment.md)). `/health` and `/ready` are unchanged and
+remain anonymous.
 
 `GET /ready` returns readiness and dependency state, for example:
 

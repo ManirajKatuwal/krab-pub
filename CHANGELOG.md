@@ -38,6 +38,19 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ### Changed
 
+- **Breaking:** `/metrics` and `/metrics/prometheus` are no longer on the default
+  unauthenticated open-path list. Every service built on Krab was handing anonymous callers
+  its full route inventory, request volumes, error counts and latency histograms. Set
+  `KRAB_METRICS_PUBLIC=true` to restore anonymous scraping — one line, and greppable across
+  an estate to answer "who is exposing metrics?". The flag is additive over
+  `KRAB_AUTH_OPEN_PATHS`, which *replaces* the baseline list rather than extending it, so
+  reopening metrics no longer means restating every other default. The bundled
+  `docker-compose.yml` sets it for the local monitoring stack.
+- **Breaking on `wasm32` only:** `krab_core::render_stream` is no longer compiled for
+  `wasm32`. It was reaching the browser bundle with a bare `std::time::Instant`, which
+  compiles there and panics at runtime, and streaming SSR has no client half
+  (see [ADR 0009](docs/adr/0009-resource-ssr-semantics.md)). Native targets are unchanged;
+  no working browser code can break, since any call was already a guaranteed panic.
 - **Breaking:** `krab_core::http::ErrorCategory` is now `#[non_exhaustive]`. Rust callers
   that `match` on a category need a wildcard arm. Taken in the same release as the
   `Unavailable` addition so that every future category is a non-breaking addition;
@@ -77,6 +90,12 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ### Fixed
 
+- `krab_core::static_assets::resolve_static_pkg_path` documents that it blocks the calling
+  thread, and that async callers must wrap it in `spawn_blocking` (or use `ServeDir`).
+  Its two `canonicalize` calls are what refuse symlinks escaping the static root, so they
+  are deliberately not cached or replaced with a lexical check: the static root is commonly
+  a deploy symlink that repoints per release, and memoising it would keep serving a retired
+  release. Pinned by a new test that plants an escaping symlink and asserts refusal.
 - `KRAB_HTTP_OVERLOAD_MODE=shed` now answers `503 Service Unavailable` as documented; it
   was returning `429 Too Many Requests`, which load balancer and alert policies keyed on
   503 would not match.

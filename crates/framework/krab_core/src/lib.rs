@@ -43,6 +43,16 @@ pub mod isr;
 pub mod layout;
 pub mod protocol;
 pub mod render_policy;
+// Server-side: streaming SSR assembles the response body before it ever
+// reaches a browser, and `ChunkedStreamWriter` times its flushes with
+// `std::time::Instant`. On `wasm32-unknown-unknown` that clock has no
+// implementation and `Instant::now()` panics at runtime rather than failing to
+// compile — so an ungated `pub mod` here shipped a live panic into the island
+// bundle, reachable the moment anything constructed a writer. It is also dead
+// payload: ADR 0009 records that streaming has no client half, and nothing in
+// `krab_client` consumes the `<!--krab:suspense:*-->` markers. Gated alongside
+// `isr`, `ws`, and `telemetry` for the same reason.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod render_stream;
 pub mod resilience;
 pub mod service_contract;

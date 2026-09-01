@@ -1255,10 +1255,33 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
+    /// Metrics are served, but not to anonymous callers. This asserted a
+    /// plain 200 while `/metrics/prometheus` sat on the default open-path
+    /// list; that default was the leak, so the test pinning it had to change
+    /// with it. Both directions are asserted so neither can regress.
+    ///
+    /// `KRAB_METRICS_PUBLIC` is touched by no other test in this file and is
+    /// cleared on both exits.
     #[tokio::test]
-    async fn contract_metrics_prometheus_exposed() {
-        let app = build_app(test_state().await);
-        let response = app
+    async fn contract_metrics_prometheus_requires_auth_and_opens_with_flag() {
+        std::env::remove_var("KRAB_METRICS_PUBLIC");
+        let response = build_app(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "metrics must not be anonymous by default"
+        );
+
+        std::env::set_var("KRAB_METRICS_PUBLIC", "true");
+        let response = build_app(test_state().await)
             .oneshot(
                 Request::builder()
                     .uri("/metrics/prometheus")
@@ -1273,6 +1296,7 @@ mod tests {
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("krab_requests_total"));
         assert!(body.contains("krab_uptime_seconds"));
+        std::env::remove_var("KRAB_METRICS_PUBLIC");
     }
 
     #[tokio::test]

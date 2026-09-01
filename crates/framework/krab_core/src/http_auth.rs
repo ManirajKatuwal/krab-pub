@@ -766,9 +766,9 @@ pub fn authorize_with_jwt_cached(
 
 /// Baseline unauthenticated ("open") path patterns, used when
 /// `KRAB_AUTH_OPEN_PATHS` is unset. A trailing `*` makes a pattern a prefix
-/// match; anything else is an exact match. This is the same list that used to
-/// be hardcoded in `auth_middleware`, so defaults are backward-compatible —
-/// but operators can now override it, e.g. to close `/metrics`.
+/// match; anything else is an exact match. This is the list that used to be
+/// hardcoded in `auth_middleware`, minus the metrics endpoints — see
+/// [`METRICS_OPEN_PATHS`].
 pub(crate) const DEFAULT_AUTH_OPEN_PATHS: &[&str] = &[
     "/",
     "/health",
@@ -782,8 +782,6 @@ pub(crate) const DEFAULT_AUTH_OPEN_PATHS: &[&str] = &[
     "/api/v1/auth/capabilities",
     "/api/v1/auth/status",
     "/api/status",
-    "/metrics",
-    "/metrics/prometheus",
     "/data/dashboard",
     "/rpc/version",
     "/rpc/now",
@@ -792,17 +790,62 @@ pub(crate) const DEFAULT_AUTH_OPEN_PATHS: &[&str] = &[
     "/pkg/*",
 ];
 
+/// Telemetry endpoints, anonymous only when `KRAB_METRICS_PUBLIC` is on.
+///
+/// These shipped on the default open-path list, which meant every service
+/// built on Krab handed an unauthenticated caller its full route inventory,
+/// request volumes, error counts, and latency histograms — a free
+/// reconnaissance map of the deployment, and on low-traffic services enough
+/// per-route timing to infer individual user activity. Nothing about a
+/// framework default should require an operator to notice a leak and close
+/// it; the safe state is the one you get by not configuring anything.
+///
+/// Closing it by deleting the entries would have been the wrong repair.
+/// `KRAB_AUTH_OPEN_PATHS` REPLACES the baseline list rather than extending
+/// it, so the only way back for someone scraping today would have been to
+/// restate all eighteen surviving defaults and hope none were missed or
+/// mistyped — an upgrade step that silently closes `/health` if you get it
+/// wrong. A dedicated flag keeps the restore to one unambiguous line,
+/// `KRAB_METRICS_PUBLIC=true`, and keeps the decision auditable: a grep for
+/// that variable across an estate answers "who is exposing metrics?", which
+/// a hand-copied path list never could.
+///
+/// The flag is deliberately additive over whatever `auth_open_path_patterns`
+/// resolves, including an explicit list. Each knob then means exactly what
+/// its name says — one governs the general open surface, one governs the
+/// metrics endpoints — instead of the flag being silently inert whenever
+/// `KRAB_AUTH_OPEN_PATHS` happens to be set, which is the sort of hidden
+/// interaction that gets a service published to the internet by accident.
+pub(crate) const METRICS_OPEN_PATHS: &[&str] = &["/metrics", "/metrics/prometheus"];
+
 /// Resolve the open-path pattern list: `KRAB_AUTH_OPEN_PATHS` when set
 /// (comma-separated; an explicitly EMPTY value closes every default open
-/// path), the baseline list otherwise.
+/// path), the baseline list otherwise. [`METRICS_OPEN_PATHS`] is appended in
+/// either case when `KRAB_METRICS_PUBLIC` is on.
 pub(crate) fn auth_open_path_patterns() -> Vec<String> {
-    match std::env::var("KRAB_AUTH_OPEN_PATHS") {
+    let mut patterns: Vec<String> = match std::env::var("KRAB_AUTH_OPEN_PATHS") {
         Ok(raw) => parse_csv_set(&raw),
         Err(_) => DEFAULT_AUTH_OPEN_PATHS
             .iter()
             .map(|s| s.to_string())
             .collect(),
+    };
+
+    if metrics_public() {
+        for path in METRICS_OPEN_PATHS {
+            let path = (*path).to_string();
+            if !patterns.contains(&path) {
+                patterns.push(path);
+            }
+        }
     }
+
+    patterns
+}
+
+/// Whether the metrics endpoints are anonymously scrapeable. Off by default.
+pub(crate) fn metrics_public() -> bool {
+    crate::http::bool_env("KRAB_METRICS_PUBLIC", false)
 }
 
 /// Match `path` against patterns: trailing `*` is a prefix match, everything
@@ -964,6 +1007,13 @@ mod open_path_tests {
     use super::{auth_open_path_patterns, path_matches_patterns, DEFAULT_AUTH_OPEN_PATHS};
     use serial_test::serial;
 
+    /// Every test here resolves the pattern list from the environment, so both
+    /// knobs must start unset regardless of what ran before.
+    fn reset_open_path_env() {
+        std::env::remove_var("KRAB_AUTH_OPEN_PATHS");
+        std::env::remove_var("KRAB_METRICS_PUBLIC");
+    }
+
     #[test]
     fn pattern_matching_supports_exact_and_prefix() {
         let patterns: Vec<String> = vec!["/health".into(), "/blog/*".into()];
@@ -976,11 +1026,10 @@ mod open_path_tests {
 
     #[test]
     #[serial]
-    fn default_open_paths_keep_backward_compatible_surface() {
-        std::env::remove_var("KRAB_AUTH_OPEN_PATHS");
+    fn default_open_paths_exclude_metrics() {
+        reset_open_path_env();
         let patterns = auth_open_path_patterns();
 
-        // The pre-configurability hardcoded list, byte for byte.
         assert_eq!(
             patterns,
             DEFAULT_AUTH_OPEN_PATHS
@@ -988,17 +1037,54 @@ mod open_path_tests {
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
         );
-        assert!(path_matches_patterns("/metrics", &patterns));
+        assert!(
+            !path_matches_patterns("/metrics", &patterns),
+            "metrics must not be anonymously readable without an explicit opt-in"
+        );
+        assert!(!path_matches_patterns("/metrics/prometheus", &patterns));
+        assert!(path_matches_patterns("/health", &patterns));
         assert!(path_matches_patterns("/pkg/app_bg.wasm", &patterns));
         assert!(!path_matches_patterns("/api/v1/users", &patterns));
     }
 
     #[test]
     #[serial]
+    fn metrics_public_env_reopens_both_metrics_paths() {
+        reset_open_path_env();
+        std::env::set_var("KRAB_METRICS_PUBLIC", "true");
+        let patterns = auth_open_path_patterns();
+        reset_open_path_env();
+
+        assert!(path_matches_patterns("/metrics", &patterns));
+        assert!(path_matches_patterns("/metrics/prometheus", &patterns));
+        // The opt-in must not disturb anything else on the baseline list.
+        assert!(path_matches_patterns("/health", &patterns));
+        assert!(!path_matches_patterns("/api/v1/users", &patterns));
+    }
+
+    #[test]
+    #[serial]
+    fn metrics_public_env_applies_over_an_explicit_open_path_list() {
+        reset_open_path_env();
+        std::env::set_var("KRAB_AUTH_OPEN_PATHS", "/health,/ready");
+        std::env::set_var("KRAB_METRICS_PUBLIC", "1");
+        let patterns = auth_open_path_patterns();
+        reset_open_path_env();
+
+        assert!(path_matches_patterns("/health", &patterns));
+        assert!(
+            path_matches_patterns("/metrics", &patterns),
+            "the metrics flag must not be silently inert when KRAB_AUTH_OPEN_PATHS is set"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn operators_can_close_metrics_via_env() {
+        reset_open_path_env();
         std::env::set_var("KRAB_AUTH_OPEN_PATHS", "/health,/ready");
         let patterns = auth_open_path_patterns();
-        std::env::remove_var("KRAB_AUTH_OPEN_PATHS");
+        reset_open_path_env();
 
         assert!(path_matches_patterns("/health", &patterns));
         assert!(
@@ -1010,9 +1096,10 @@ mod open_path_tests {
     #[test]
     #[serial]
     fn empty_env_value_closes_every_default_open_path() {
+        reset_open_path_env();
         std::env::set_var("KRAB_AUTH_OPEN_PATHS", "");
         let patterns = auth_open_path_patterns();
-        std::env::remove_var("KRAB_AUTH_OPEN_PATHS");
+        reset_open_path_env();
 
         assert!(patterns.is_empty());
         assert!(!path_matches_patterns("/health", &patterns));
