@@ -257,13 +257,37 @@ Local runs require `cargo-deny` to be installed; without it, the dependency audi
 
 ## Known Limitations
 
-### Instance-Local Rate Limiting
+### Rate limiting and auth-failure tracking depend on a shared store
 
-The per-IP rate limiter (`global_rate_limit_middleware`) and auth-failure rate limiter use a distributed store (Redis) for state, but each instance tracks its own window counters. Under horizontal scaling, an attacker can distribute requests across instances to exceed the effective per-IP limit by a factor of the instance count.
+The per-IP rate limiter (`global_rate_limit_middleware`) and the auth-failure
+rate limiter both increment their window counters through
+`DistributedStore::incr` against a **shared** store — Redis when
+`KRAB_REDIS_URL` is configured (the `redis-store` feature), an in-process
+`MemoryStore` otherwise. Redis `INCR`/`EXPIRE` are atomic, so under horizontal
+scaling counted against the same Redis the per-IP and auth-failure limits hold
+across replicas rather than being multiplied by instance count.
 
-**Mitigation before horizontal scaling**: migrate rate limit counters to a shared Redis cluster with atomic `INCR`/`EXPIRE` operations coordinated across all instances.
+The caveat is the store choice, not per-instance counting:
 
-**Current posture**: acceptable for single-instance deployments. Auth failure counting now fails closed on store unavailability (returns 429) to prevent silent bypass.
+- **Configure `KRAB_REDIS_URL` for any deployment of more than one replica.**
+  With the default in-memory store each process keeps its own counters, so an
+  attacker can spread requests across instances and multiply the effective
+  limit by the replica count.
+- **The binary must be built with `redis-store` *and* given the URL.** A
+  binary compiled without that feature cannot honour `KRAB_REDIS_URL`:
+  `RuntimeState`'s store builder reports a non-empty URL as an initialization
+  error, and the boot-path constructor `RuntimeState::try_new` turns that into
+  a refusal to start in `staging`, `prod`, and unrecognised environments
+  (`dev` warns and falls back to `MemoryStore`). A malformed URL fails the
+  same way, since `RedisStore::from_url` validates it at construction; a
+  well-formed but unreachable Redis is *not* caught at startup — it surfaces
+  later as per-operation store errors, handled by the policies below. The
+  lenient `RuntimeState::new` always warns and falls back to the in-memory
+  store, so it is not a boot path for a multi-replica deployment.
+- The rate limiter honours the `KRAB_RATE_LIMIT_FAIL_OPEN` knob on store
+  errors (open in dev by default, closed elsewhere). Auth-failure tracking
+  always **fails closed** — an unavailable store answers `429` rather than
+  silently letting the attempt through.
 
 ### SHA-1 Transitive Dependency
 

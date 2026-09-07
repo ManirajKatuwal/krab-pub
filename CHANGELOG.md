@@ -99,6 +99,23 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ### Fixed
 
+- `docs/reference/security.md` no longer claims rate limiting and auth-failure
+  tracking are instance-local. They were rewritten to reflect that both counters
+  already increment through `DistributedStore::incr` — Redis-backed atomic
+  `INCR`/`EXPIRE` when `KRAB_REDIS_URL` is configured — so per-IP and
+  auth-failure limits hold across replicas sharing the same store. The caveat is
+  now stated correctly: with the default in-memory store (no Redis), each
+  process keeps its own counters, which is why `KRAB_REDIS_URL` is required for
+  multi-replica deployments. The section also now records that a shared
+  store needs both the `redis-store` feature and `KRAB_REDIS_URL`, and what the
+  runtime does when only one of the two is present. Also corrected the
+  `production_readiness.md` Phase 1, Phase 2, and Phase 3 checklists: Phase 3
+  and the Phase 1 store-integration item describe work that is already
+  implemented, while the two load-validation items stay open and annotated —
+  Phase 1's multi-replica check has only a local containerised PASS behind it,
+  never a CI run, and Phase 2's distributed cache TTL/invalidation path is
+  still unexercised under load. The document header no longer claims blanket
+  completion.
 - `krab_core::static_assets::resolve_static_pkg_path` documents that it blocks the calling
   thread, and that async callers must wrap it in `spawn_blocking` (or use `ServeDir`).
   Its two `canonicalize` calls are what refuse symlinks escaping the static root, so they
