@@ -8,7 +8,7 @@ use krab_core::error_boundary::ErrorBoundary;
 use krab_core::http::{apply_common_http_layers, HasRuntimeState, RuntimeState};
 use krab_core::i18n::{detect_locale_from_header, I18n, Locale, TranslationBundle};
 use krab_core::isr::{IsrCache, IsrPolicy};
-use krab_core::render_stream::{ChunkedStreamWriter, SuspenseState};
+use krab_core::render_stream::{is_finalized_ssr_snapshot, ChunkedStreamWriter, SuspenseState};
 use krab_core::service::{serve_with_graceful_shutdown, ServiceConfig};
 use krab_core::service_contract::TopologyRuntime;
 use krab_core::telemetry::init_tracing;
@@ -34,7 +34,7 @@ mod routes;
 mod users_contract;
 mod ws;
 use crate::app_state::AppState;
-use crate::cache::{cache_middleware, is_finalized_ssr_snapshot};
+use crate::cache::cache_middleware;
 #[cfg(test)]
 use crate::frontend_env::normalize_service_base_url;
 use crate::frontend_env::{

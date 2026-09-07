@@ -12,6 +12,13 @@ use crate::Render;
 use std::collections::HashMap;
 use std::time::Instant;
 
+/// Lifecycle state of a streaming SSR suspense boundary.
+///
+/// Part of the server-side streaming protocol. The only client-side consumer
+/// of these markers does not exist yet — ADR 0009 records that streaming has
+/// no client half — so nothing in the browser reacts to a `Pending` boundary
+/// being later resolved. It is public only because [`ChunkedStreamWriter::write_suspense_marker`]
+/// takes it; do not treat it as a documented hook for client-side swap-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SuspenseState {
     Pending,
@@ -38,13 +45,30 @@ impl SuspenseState {
     }
 }
 
-/// Parsed suspense marker emitted by SSR streaming output.
+/// A parsed `<!--krab:suspense:{id}:{state}-->` marker.
+///
+/// **Deprecated in 0.5.0, removed in 0.6.0.** The markers this parses are part
+/// of a server-only streaming protocol: ADR 0009 records that streaming has no
+/// client half, so nothing in the browser consumes them and there is no stable
+/// meaning for a downstream crate to build on. The one real use — deciding
+/// whether a rendered snapshot has every boundary resolved and is therefore
+/// safe to cache — is now [`is_finalized_ssr_snapshot`].
+///
+/// Kept public through 0.5.x because it shipped in the 0.4.0 public API. See
+/// `docs/reference/api.md`.
+#[deprecated(
+    since = "0.5.0",
+    note = "use `is_finalized_ssr_snapshot` to test a rendered snapshot; this parses a \
+            server-only streaming marker with no browser counterpart (ADR 0009) and is \
+            removed in 0.6.0"
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuspenseMarker {
     pub boundary_id: String,
     pub state: SuspenseState,
 }
 
+#[allow(deprecated)]
 impl SuspenseMarker {
     /// Parse from either full marker comment (`<!--krab:suspense:...-->`) or raw body (`krab:suspense:...`).
     pub fn parse(input: &str) -> Option<Self> {
@@ -70,6 +94,49 @@ impl SuspenseMarker {
             state,
         })
     }
+}
+
+/// Whether an SSR snapshot has every suspense boundary resolved, so it is safe
+/// to cache without serving a half-rendered page.
+///
+/// A streamed render may flush a `Pending` boundary before its `Resolved` (or
+/// `Error`) marker; if that partial HTML were cached it would always be served
+/// and the page would be stuck showing fallbacks. This scans the rendered
+/// output and reports whether each boundary's `pending` count is exactly
+/// matched by its `resolved + error` count. A snapshot with no suspense markers
+/// counts as finalized — nothing is waiting on a boundary.
+// `SuspenseMarker` is deprecated for downstream callers but is still the parser
+// this helper is built on, so the use is allowed here rather than duplicated.
+#[allow(deprecated)]
+pub fn is_finalized_ssr_snapshot(html: &str) -> bool {
+    let mut boundary_state: HashMap<String, (usize, usize, usize)> = HashMap::new();
+
+    for segment in html.split("<!--").skip(1) {
+        let Some(comment_end) = segment.find("-->") else {
+            continue;
+        };
+        let marker_raw = format!("<!--{}-->", &segment[..comment_end]);
+        let Some(marker) = SuspenseMarker::parse(&marker_raw) else {
+            continue;
+        };
+
+        let counts = boundary_state
+            .entry(marker.boundary_id)
+            .or_insert((0usize, 0usize, 0usize));
+        match marker.state {
+            SuspenseState::Pending => counts.0 += 1,
+            SuspenseState::Resolved => counts.1 += 1,
+            SuspenseState::Error => counts.2 += 1,
+        }
+    }
+
+    if boundary_state.is_empty() {
+        return true;
+    }
+
+    boundary_state
+        .values()
+        .all(|(pending, resolved, error)| *pending > 0 && *pending == (*resolved + *error))
 }
 
 /// Streaming SSR telemetry snapshot for performance budgets and regressions.
@@ -382,6 +449,46 @@ mod tests {
     }
 
     #[test]
+    fn finalized_snapshot_with_all_boundaries_resolved() {
+        let html = concat!(
+            "<html><body>",
+            "<!--krab:suspense:home:pending-->",
+            "<div data-krab-hydration=\"home\">fallback</div>",
+            "<!--krab:suspense:home:resolved-->",
+            "</body></html>"
+        );
+        assert!(is_finalized_ssr_snapshot(html));
+    }
+
+    #[test]
+    fn unfinalized_snapshot_without_resolution() {
+        let html = concat!(
+            "<html><body>",
+            "<!--krab:suspense:home:pending-->",
+            "<div>fallback</div>",
+            "</body></html>"
+        );
+        assert!(!is_finalized_ssr_snapshot(html));
+    }
+
+    #[test]
+    fn unfinalized_snapshot_with_error_boundary_matches_resolution() {
+        // An Error boundary is terminal, so pending == resolved + error still
+        // holds and the page may be cached.
+        let html = concat!(
+            "<!--krab:suspense:home:pending-->",
+            "<!--krab:suspense:home:error-->"
+        );
+        assert!(is_finalized_ssr_snapshot(html));
+    }
+
+    #[test]
+    fn snapshot_with_no_markers_is_finalized() {
+        assert!(is_finalized_ssr_snapshot("<html><body>plain</body></html>"));
+        assert!(is_finalized_ssr_snapshot(""));
+    }
+
+    #[test]
     fn suspense_markers_are_hydration_compatible_comments() {
         let mut writer = ChunkedStreamWriter::new(32, 64);
         let _ = writer.write_suspense_marker("home-data", SuspenseState::Pending);
@@ -395,6 +502,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn suspense_marker_parser_handles_comment_and_raw_body() {
         let parsed_comment = SuspenseMarker::parse("<!--krab:suspense:home:pending-->")
             .expect("comment marker should parse");

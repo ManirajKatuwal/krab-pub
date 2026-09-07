@@ -11,8 +11,7 @@ use krab_core::http::HasRuntimeState;
 use axum::body::Body;
 use krab_core::isr::{IsrEntry, IsrPolicy, IsrServeOutcome};
 use krab_core::render_policy::CacheMode;
-use krab_core::render_stream::{SuspenseMarker, SuspenseState};
-use std::collections::HashMap;
+use krab_core::render_stream::is_finalized_ssr_snapshot;
 use std::time::Duration;
 
 use crate::frontend_env::{distributed_cache_ttl, isr_revalidate_duration};
@@ -224,37 +223,6 @@ pub fn parse_cache_key_path_and_locale(key: &str) -> (String, String) {
 /// winner's entry before rendering anyway (fail open).
 const ISR_COLD_WAIT_ATTEMPTS: u32 = 10;
 const ISR_COLD_WAIT_INTERVAL: Duration = Duration::from_millis(100);
-
-pub fn is_finalized_ssr_snapshot(html: &str) -> bool {
-    let mut boundary_state: HashMap<String, (usize, usize, usize)> = HashMap::new();
-
-    for segment in html.split("<!--").skip(1) {
-        let Some(comment_end) = segment.find("-->") else {
-            continue;
-        };
-        let marker_raw = format!("<!--{}-->", &segment[..comment_end]);
-        let Some(marker) = SuspenseMarker::parse(&marker_raw) else {
-            continue;
-        };
-
-        let counts = boundary_state
-            .entry(marker.boundary_id)
-            .or_insert((0usize, 0usize, 0usize));
-        match marker.state {
-            SuspenseState::Pending => counts.0 += 1,
-            SuspenseState::Resolved => counts.1 += 1,
-            SuspenseState::Error => counts.2 += 1,
-        }
-    }
-
-    if boundary_state.is_empty() {
-        return true;
-    }
-
-    boundary_state
-        .values()
-        .all(|(pending, resolved, error)| *pending > 0 && *pending == (*resolved + *error))
-}
 
 /// Build the response for an ISR cache hit and, when the entry is stale,
 /// start background revalidation.

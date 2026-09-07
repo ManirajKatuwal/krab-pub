@@ -87,6 +87,15 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 - `krab_core::db::postgres::run_migrations`, superseded by `run_versioned_migrations`.
   It only creates an unused `_krab_migrations` table. Removed in 0.6.0.
+- `krab_core::render_stream::SuspenseMarker`, deprecated in 0.5.0 and removed in 0.6.0.
+  It parses `<!--krab:suspense:{id}:{state}-->` markers emitted by server-side streaming,
+  and streaming has no client half ([ADR 0009](docs/adr/0009-resource-ssr-semantics.md)),
+  so nothing in the browser consumes them. The one real use — deciding whether a rendered
+  snapshot has every boundary resolved and is therefore safe to cache — is now the new
+  public `krab_core::render_stream::is_finalized_ssr_snapshot`, which takes the rendered
+  HTML and returns a `bool`. Behavior is unchanged: `service_frontend` now calls that
+  shared helper instead of re-parsing markers itself. `SuspenseState` stays public because
+  `ChunkedStreamWriter::write_suspense_marker` takes it.
 
 ### Fixed
 

@@ -346,6 +346,7 @@ contract as any other `GET` on the route.
 |---|---|---|---|
 | `krab_core::db::postgres::run_migrations` | 0.5.0 | 0.6.0 | `krab_core::db::postgres::run_versioned_migrations` |
 | `krab_client` feature `demo-islands` (`Counter`, `Toggle`, `Likes`) | 0.4.0 | 0.6.0 | Define islands in your own crate with `#[island]` |
+| `krab_core::render_stream::SuspenseMarker` | 0.5.0 | 0.6.0 | `krab_core::render_stream::is_finalized_ssr_snapshot` |
 
 `run_migrations` only ever applied one bootstrap migration creating a
 `_krab_migrations` table that nothing in the framework reads; the real ledger,
@@ -353,3 +354,12 @@ checksums, rollback SQL and failure policy all belong to
 `run_versioned_migrations`. Callers should pass their own `&[Migration]` slice
 and a `MigrationFailurePolicy`. See
 [`database.md`](database.md) for the migration contract.
+
+`SuspenseMarker` only ever parsed the `<!--krab:suspense:{id}:{state}-->`
+markers emitted by server-side streaming.
+[ADR 0009](../adr/0009-resource-ssr-semantics.md) records streaming as having no
+client half, so nothing in the browser consumes those markers and there is no
+stable meaning for a downstream crate to build on the parsed form. The one real
+use — deciding whether a rendered snapshot has every boundary resolved and is
+therefore safe to cache — is now `is_finalized_ssr_snapshot`, which takes the
+rendered HTML and returns a `bool`.
