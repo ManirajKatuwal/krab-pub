@@ -52,10 +52,10 @@ variable marked **secret** has them.
 | Variable | Required | Default | Accepts |
 |---|---|---|---|
 | `KRAB_ENVIRONMENT` | **Yes** | — | `local` \| `dev` \| `staging` \| `prod`. Gates secret-sourcing enforcement and migration promotion policy |
-| `KRAB_SERVICE_NAME` | No | `krab` | Service identity used in telemetry, migration records, and protocol selection |
+| `KRAB_SERVICE_NAME` | No | per service | **Per-service.** Service identity used in telemetry (the `service` field on every log line and metric), migration records, and the `KRAB_PROTOCOL_ENABLED_<NAME>` lookup. The default is whatever the binary passes to `KrabConfig::from_env_checked` — `frontend`, `auth`, `users`, `users-split` for the reference services, not `krab`. Setting it in a shared environment renames **every** service that inherits it, and it degrades silently: nothing fails, they simply all report one name. Under `krab bootstrap` the orchestrator injects each service's own value from `[services.X].service_name` in `krab.toml` |
 | `KRAB_SERVICE` | No | `service` | Fallback service identity for protocol selection when `KRAB_SERVICE_NAME` is unset |
 | `KRAB_HOST` | No | `127.0.0.1` | Bind address |
-| `KRAB_PORT` | No | `3000` | Bind port. Reference services use `3000` frontend, `3001` auth, `3002` users, `3207` users-split |
+| `KRAB_PORT` | No | per service | **Per-service.** Bind port. The per-service default (`3000` frontend, `3001` auth, `3002` users, `3207` users-split) is a *fallback*, not a floor: when `KRAB_PORT` is set it overrides all of them simultaneously, so every service that inherits it tries to bind the same port. Under `krab bootstrap` the orchestrator injects each service's own value from `[services.X].port` in `krab.toml`, which is what keeps a service on the port its health probe addresses |
 | `KRAB_PUBLIC_BASE_URL` | No | `http://localhost:3000` | Public origin for SEO metadata (`canonical`, `og:url`) and `/robots.txt`, `/sitemap.xml`. **Set explicitly to your external HTTPS URL in staging and prod** |
 | `RUST_LOG` | No | `info` | `tracing-subscriber` env filter, e.g. `info,krab_core=debug` |
 

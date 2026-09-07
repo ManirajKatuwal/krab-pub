@@ -10,7 +10,9 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tracing::{error, info, warn};
 
-use crate::configuration::{KrabConfig, ServiceDefinition, DEFAULT_SHUTDOWN_TIMEOUT_MS};
+use crate::configuration::{
+    KrabConfig, ServiceDefinition, DEFAULT_SHUTDOWN_TIMEOUT_MS, PORT_ENV_KEY,
+};
 
 const ORCHESTRATOR_ARTIFACT_ROOT: &str = "internal/audit/orchestrator";
 const PROBE_BODY_EXCERPT_LIMIT: usize = 160;
@@ -472,24 +474,51 @@ pub(super) async fn terminate_child(
     }
 }
 
+/// Build the child command for a service: program, arguments, resolved
+/// environment, and working directory.
+///
+/// Split out of [`spawn_service`] so the environment a child actually receives
+/// can be observed in a test without also taking on the log forwarders and the
+/// artifact directory.
+pub(super) fn build_command(name: &str, service: &ServiceDefinition) -> Command {
+    let child_env = service.resolved_env(name);
+
+    // The child inherits this process's environment and the resolved map is
+    // merged over it — there is no `env_clear()` — so anything the manifest
+    // does not speak for is still ambient. `KRAB_PORT` was the case where that
+    // mattered most: one exported value moved every service off its own port
+    // and out from under its own health probe.
+    if service.port_is_unpinned() {
+        if let Ok(ambient) = std::env::var(PORT_ENV_KEY) {
+            warn!(
+                service = %name,
+                ambient_port = %ambient,
+                "service_port_unpinned_inheriting_ambient_krab_port"
+            );
+        }
+    }
+
+    let mut cmd = Command::new(&service.command);
+    cmd.args(&service.args).envs(&child_env);
+    if let Some(cwd) = &service.cwd {
+        cmd.current_dir(cwd);
+    }
+    cmd
+}
+
 /// Spawn a configured service process using its command, arguments, environment, and cwd.
 pub(super) async fn spawn_service(
     name: &str,
     service: &ServiceDefinition,
 ) -> Result<tokio::process::Child> {
-    let mut cmd = Command::new(&service.command);
-    cmd.args(&service.args)
-        .envs(&service.env)
-        .stdout(Stdio::piped())
+    let mut cmd = build_command(name, service);
+    cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Backstop for the paths that never reach `shutdown_children`: if the
         // orchestrator panics or is killed outright, the runtime still reaps
         // its children instead of leaving every service running and its port
         // bound.
         .kill_on_drop(true);
-    if let Some(cwd) = &service.cwd {
-        cmd.current_dir(cwd);
-    }
 
     let mut child = cmd.spawn().with_context(|| {
         format!(
@@ -516,6 +545,8 @@ pub(super) async fn spawn_service(
         command = %service.command,
         args = ?service.args,
         cwd = ?service.cwd,
+        krab_service_name = %service.effective_service_name(name),
+        krab_port = ?service.port,
         stdout_log = %stdout_log.display(),
         stderr_log = %stderr_log.display(),
         artifact_dir = %orchestrator_artifact_dir().display(),
@@ -778,8 +809,151 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{compact_excerpt, sanitize_artifact_component, ProbeFailureDiagnostics};
+    use super::ProbeFailureDiagnostics;
+    use super::{build_command, compact_excerpt, sanitize_artifact_component, Stdio, PORT_ENV_KEY};
+    use crate::configuration::{ServiceDefinition, SERVICE_NAME_ENV_KEY};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
     use std::time::Duration;
+
+    /// `set_var`/`remove_var` are process-global, so the tests that stage an
+    /// ambient `KRAB_PORT` take a turn rather than racing each other.
+    static AMBIENT_ENV: Mutex<()> = Mutex::new(());
+
+    /// Echoes the two identity variables the orchestrator injects, separated by
+    /// `|`, using the shell that exists on the platform running the test.
+    fn echo_identity_service() -> ServiceDefinition {
+        #[cfg(windows)]
+        let (command, args) = (
+            "cmd".to_string(),
+            vec![
+                "/C".to_string(),
+                format!("echo %{SERVICE_NAME_ENV_KEY}%^|%{PORT_ENV_KEY}%"),
+            ],
+        );
+        #[cfg(not(windows))]
+        let (command, args) = (
+            "sh".to_string(),
+            vec![
+                "-c".to_string(),
+                format!("printf '%s|%s' \"${SERVICE_NAME_ENV_KEY}\" \"${PORT_ENV_KEY}\""),
+            ],
+        );
+
+        ServiceDefinition {
+            command,
+            args,
+            port: None,
+            service_name: None,
+            env: HashMap::new(),
+            cwd: None,
+            watch: false,
+            restart_on_exit: false,
+            restart_backoff_ms: 500,
+            max_restart_attempts: 5,
+            healthcheck_url: None,
+            healthcheck_timeout_ms: 1200,
+            shutdown_timeout_ms: 5000,
+            depends_on: vec![],
+            startup_dependencies: vec![],
+            restart_policy: None,
+            healthcheck: None,
+        }
+    }
+
+    /// Spawn through the real command-building path with `ambient` staged in
+    /// this process's environment.
+    ///
+    /// The child's *inherited* environment is captured at `spawn`, not at
+    /// build, so the staging has to survive that call — but no longer: the
+    /// lock is released before anything is awaited, both because a
+    /// `MutexGuard` may not be held across an await and because the ambient
+    /// variables must not outlive the spawn they were staged for.
+    fn spawn_with_ambient(
+        name: &str,
+        service: &ServiceDefinition,
+        ambient: &[(&str, &str)],
+    ) -> tokio::process::Child {
+        let _guard = AMBIENT_ENV.lock().unwrap_or_else(|err| err.into_inner());
+        // Restored, not removed: a developer running the suite with KRAB_PORT
+        // exported would otherwise lose it for the rest of the test binary,
+        // and the next test to stage an ambient value would be measuring a
+        // different starting environment than the first one did.
+        let previous: Vec<(&str, Option<String>)> = ambient
+            .iter()
+            .map(|(key, _)| (*key, std::env::var(key).ok()))
+            .collect();
+        for (key, value) in ambient {
+            std::env::set_var(key, value);
+        }
+
+        let child = build_command(name, service)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("child process spawns");
+
+        for (key, value) in &previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        child
+    }
+
+    async fn observed_identity(child: tokio::process::Child) -> String {
+        let output = child
+            .wait_with_output()
+            .await
+            .expect("child process completes");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn the_spawn_path_injects_the_declared_port_and_name_over_an_ambient_one() {
+        // The reproduction, in miniature: an exported `KRAB_PORT` used to reach
+        // every child, because the orchestrator merges per-service env over an
+        // inherited environment and never spoke for the port itself.
+        let mut service = echo_identity_service();
+        service.port = Some(3001);
+
+        let child = spawn_with_ambient(
+            "auth",
+            &service,
+            &[(PORT_ENV_KEY, "3000"), (SERVICE_NAME_ENV_KEY, "krab")],
+        );
+        let observed = observed_identity(child).await;
+
+        assert_eq!(observed, "auth|3001", "child saw {observed}");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_env_entry_still_wins_over_the_injected_default() {
+        let mut service = echo_identity_service();
+        service.port = Some(3001);
+        service.service_name = Some("auth".to_string());
+        service.env.insert(PORT_ENV_KEY.to_string(), "3999".into());
+        service
+            .env
+            .insert(SERVICE_NAME_ENV_KEY.to_string(), "pinned".into());
+
+        let child = spawn_with_ambient("auth", &service, &[(PORT_ENV_KEY, "3000")]);
+        let observed = observed_identity(child).await;
+
+        assert_eq!(observed, "pinned|3999", "child saw {observed}");
+    }
+
+    #[tokio::test]
+    async fn a_service_with_no_declared_port_still_inherits_the_ambient_one() {
+        // Unchanged behaviour for manifests that declare no port — the
+        // orchestrator invents nothing, it only warns.
+        let service = echo_identity_service();
+
+        let child = spawn_with_ambient("frontend", &service, &[(PORT_ENV_KEY, "3000")]);
+        let observed = observed_identity(child).await;
+
+        assert_eq!(observed, "frontend|3000", "child saw {observed}");
+    }
 
     #[test]
     fn compact_excerpt_normalizes_whitespace_and_truncates() {

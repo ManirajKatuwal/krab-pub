@@ -16,7 +16,7 @@ categories = ["command-line-utilities", "development-tools", "web-programming"]
 [dependencies]
 tokio = { workspace = true, features = ["full"] }
 serde = { workspace = true, features = ["derive"] }
-config = "0.14"
+toml = "0.8"
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true }

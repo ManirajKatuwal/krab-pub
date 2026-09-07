@@ -154,6 +154,32 @@ On Windows, find the holder with
 Linux/macOS, `lsof -i :3000`. A common cause is a previous orchestrator run
 that left a service behind.
 
+The other common cause does **not** look like a port conflict at all. `KRAB_PORT`
+is per-service, and the per-service defaults above are fallbacks used only when
+it is unset — so an exported `KRAB_PORT` moves *every* service onto that one
+port. What you see then is a **readiness-probe timeout on a service that is
+running perfectly well**, because it bound the ambient port while the probe
+still addresses its own:
+
+```
+service 'auth' failed readiness probe at http://127.0.0.1:3001/ready ...
+```
+
+with no bind error anywhere, and the child logging `service_listening` on 3000.
+(`service_listening` is emitted before the bind is attempted, so it is not
+evidence that a bind succeeded.) Only when the ambient value collides with a
+port already taken do you get the honest `os error 10048` / `EADDRINUSE`.
+
+Check it with `echo $env:KRAB_PORT` (PowerShell) or `echo $KRAB_PORT`, and
+unset it. `KRAB_SERVICE_NAME` has the same shape and is worse: it never fails at
+all, it just makes every service report one identity in logs, metrics, and
+migration records.
+
+Under `krab bootstrap` this is handled for you — the orchestrator injects each
+service's `port` and `service_name` from `krab.toml` over whatever it inherited,
+and refuses to start a manifest in which two services claim the same port. A
+service running outside the orchestrator still takes the ambient value.
+
 ### Database connectivity
 
 Driver selection is `KRAB_DB_DRIVER=postgres` (default) or `sqlite`, resolved

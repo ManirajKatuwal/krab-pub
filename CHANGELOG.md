@@ -18,6 +18,21 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ### Added
 
+- `[services.X].port` and `[services.X].service_name` in `krab.toml`: the orchestrator now
+  owns each service's identity and injects it as `KRAB_PORT` / `KRAB_SERVICE_NAME` at
+  spawn. Precedence, lowest first, is the inherited environment, then this injected
+  identity, then explicit `[services.X].env` entries. `service_name` defaults to the
+  `[services.<key>]` table key; `port` has no default and an undeclared port still
+  inherits whatever is ambient, logging
+  `service_port_unpinned_inheriting_ambient_krab_port` when it does. All four workspace
+  services declare both. See
+  [ADR 0012](docs/adr/0012-orchestrator-owns-service-identity.md).
+- `krab.toml` validation, at orchestrator startup and statically in `krab topology
+  doctor`: two services declaring the same port, or resolving to the same
+  `service_name`, are reported by name before anything is spawned, as is a port outside
+  1-65535. The orchestrator treats these as startup errors; `krab topology doctor`
+  reports them as violations. A declared port that disagrees with the port in that
+  service's probe URL is warned about, not rejected.
 - `KRAB_AUTH_FAILURE_WINDOW_SECS` (default: 60) and `KRAB_AUTH_FAILURE_THRESHOLD`
   (default: 100): operator-configurable knobs for the per-client-IP auth-failure
   rate limiter (`auth_middleware`). Window and failure count are shared across
@@ -61,6 +76,18 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ### Changed
 
+- **Breaking for downstream `krab.toml` consumers:** a service's identity now defaults to
+  its manifest key. A `[services.api]` entry running a binary whose own default name is
+  `backend` reports `service=api` in telemetry after this change; declare
+  `service_name = "backend"` to keep the old value. The alternative was leaving
+  `KRAB_SERVICE_NAME` unpinned for every service that had not opted in, which is the
+  defect being fixed.
+- **Breaking for downstream `krab.toml` consumers:** the orchestrator reads `krab.toml`
+  only. `config`'s `File::with_name` incidentally accepted `krab.yaml`, `krab.json` and
+  others; nothing in the workspace, the docs, or the `krab new` templates has ever
+  produced one. `krab_orchestrator` drops its `config` dependency for `toml`.
+- `krab generate service` writes `port` and `service_name` into the `[services.X]` entry
+  it registers, alongside the probe URL it already generated.
 - **Breaking:** `/metrics` and `/metrics/prometheus` are no longer on the default
   unauthenticated open-path list. Every service built on Krab was handing anonymous callers
   its full route inventory, request volumes, error counts and latency histograms. Set
@@ -134,6 +161,27 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ### Fixed
 
+- An exported `KRAB_PORT` no longer moves every service onto one port. The per-service
+  default (`3000` frontend, `3001` auth, `3002` users, `3207` users-split) is a fallback
+  used only when the variable is unset, so a single ambient value applied to all of them
+  — and because `krab.toml` pinned it for none while hardcoding the ports into every
+  health-probe URL, the failure surfaced as a **readiness-probe timeout on a service that
+  was running fine on the wrong port**, with no bind error anywhere. (`service_listening`
+  is logged before the bind is attempted, so it is not evidence of a successful bind.)
+  `KRAB_SERVICE_NAME` had the identical defect and never failed at all: every service
+  reported the same `service` field in logs, metrics, protocol selection, and migration
+  records. Both are now injected per service by the orchestrator. A service run directly
+  rather than through `krab bootstrap` still takes the ambient value.
+- `[services.X].env` keys in `krab.toml` keep the case the manifest wrote. The
+  orchestrator parsed the file with `config`, which lowercases every key it reads, so
+  `RUST_LOG = "info"` reached children as `rust_log` — invisible on Windows, whose
+  environment variables are case-insensitive, and completely inert on Linux and macOS,
+  including in containers and CI. Entries that have been silently doing nothing will
+  take effect. Parsing now uses `toml`, the same parser `krab doctor` and `krab topology
+  doctor` already apply to this file.
+- `.env.example` no longer ships `KRAB_SERVICE_NAME=krab` and `KRAB_PORT=3000`
+  uncommented. Both are per-service identity, wrong as workspace-wide defaults in a
+  four-service repo, and copied straight into `.env` by the documented first step.
 - `service_users_split` answers its API again. Its router never applied
   `apply_common_http_layers`, which is the only thing in the workspace that inserts the
   `AuthContext` extension both adapters extract, so `/api/v1/users/me` and

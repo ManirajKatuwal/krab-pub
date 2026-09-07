@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
     let config = load_krab_config().map_err(|err| {
         error!(error = %err, "krab_config_load_failed");
         err.context(
-            "failed to load krab.toml; ensure it exists in the directory the orchestrator is started from",
+            "failed to load krab.toml; it must exist in the directory the orchestrator is started from, parse as TOML, and declare a service graph whose ports and names are unique",
         )
     })?;
 
@@ -277,6 +277,8 @@ mod tests {
         ServiceDefinition {
             command: "cargo".to_string(),
             args: vec![],
+            port: None,
+            service_name: None,
             env: HashMap::new(),
             cwd: None,
             watch: false,

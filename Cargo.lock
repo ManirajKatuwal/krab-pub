@@ -1750,13 +1750,13 @@ name = "krab_orchestrator"
 version = "0.4.0"
 dependencies = [
  "anyhow",
- "config",
  "krab_core",
  "nix",
  "notify",
  "reqwest",
  "serde",
  "tokio",
+ "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
 ]

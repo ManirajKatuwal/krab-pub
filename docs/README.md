@@ -75,6 +75,9 @@ immutable once accepted — supersede rather than edit.
 | [0007](adr/0007-grpc-feature-disposition.md) | The `grpc` feature is renamed, not implemented |
 | [0008](adr/0008-view-control-flow-tags.md) | Control flow in `view!` via a fixed set of built-in tags |
 | [0009](adr/0009-resource-ssr-semantics.md) | `Resource` renders synchronously on the server — initial value or pending, never blocking |
+| [0010](adr/0010-protocol-resolution-inside-auth-boundary.md) | Protocol resolution moves inside the auth boundary |
+| [0011](adr/0011-isr-key-separator-and-single-flight.md) | ISR key separator and cold-miss single-flight |
+| [0012](adr/0012-orchestrator-owns-service-identity.md) | The orchestrator owns service identity — `port` and `service_name` in `krab.toml` |
 
 ## Planning
 

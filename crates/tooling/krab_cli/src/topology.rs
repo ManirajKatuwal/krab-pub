@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::BTreeMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -578,8 +579,11 @@ fn register_krab_service(service_key: &str, service_crate: &str, port: u16) -> R
         raw.push('\n');
     }
 
+    // `port` and `service_name` are written alongside the probe URL so the
+    // generated service is told the topology its own health check asserts,
+    // instead of inheriting whatever KRAB_PORT is ambient.
     raw.push_str(&format!(
-        "\n{header}\ncommand = \"cargo\"\nargs = [\"run\", \"--bin\", \"{service_crate}\"]\nenv = {{ RUST_LOG = \"info\" }}\n\n[services.{service_key}.restart_policy]\non_exit = true\nbackoff_ms = 700\nmax_attempts = 8\n\n[services.{service_key}.healthcheck]\nurl = \"http://127.0.0.1:{port}/ready\"\ntimeout_ms = 1500\nretries = 12\ninterval_ms = 300\n"
+        "\n{header}\ncommand = \"cargo\"\nargs = [\"run\", \"--bin\", \"{service_crate}\"]\nport = {port}\nservice_name = \"{service_key}\"\nenv = {{ RUST_LOG = \"info\" }}\n\n[services.{service_key}.restart_policy]\non_exit = true\nbackoff_ms = 700\nmax_attempts = 8\n\n[services.{service_key}.healthcheck]\nurl = \"http://127.0.0.1:{port}/ready\"\ntimeout_ms = 1500\nretries = 12\ninterval_ms = 300\n"
     ));
 
     fs::write(&config_path, raw)
@@ -715,11 +719,58 @@ fn detect_service_config_violations(raw: &str) -> Vec<String> {
     };
 
     let mut violations = Vec::new();
+    // Two services on one port are not a port conflict at runtime: the first to
+    // bind wins and the second either fails to bind or is answered by its
+    // neighbour's health endpoint. Only the manifest can see it, and only
+    // before anything is spawned.
+    let mut ports_seen: BTreeMap<u16, &String> = BTreeMap::new();
+    // Two services under one identity do not fail at all: their log lines,
+    // metrics, protocol selection and migration records simply collapse into
+    // one. The orchestrator rejects this at startup; checking it here means
+    // `krab topology doctor` catches it without running anything.
+    let mut identities_seen: BTreeMap<String, &String> = BTreeMap::new();
+
     for (name, service) in services {
         let Some(service_table) = service.as_table() else {
             violations.push(format!("services.{name} must be a table"));
             continue;
         };
+
+        if let Some(port) = service_table.get("port").and_then(toml::Value::as_integer) {
+            match u16::try_from(port) {
+                Ok(0) | Err(_) => violations.push(format!(
+                    "services.{name}.port must be a port number between 1 and 65535, got `{port}`"
+                )),
+                Ok(port) => {
+                    if let Some(previous) = ports_seen.insert(port, name) {
+                        violations.push(format!(
+                            "services.{previous} and services.{name} both declare port = {port}; \
+                             the orchestrator injects this as KRAB_PORT, so give each service \
+                             its own port"
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Mirrors `ServiceDefinition::effective_service_name`: a declared
+        // name wins, a blank one is treated as absent, and the manifest key
+        // is the default. Table keys are unique, so a collision can only
+        // come from an explicit `service_name`.
+        let identity = service_table
+            .get("service_name")
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(name.as_str())
+            .to_string();
+        if let Some(previous) = identities_seen.insert(identity.clone(), name) {
+            violations.push(format!(
+                "services.{previous} and services.{name} both resolve to \
+                 service_name = `{identity}`; the orchestrator injects this as \
+                 KRAB_SERVICE_NAME, so give each service its own name"
+            ));
+        }
 
         let Some(healthcheck) = service_table
             .get("healthcheck")
@@ -775,6 +826,142 @@ mod tests {
     };
     use std::fs;
     use std::path::Path;
+
+    /// `service_entry` with an explicit `service_name`, for the identity checks.
+    fn service_entry_named(name: &str, port: u16, service_name: Option<&str>) -> String {
+        let declared = match service_name {
+            Some(value) => format!(
+                "service_name = \"{value}\"
+"
+            ),
+            None => String::new(),
+        };
+        service_entry(name, port).replace(
+            &format!(
+                "[services.{name}]
+"
+            ),
+            &format!(
+                "[services.{name}]
+{declared}"
+            ),
+        )
+    }
+
+    /// Minimal service body carrying everything the other checks demand, so a
+    /// port assertion fails on the port and nothing else.
+    fn service_entry(name: &str, port: u16) -> String {
+        format!(
+            "[services.{name}]\ncommand = \"cargo\"\nport = {port}\n\n\
+             [services.{name}.restart_policy]\non_exit = true\nbackoff_ms = 700\nmax_attempts = 8\n\n\
+             [services.{name}.healthcheck]\nurl = \"http://127.0.0.1:{port}/ready\"\n\
+             timeout_ms = 1500\nretries = 12\ninterval_ms = 300\n\n"
+        )
+    }
+
+    #[test]
+    fn two_services_declaring_one_port_are_reported_with_both_names() {
+        let manifest = format!(
+            "{}{}",
+            service_entry("auth", 3001),
+            service_entry("users", 3001)
+        );
+
+        let violations = detect_service_config_violations(&manifest);
+
+        let duplicate = violations
+            .iter()
+            .find(|violation| violation.contains("both declare port"))
+            .unwrap_or_else(|| panic!("duplicate port not reported; got {violations:?}"));
+        assert!(duplicate.contains("services.auth"), "{duplicate}");
+        assert!(duplicate.contains("services.users"), "{duplicate}");
+        assert!(duplicate.contains("3001"), "{duplicate}");
+    }
+
+    #[test]
+    fn distinct_ports_raise_no_port_violation() {
+        let manifest = format!(
+            "{}{}",
+            service_entry("auth", 3001),
+            service_entry("users", 3002)
+        );
+
+        let violations = detect_service_config_violations(&manifest);
+
+        assert!(
+            !violations.iter().any(|v| v.contains("port")),
+            "unexpected port violations: {violations:?}"
+        );
+    }
+
+    /// Two services can only collide on identity through an explicit
+    /// `service_name` -- manifest keys are unique by construction.
+    #[test]
+    fn two_services_resolving_to_one_service_name_are_reported_with_both_names() {
+        let manifest = format!(
+            "{}{}",
+            service_entry_named("auth", 3001, Some("shared")),
+            service_entry_named("users", 3002, Some("shared"))
+        );
+
+        let violations = detect_service_config_violations(&manifest);
+
+        let duplicate = violations
+            .iter()
+            .find(|violation| violation.contains("both resolve to service_name"))
+            .unwrap_or_else(|| panic!("duplicate identity not reported; got {violations:?}"));
+        assert!(duplicate.contains("services.auth"), "{duplicate}");
+        assert!(duplicate.contains("services.users"), "{duplicate}");
+        assert!(duplicate.contains("shared"), "{duplicate}");
+    }
+
+    #[test]
+    fn distinct_service_names_raise_no_identity_violation() {
+        let manifest = format!(
+            "{}{}",
+            service_entry_named("auth", 3001, Some("auth-api")),
+            service_entry_named("users", 3002, Some("users-api"))
+        );
+
+        let violations = detect_service_config_violations(&manifest);
+
+        assert!(
+            !violations.iter().any(|v| v.contains("service_name")),
+            "unexpected identity violations: {violations:?}"
+        );
+    }
+
+    /// A blank `service_name` falls back to its manifest key rather than
+    /// colliding with every other blank one on the empty string.
+    #[test]
+    fn blank_service_names_fall_back_to_their_keys() {
+        let manifest = format!(
+            "{}{}",
+            service_entry_named("auth", 3001, Some("   ")),
+            service_entry_named("users", 3002, Some(""))
+        );
+
+        let violations = detect_service_config_violations(&manifest);
+
+        assert!(
+            !violations.iter().any(|v| v.contains("service_name")),
+            "unexpected identity violations: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_port_is_reported() {
+        let manifest = "[services.auth]\ncommand = \"cargo\"\nport = 70000\n".to_string();
+
+        let violations = detect_service_config_violations(&manifest);
+
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("services.auth.port") && v.contains("70000")),
+            "unexpected violations: {violations:?}"
+        );
+    }
 
     fn clear_topology_env() {
         std::env::remove_var("KRAB_RUNTIME_TOPOLOGY");
