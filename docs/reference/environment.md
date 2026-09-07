@@ -111,6 +111,8 @@ Required when `KRAB_AUTH_MODE=jwt`.
 | `KRAB_RATE_LIMIT_CAPACITY` | No | `120` | Token-bucket burst capacity |
 | `KRAB_RATE_LIMIT_REFILL_PER_SEC` | No | `60` | Token-bucket refill rate |
 | `KRAB_RATE_LIMIT_FAIL_OPEN` | No | `true` in `dev`, `false` elsewhere | Whether to allow requests when the limiter backing store is unreachable |
+| `KRAB_AUTH_FAILURE_WINDOW_SECS` | No | `60` | Length (seconds) of the fixed window for per-IP auth-failure tracking. Windows are tumbling, not sliding — the counter is keyed on `floor(unix_secs / window)` and resets at the boundary, so a client can spend up to `2 x KRAB_AUTH_FAILURE_THRESHOLD` failures across two adjacent windows. `0` and unparseable values fall back to `60` |
+| `KRAB_AUTH_FAILURE_THRESHOLD` | No | `100` | Max auth failures per client IP allowed within the window before 429 is returned. `0` is valid and means lockdown: the first auth failure in the window is answered 429. Unparseable values fall back to `100` |
 | `KRAB_TRUST_PROXY_HEADERS` | No | `false` | Trust `X-Forwarded-*` for client IP and protocol. **Only enable behind a proxy you control** |
 | `KRAB_TRUSTED_PROXY_HOPS` | No | `1` | Only with `KRAB_TRUST_PROXY_HEADERS=true`: how many trusted proxy hops to skip from the right of `X-Forwarded-For` when choosing the client IP. `1` = rightmost entry. The candidate must parse as an IP or it is ignored |
 | `KRAB_CORS_ORIGINS` | No | — | Comma-separated allowed origins. Unset means no cross-origin allowance |

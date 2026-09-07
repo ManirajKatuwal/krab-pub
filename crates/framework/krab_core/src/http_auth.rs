@@ -922,7 +922,7 @@ where
             runtime.auth_failures_total.fetch_add(1, Ordering::Relaxed);
 
             let client_ip = extract_client_ip(&req, runtime.trust_proxy_headers);
-            let auth_window_secs = 60_u64;
+            let auth_window_secs = runtime.auth_fail_window_secs;
             let auth_window = current_window_epoch(auth_window_secs);
             let auth_key = format!("auth:fail:{client_ip}:{auth_window}");
 
@@ -944,10 +944,11 @@ where
                     .await;
             }
 
-            if failures > 100 {
+            if failures > runtime.auth_fail_threshold {
                 warn!(
                     failures_in_window = failures,
-                    window_seconds = 60,
+                    window_seconds = auth_window_secs,
+                    threshold = runtime.auth_fail_threshold,
                     limiter_scope = "per_ip_distributed_auth_failures",
                     client_ip = %client_ip,
                     "auth_failure_rate_limiter_triggered"

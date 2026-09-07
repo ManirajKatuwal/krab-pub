@@ -33,7 +33,17 @@ Supporting automation:
   are never rewritten).
 - [`shared_state_validation.py`](../../scripts/shared_state_validation.py) —
   verifies that rate limiting still blocks (HTTP 429) under the scaled topology
-  with Redis-backed shared state.
+  with Redis-backed shared state. With `KRAB_SHARED_STATE_SCENARIO=auth_failure`
+  it drives invalid tokens instead and, when
+  `KRAB_SHARED_STATE_MAX_BLOCK_INDEX` is set, requires the first block to land
+  at or below that request index — which is what separates a block by the
+  per-IP auth-failure limiter from one by the global token bucket.
+  `KRAB_SHARED_STATE_CLIENT_IP` sends that address as `X-Forwarded-For` so the
+  scenario runs against counters no earlier scenario in the job has spent; both
+  limiters key on the client IP, and a token bucket left partly drained by a
+  previous step blocks *earlier* than its capacity, which would satisfy the
+  bound without the limiter under test doing anything. It is honoured only
+  where the target trusts forwarded headers.
 - [`release_evidence_bundle.py`](../../scripts/release_evidence_bundle.py) —
   consolidates run artifacts into a release-evidence manifest.
 
@@ -316,7 +326,7 @@ table — check it before adding any artifact. Summary:
 |---|---|
 | `thresholds.json`, `benchmark_config.json`, `trend_history.csv` | `latest_summary.md`, `latest_summary_single.md`, `latest_summary_scaled.md` |
 | `external_results.json`, `external_summary.md` | `single_replica_results.json`, `scaled_replica_results.json` |
-| `targeted_hardening_results.json` | `shared_state_validation.json`, `release_evidence_bundle.json` / `.md` |
+| `targeted_hardening_results.json` | `shared_state_validation.json`, `shared_state_auth_failure_validation.json`, `release_evidence_bundle.json` / `.md` |
 
 Never write benchmark output to the repository root; generated artifacts
 belong under the gitignored patterns above or in `internal/`.

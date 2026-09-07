@@ -61,6 +61,8 @@ mod tests {
             "KRAB_RATE_LIMIT_CAPACITY",
             "KRAB_RATE_LIMIT_REFILL_PER_SEC",
             "KRAB_RATE_LIMIT_FAIL_OPEN",
+            "KRAB_AUTH_FAILURE_WINDOW_SECS",
+            "KRAB_AUTH_FAILURE_THRESHOLD",
             "KRAB_HTTP_REQUEST_TIMEOUT_SECS",
             "KRAB_HTTP_MAX_CONCURRENCY",
             "KRAB_HTTP_OVERLOAD_MODE",
@@ -1274,5 +1276,87 @@ mod tests {
         }
 
         std::env::remove_var("KRAB_METRICS_PUBLIC");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_auth_failure_threshold_env_is_configurable() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+        // Pin the window well beyond the test's runtime. With the 60s default
+        // an epoch boundary between the 3rd and 4th request would reset the
+        // counter and flip the 429 assertion below to 401.
+        std::env::set_var("KRAB_AUTH_FAILURE_WINDOW_SECS", "3600");
+        std::env::set_var("KRAB_AUTH_FAILURE_THRESHOLD", "3");
+
+        let app = test_app();
+
+        let make_req = |ip: &str| {
+            Request::builder()
+                .uri("/protected")
+                .header("Authorization", "Bearer invalid-token")
+                .header("x-forwarded-for", ip)
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // First 3 failures from 10.10.0.1 return 401 (accumulating up to threshold).
+        for _ in 0..3 {
+            let res = app.clone().oneshot(make_req("10.10.0.1")).await.unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // 4th failure exceeds threshold (3) -> returns 429 Too Many Requests.
+        let res = app.clone().oneshot(make_req("10.10.0.1")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // A different client IP has not reached the threshold and still gets 401.
+        let res = app.clone().oneshot(make_req("10.10.0.2")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        std::env::remove_var("KRAB_AUTH_FAILURE_WINDOW_SECS");
+        std::env::remove_var("KRAB_AUTH_FAILURE_THRESHOLD");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_auth_failure_window_rolls_over() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+        std::env::set_var("KRAB_AUTH_FAILURE_WINDOW_SECS", "2");
+        std::env::set_var("KRAB_AUTH_FAILURE_THRESHOLD", "1");
+
+        let app = test_app();
+
+        let make_req = || {
+            Request::builder()
+                .uri("/protected")
+                .header("Authorization", "Bearer invalid-token")
+                .header("x-forwarded-for", "10.10.0.3")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // 1st failure -> 401 (threshold is 1)
+        let res = app.clone().oneshot(make_req()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // 2nd failure immediately -> 429 (count is 2 > threshold 1)
+        let res = app.clone().oneshot(make_req()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Sleep longer than the 2-second window duration to ensure epoch rollover.
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+
+        // After window rollover, a new window counter starts -> 401.
+        let res = app.clone().oneshot(make_req()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        std::env::remove_var("KRAB_AUTH_FAILURE_WINDOW_SECS");
+        std::env::remove_var("KRAB_AUTH_FAILURE_THRESHOLD");
     }
 }

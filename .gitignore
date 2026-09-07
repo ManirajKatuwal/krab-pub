@@ -65,7 +65,7 @@ internal/
 benchmarks/latest_summary*.md
 benchmarks/release_evidence_bundle.*
 benchmarks/*_replica_results.json
-benchmarks/shared_state_validation.json
+benchmarks/shared_state_*.json
 
 # Rendered compose output
 docker/composed.nft.rendered.yaml

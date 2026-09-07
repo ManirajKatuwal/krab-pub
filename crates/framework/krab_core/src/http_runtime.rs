@@ -32,6 +32,8 @@ pub struct RuntimeState {
     pub cors_allow_any_origin: bool,
     pub trust_proxy_headers: bool,
     pub rate_limit_fail_open: bool,
+    pub auth_fail_window_secs: u64,
+    pub auth_fail_threshold: u64,
     pub auth_mode: String,
     pub service_auth_scope: String,
     pub public_paths: Vec<String>,
@@ -162,6 +164,8 @@ impl RuntimeState {
             cors_allow_any_origin: http_cfg.cors_allow_any_origin,
             trust_proxy_headers: http_cfg.trust_proxy_headers,
             rate_limit_fail_open: http_cfg.rate_limit_fail_open,
+            auth_fail_window_secs: http_cfg.auth_fail_window_secs,
+            auth_fail_threshold: http_cfg.auth_fail_threshold,
             auth_mode: http_cfg.auth_mode,
             service_auth_scope: http_cfg.service_auth_scope,
             public_paths: std::env::var("KRAB_AUTH_PUBLIC_PATHS")

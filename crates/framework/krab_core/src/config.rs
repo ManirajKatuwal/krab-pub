@@ -234,6 +234,19 @@ pub struct HttpConfig {
     /// Behavior when distributed rate-limit store errors occur.
     /// true = fail-open, false = fail-closed.
     pub rate_limit_fail_open: bool,
+    /// Length (seconds) of the per-client-IP auth-failure window. Shared across
+    /// replicas when the runtime store is Redis-backed.
+    ///
+    /// The window is fixed (tumbling), not sliding: the counter key carries
+    /// `floor(unix_secs / window)`, so it resets at the boundary rather than
+    /// ageing out failure by failure. A client can therefore spend up to
+    /// `2 * auth_fail_threshold` failures across two adjacent windows.
+    pub auth_fail_window_secs: u64,
+    /// Max auth failures a client IP may accumulate in one window before the
+    /// next failure is answered 429. Shared across replicas like the window.
+    /// `0` is a valid lockdown setting: it blocks on the first auth failure in
+    /// the window. Unparseable values fall back to the default.
+    pub auth_fail_threshold: u64,
     /// Trust `x-forwarded-for` / `x-real-ip` request headers for client IP extraction.
     pub trust_proxy_headers: bool,
     /// Allowed CORS origins from `KRAB_CORS_ORIGINS` (comma-separated).
@@ -275,6 +288,15 @@ impl HttpConfig {
                 .unwrap_or(60),
             rate_limit_fail_open: env_bool("KRAB_RATE_LIMIT_FAIL_OPEN")
                 .unwrap_or(matches!(environment, Environment::Dev)),
+            auth_fail_window_secs: std::env::var("KRAB_AUTH_FAILURE_WINDOW_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|&v| v > 0)
+                .unwrap_or(60),
+            auth_fail_threshold: std::env::var("KRAB_AUTH_FAILURE_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(100),
             trust_proxy_headers: env_bool("KRAB_TRUST_PROXY_HEADERS").unwrap_or(false),
             cors_origins,
             cors_allow_any_origin: matches!(environment, Environment::Dev),
@@ -636,6 +658,8 @@ mod tests {
             "KRAB_CORS_ORIGINS",
             "KRAB_TRUST_PROXY_HEADERS",
             "KRAB_RATE_LIMIT_FAIL_OPEN",
+            "KRAB_AUTH_FAILURE_WINDOW_SECS",
+            "KRAB_AUTH_FAILURE_THRESHOLD",
         ] {
             std::env::remove_var(key);
         }
@@ -1182,5 +1206,40 @@ mod tests {
 
         let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn http_config_reads_auth_failure_knobs() {
+        let _guard = env_lock();
+        clear_auth_env();
+
+        // Defaults when unset
+        let cfg = HttpConfig::from_env();
+        assert_eq!(cfg.auth_fail_window_secs, 60);
+        assert_eq!(cfg.auth_fail_threshold, 100);
+
+        // Custom valid values
+        std::env::set_var("KRAB_AUTH_FAILURE_WINDOW_SECS", "30");
+        std::env::set_var("KRAB_AUTH_FAILURE_THRESHOLD", "15");
+        let cfg = HttpConfig::from_env();
+        assert_eq!(cfg.auth_fail_window_secs, 30);
+        assert_eq!(cfg.auth_fail_threshold, 15);
+
+        // A 0 window has no meaningful epoch, so it falls back to the default.
+        // An unparseable threshold also falls back.
+        std::env::set_var("KRAB_AUTH_FAILURE_WINDOW_SECS", "0");
+        std::env::set_var("KRAB_AUTH_FAILURE_THRESHOLD", "invalid");
+        let cfg = HttpConfig::from_env();
+        assert_eq!(cfg.auth_fail_window_secs, 60);
+        assert_eq!(cfg.auth_fail_threshold, 100);
+
+        // A 0 threshold is not an error — it is deliberate lockdown, kept as-is
+        // so the first auth failure inside the window is answered 429.
+        std::env::set_var("KRAB_AUTH_FAILURE_THRESHOLD", "0");
+        let cfg = HttpConfig::from_env();
+        assert_eq!(cfg.auth_fail_threshold, 0);
+
+        clear_auth_env();
     }
 }

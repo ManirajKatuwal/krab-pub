@@ -18,6 +18,29 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ### Added
 
+- `KRAB_AUTH_FAILURE_WINDOW_SECS` (default: 60) and `KRAB_AUTH_FAILURE_THRESHOLD`
+  (default: 100): operator-configurable knobs for the per-client-IP auth-failure
+  rate limiter (`auth_middleware`). Window and failure count are shared across
+  replicas via `DistributedStore` (backed by Redis when `KRAB_REDIS_URL` is set).
+  When failures exceed the threshold within the window, subsequent unauthorized
+  attempts return `429 Too Many Requests`. A threshold of `0` is valid and blocks
+  on the first auth failure in the window. The window is fixed (tumbling), not
+  sliding — the counter is keyed on `floor(unix_secs / window)` and resets at the
+  boundary — so the worst case a client can spend is `2 x` the threshold across
+  two adjacent windows; size the threshold accordingly. Also added a
+  multi-replica shared-state auth-failure validation scenario in
+  `scripts/shared_state_validation.py` and `.github/workflows/nft.yaml`: the NFT
+  stack starts `service_auth` with `KRAB_AUTH_FAILURE_THRESHOLD=10` and the new
+  optional `KRAB_SHARED_STATE_MAX_BLOCK_INDEX` knob bounds the first block at
+  request 60, so a pass proves the shared per-IP auth-failure counter fired
+  across all three replicas. Without that bound a block near the global rate
+  limiter's capacity of 120 satisfied the check, which the token bucket does on
+  its own. A second new knob, `KRAB_SHARED_STATE_CLIENT_IP`, sends that address
+  as `X-Forwarded-For` so the scenario meets full counters: the bound alone only
+  rules out a block *later* than 60, and the rate-limit scenario that runs before
+  it drains the shared per-IP token bucket from the same container, leaving a
+  bucket that blocks early enough to satisfy the bound by itself. Unset, neither
+  knob applies and the rate-limit scenario is unchanged.
 - `KRAB_HTTP_OVERLOAD_MODE=queue|shed`: support for fast-failing excess concurrent HTTP
   requests with `503 Service Unavailable` (`SERVICE_OVERLOADED`) via `tower/load-shed`.
 - Signal WASM microtask drain chain depth limiter (`DRAIN_CHAIN_DEPTH`) bounded at

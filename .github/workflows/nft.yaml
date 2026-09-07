@@ -100,6 +100,16 @@ jobs:
             down -v
 
       - name: Start scaled stack (N=3, in-network)
+        # KRAB_AUTH_FAILURE_THRESHOLD is a *service-side* knob: docker-compose.yml
+        # interpolates it into service_auth's environment, so it has to be set
+        # here, when the containers are created. Setting it on the auth-failure
+        # validation step below would be too late — service_auth is already
+        # running by then. 10 makes the auth-failure limiter block on roughly
+        # the 11th failure, far ahead of the global per-IP token bucket
+        # (KRAB_RATE_LIMIT_CAPACITY, default 120). The load gate below uses a
+        # valid token, produces no auth failures, and is unaffected by this.
+        env:
+          KRAB_AUTH_FAILURE_THRESHOLD: "10"
         run: |
           docker compose \
             -f docker-compose.yml \
@@ -121,16 +131,79 @@ jobs:
             --markdown-out benchmarks/latest_summary_scaled.md
 
       - name: Validate shared-state rate-limit behavior (scaled)
+        # `docker compose run` injects only what the service's `environment:`
+        # map (or an env_file) declares — step-level env does NOT reach the
+        # container on its own. Every host var the script reads therefore needs
+        # an explicit `-e VAR` pass-through; `-e VAR` with no `=value` forwards
+        # the host value. KRAB_BEARER_TOKEN is deliberately not set here:
+        # docker-compose.nft.yaml interpolates it into nft_runner from `.env`,
+        # which the "Prepare NFT environment" step writes.
         env:
           KRAB_AUTH_BASE_URL: http://service_auth:3001
-          KRAB_BEARER_TOKEN: ${KRAB_BEARER_TOKEN}
           KRAB_SHARED_STATE_SAMPLES: "240"
           KRAB_SHARED_STATE_EXPECT_STATUS: "429"
         run: |
           docker compose \
             -f docker-compose.yml \
             -f docker-compose.nft.yaml \
-            run --rm --entrypoint python3 nft_runner \
+            run --rm --entrypoint python3 \
+            -e KRAB_AUTH_BASE_URL \
+            -e KRAB_SHARED_STATE_SAMPLES \
+            -e KRAB_SHARED_STATE_EXPECT_STATUS \
+            nft_runner \
+            scripts/shared_state_validation.py
+
+      - name: Validate shared-state auth-failure behavior (scaled)
+        # KRAB_SHARED_STATE_MAX_BLOCK_INDEX is what makes this scenario prove
+        # anything. service_auth runs with KRAB_AUTH_FAILURE_THRESHOLD=10 (set
+        # on the stack-start step above), so the auth-failure limiter blocks at
+        # roughly the 11th invalid-token request. 60 leaves generous slack for
+        # 24-worker concurrency across 3 replicas while staying well below the
+        # global per-IP token bucket's capacity of 120: a first block near ~120
+        # would only prove the global rate limiter fired — which it does on its
+        # own, even if the auth-failure limiter were deleted entirely. Without
+        # this bound the scenario passes on the global limiter alone.
+        # KRAB_SHARED_STATE_CLIENT_IP is what makes that bound sound in both
+        # directions. The bound rules out a block LATER than 60; on its own it
+        # does not rule out an earlier one, because the rate-limit step just
+        # above ran 240 requests from this same container -- so the same client
+        # IP -- and the token bucket it drained is shared through Redis. A
+        # partly drained bucket blocks well before its capacity of 120, which
+        # would satisfy the bound while proving nothing. Presenting an IP this
+        # scenario owns starts it against a full bucket, so a block at or below
+        # 60 can only be the auth-failure limiter. service_auth runs with
+        # KRAB_TRUST_PROXY_HEADERS=true here (docker-compose.nft.yaml), which is
+        # what makes the header authoritative; the address is from the RFC 5737
+        # TEST-NET-1 documentation range so it cannot collide with a real one.
+        #
+        # A lower bound on the block index would be the obvious alternative and
+        # is not sound: with 24 workers the request that arrives 11th may have
+        # been submitted at any index in 1..24, so the first block by submission
+        # index can legitimately be 1.
+        #
+        # These are runner-side vars, so they need `-e` pass-through as above;
+        # the threshold is service-side and is set at stack start instead.
+        env:
+          KRAB_AUTH_BASE_URL: http://service_auth:3001
+          KRAB_SHARED_STATE_SCENARIO: auth_failure
+          KRAB_SHARED_STATE_SAMPLES: "240"
+          KRAB_SHARED_STATE_EXPECT_STATUS: "429"
+          KRAB_SHARED_STATE_MAX_BLOCK_INDEX: "60"
+          KRAB_SHARED_STATE_CLIENT_IP: 192.0.2.77
+          KRAB_SHARED_STATE_OUT: benchmarks/shared_state_auth_failure_validation.json
+        run: |
+          docker compose \
+            -f docker-compose.yml \
+            -f docker-compose.nft.yaml \
+            run --rm --entrypoint python3 \
+            -e KRAB_AUTH_BASE_URL \
+            -e KRAB_SHARED_STATE_SCENARIO \
+            -e KRAB_SHARED_STATE_SAMPLES \
+            -e KRAB_SHARED_STATE_EXPECT_STATUS \
+            -e KRAB_SHARED_STATE_MAX_BLOCK_INDEX \
+            -e KRAB_SHARED_STATE_CLIENT_IP \
+            -e KRAB_SHARED_STATE_OUT \
+            nft_runner \
             scripts/shared_state_validation.py
 
       - name: Generate release evidence bundle
@@ -174,6 +247,7 @@ jobs:
             benchmarks/single_replica_results.json
             benchmarks/scaled_replica_results.json
             benchmarks/shared_state_validation.json
+            benchmarks/shared_state_auth_failure_validation.json
             benchmarks/release_evidence_bundle.json
             benchmarks/release_evidence_bundle.md
             benchmarks/trend_history.csv

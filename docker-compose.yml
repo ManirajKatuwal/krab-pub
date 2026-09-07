@@ -60,6 +60,11 @@ services:
       KRAB_METRICS_PUBLIC: "true"
       KRAB_AUTH_MODE: static
       KRAB_BEARER_TOKEN: ${KRAB_BEARER_TOKEN:?set KRAB_BEARER_TOKEN in .env}
+      # Auth-failure limiter threshold. Interpolated from the host so the NFT
+      # auth-failure validation can start this stack with a low threshold and
+      # prove the block came from this limiter rather than from the global
+      # per-IP token bucket. The default keeps the runtime default behaviour.
+      KRAB_AUTH_FAILURE_THRESHOLD: ${KRAB_AUTH_FAILURE_THRESHOLD:-100}
       KRAB_REDIS_URL: ${KRAB_REDIS_URL:-redis://redis:6379}
       KRAB_HOST: 0.0.0.0
       KRAB_PORT: "3001"
