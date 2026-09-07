@@ -31,6 +31,12 @@ mod protocol_client;
 mod render_policy;
 mod rendering;
 mod routes;
+// Reads the ambient KRAB_RUNTIME_TOPOLOGY / KRAB_RUNTIME_ENDPOINTS_JSON that
+// `.github/workflows/topology-matrix.yaml` exports, so the two matrix legs
+// exercise different code. Its tests carry `#[serial_test::serial]` so they do
+// not race the other env-mutating suites in this crate.
+#[cfg(test)]
+mod topology_matrix_tests;
 mod users_contract;
 mod ws;
 use crate::app_state::AppState;

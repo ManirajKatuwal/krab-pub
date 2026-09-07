@@ -77,6 +77,18 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
   `docs/reference/api.md` "As of X" reference naming a release beyond it. Those references
   have to name a release before it exists, so a renumbered release used to leave them
   silently false — and a `since` naming the wrong version is worse than none.
+- `topology-matrix.yaml` now proves the topology it configures. The workflow set
+  `KRAB_RUNTIME_TOPOLOGY` and `KRAB_RUNTIME_ENDPOINTS_JSON` for both legs, but nothing under
+  `services/` read either one from a test — every topology-sensitive case built a
+  `TopologyRuntime` literal, so the `monolith` and `distributed` jobs ran byte-identical
+  code and the gate could not fail on a topology defect. `service_frontend` gains an
+  ambient-env suite that resolves the topology the way `main` does
+  (`TopologyRuntime::from_env_checked`) and asserts the consequences per leg: which base
+  URL `resolve_service_base_url` returns, and whether `build_users_adapter` wires the
+  in-process or the remote REST adapter. The legs now take different assertion paths, a
+  distributed leg missing its endpoint map fails instead of degrading to monolith, and a
+  plain `cargo test -p service_frontend` with no topology env still passes against the
+  documented default.
 
 ### Security
 
