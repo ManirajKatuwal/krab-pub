@@ -42,6 +42,17 @@ Startup order is the topological order of `depends_on` and `startup_dependencies
 
 Shutdown and watch-triggered restarts use the same graph in reverse, so a dependency outlives everything that talks to it and comes back before its dependents do.
 
+## Reference Service
+
+[`services/service_users_split`](../../services/service_users_split/) is the in-tree
+worked example: one domain contract behind a REST adapter and a GraphQL adapter in a
+single process, registered with the orchestrator on port 3207. It carries the same
+runtime governance as every other Krab service — `apply_common_http_layers` over an
+`AppState` that implements `HasRuntimeState` — which is what supplies the `AuthContext`
+its adapters read. A split service that skips that call has no authenticated identity to
+give its adapters, and every API route answers 500 while `/health` and `/ready` stay
+green.
+
 ## Boundary Semantics
 
 Services should communicate through contracts and adapters, not direct imports from another service crate. `krab topology doctor` checks for direct cross-service imports and validates shared contract payload serialization derives.

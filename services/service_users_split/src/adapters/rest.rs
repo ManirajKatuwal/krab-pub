@@ -10,7 +10,13 @@ use serde_json::json;
 use crate::domain::models::DomainError;
 use crate::domain::service::DomainService;
 
-pub fn mount_rest_routes(domain: Arc<dyn DomainService>) -> Router {
+/// Generic over the router state so the REST routes can be merged into the
+/// governed `Router<AppState>` the runtime builds. The handlers take only
+/// extensions, so they never touch `S` themselves.
+pub fn mount_rest_routes<S>(domain: Arc<dyn DomainService>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     Router::new()
         .route("/users/me", get(get_me_handler))
         .layer(Extension(domain))

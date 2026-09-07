@@ -73,7 +73,9 @@ interval_ms = 300
 [services.users_split]
 command = "cargo"
 args = ["run", "--bin", "service_users_split"]
-env = { RUST_LOG = "info" }
+# Pinned so the service binds 3207 and names itself consistently even when the
+# ambient environment sets KRAB_PORT/KRAB_SERVICE_NAME for another service.
+env = { RUST_LOG = "info", KRAB_PORT = "3207", KRAB_SERVICE_NAME = "users-split" }
 healthcheck_url = "http://127.0.0.1:3207/health"
 healthcheck_timeout_ms = 1500
 

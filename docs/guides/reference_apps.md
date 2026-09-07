@@ -38,6 +38,11 @@ the services that are built and gated live in [`services/`](../../services/).
 | Event-stream app | `examples/reference_apps/event_stream` | `krab new event-stream --template event-stream` | SSE, WebSocket, readiness/liveness defaults |
 | Split-service example | `examples/reference_apps/split_service` | `krab topology split users --protocols rest,graphql,rpc --register` | service contracts, adapter separation, orchestrator config |
 
+The split-service track has a compiled counterpart in
+[`services/service_users_split`](../../services/service_users_split/): a working REST +
+GraphQL split over one domain contract, built and tested by CI. Read it alongside the
+track guide when you want the finished shape rather than the generated scaffold.
+
 ## Selection Guide
 
 Use the content-site track when you need the smallest deployable web service and want to understand the project model.

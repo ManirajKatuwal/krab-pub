@@ -134,6 +134,28 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ### Fixed
 
+- `service_users_split` answers its API again. Its router never applied
+  `apply_common_http_layers`, which is the only thing in the workspace that inserts the
+  `AuthContext` extension both adapters extract, so `/api/v1/users/me` and
+  `/api/v1/graphql` returned `500 Internal Server Error` to every caller while `/health`
+  and `/ready` stayed green — a service the orchestrator reported healthy with its whole
+  API dead. It now carries the same governance layers as the other three reference
+  services (auth, rate limiting, CSRF, protocol resolution, request id, tracing, metrics,
+  timeout and concurrency), boots through `KrabConfig` + `serve_with_graceful_shutdown`
+  with `3207` as the default port instead of a hardcoded bind, builds its runtime state
+  with the fail-closed `RuntimeState::try_new`, and enables the `redis-store` feature so
+  `KRAB_REDIS_URL` is honoured rather than refused. Unauthenticated API calls are now
+  `401`. The conformance suite drives the real router with a minted bearer token instead
+  of hand-injecting an `AuthContext` extension, which is what let the defect ship.
+  `KRAB_PROTOCOL_ENABLED_USERS_SPLIT` also works now: `ProtocolConfig::from_env` derives
+  the `KRAB_PROTOCOL_ENABLED_<NAME>` key from `KRAB_SERVICE_NAME`, then `KRAB_SERVICE`,
+  then the literal `service` — never from a crate's own default name — so running the
+  binary directly, which sets neither, the framework looked for
+  `KRAB_PROTOCOL_ENABLED_SERVICE` and the documented key did nothing. The service now
+  applies the override under its own name, with the framework's precedence (a
+  service-local list wins over `KRAB_PROTOCOL_ENABLED`, and the default protocol stays in
+  the enabled set).
+
 - `docs/reference/security.md` no longer claims rate limiting and auth-failure
   tracking are instance-local. They were rewritten to reflect that both counters
   already increment through `DistributedStore::incr` — Redis-backed atomic

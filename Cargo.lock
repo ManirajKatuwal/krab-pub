@@ -2957,13 +2957,14 @@ dependencies = [
  "async-trait",
  "axum",
  "http-body-util",
+ "jsonwebtoken",
  "krab_core",
  "serde",
  "serde_json",
+ "serial_test",
  "tokio",
  "tower",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
