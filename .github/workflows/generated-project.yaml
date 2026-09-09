@@ -30,7 +30,7 @@ jobs:
       # Every template is reported, not just the first to break.
       fail-fast: false
       matrix:
-        template: [default, saas, edge-ssr, event-stream]
+        template: [default, saas, edge-ssr, event-stream, fullstack]
 
     steps:
       - uses: actions/checkout@v4

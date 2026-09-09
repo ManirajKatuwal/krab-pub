@@ -15,11 +15,15 @@ It is a **Cargo workspace**, not an application. Changes here affect downstream
 framework consumers, so API surface and governance artifacts matter as much as
 the code.
 
-- Version: `0.4.0` (workspace-wide, `[workspace.package]` in `Cargo.toml`; see
-  `docs/operations/release_0_4_0_checklist.md`). Published to crates.io. Note
+- Version: `0.5.0` (workspace-wide, `[workspace.package]` in `Cargo.toml`; see
+  `docs/operations/release_0_5_0_checklist.md`). Published to crates.io. Note
   that `0.3.0` was tagged and released on GitHub but never reached the registry,
   so crates.io goes `0.2.0` → `0.4.0` — the missing number is deliberate.
-- Edition: 2021, Rust stable 1.75+
+  `[workspace.metadata.krab] next_version` must always be one ahead of
+  `version`; `scripts/check_workspace_layout.py` fails the build otherwise.
+- Edition: 2021, Rust stable 1.89+ (`rust-version` in `Cargo.toml` is the
+  measured floor of the resolved graph — `async-graphql` 7.2 and `time` 0.3.47 —
+  not a Krab choice; it said 1.75 through 0.4.0 and was never true)
 - License: MIT
 
 ---
@@ -225,7 +229,7 @@ violations.
 | Workflow | Enforces |
 |---|---|
 | [ops-hardening.yaml](.github/workflows/ops-hardening.yaml) | workspace layout, inter-crate version pinning, fmt, clippy `-D warnings`, rustdoc, `cargo-deny`, on-call delivery path, publish dry-run, release certify |
-| [generated-project.yaml](.github/workflows/generated-project.yaml) | `krab new` output builds, tests, clippy `-D warnings`, `fmt --check` — all four templates |
+| [generated-project.yaml](.github/workflows/generated-project.yaml) | `krab new` output builds, tests, clippy `-D warnings`, `fmt --check` — all five templates (`default`, `saas`, `edge-ssr`, `event-stream`, `fullstack`) |
 | [reference-app.yaml](.github/workflows/reference-app.yaml) | `examples/reference_apps/islands_rpc` builds, tests, and lints on native **and** `wasm32`, its WASM bundle is produced, and the `krab_client` browser suites run in headless Chrome |
 | [dependency-security.yaml](.github/workflows/dependency-security.yaml) | `cargo-audit`, SBOM |
 | [api-contract.yaml](.github/workflows/api-contract.yaml) | contract check, protocol parity, protocol matrix |

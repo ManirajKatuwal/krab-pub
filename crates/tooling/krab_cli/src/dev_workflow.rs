@@ -526,11 +526,19 @@ fn build_client_target(
             }
         }
     } else {
+        // `--lib` and not the whole package: the `fullstack` template puts the
+        // `[[bin]]` and the `cdylib` in one crate, and the binary's native-only
+        // dependencies (axum, tokio, tower-http) plus its `#[tokio::main]` do
+        // not build for `wasm32-unknown-unknown`. Only the cdylib is ever fed
+        // to wasm-bindgen, and the release path already builds lib-only because
+        // that is all wasm-pack does. Client crates that are lib-only anyway
+        // are unaffected.
         let mut client_cmd = Command::new("cargo");
         client_cmd
             .arg("build")
             .arg("-p")
             .arg(client_package)
+            .arg("--lib")
             .arg("--target")
             .arg("wasm32-unknown-unknown");
         if web_feature {
@@ -539,7 +547,7 @@ fn build_client_target(
 
         run_command_logged(
             &format!(
-                "cargo build -p {} --target wasm32-unknown-unknown{}",
+                "cargo build -p {} --lib --target wasm32-unknown-unknown{}",
                 client_package,
                 if web_feature { " --features web" } else { "" }
             ),
@@ -548,10 +556,16 @@ fn build_client_target(
         )?;
 
         println!("   > Generating JS bindings (debug-friendly dev mode)...");
+        // cargo names the artifact after the *crate*, so a package called
+        // `demo-fullstack` emits `demo_fullstack.wasm`. Use the same stem the
+        // release path uses rather than the package name.
+        let wasm_stem = project.client_artifact_stem().ok_or_else(|| {
+            anyhow::anyhow!("Missing client_artifact_stem for {}", client_package)
+        })?;
         let wasm_path = PathBuf::from("target")
             .join("wasm32-unknown-unknown")
             .join("debug")
-            .join(format!("{client_package}.wasm"));
+            .join(format!("{}.wasm", wasm_stem.replace('-', "_")));
 
         if !wasm_path.exists() {
             anyhow::bail!("WASM file not found at: {:?}", wasm_path);

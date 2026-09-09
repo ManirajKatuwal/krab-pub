@@ -36,6 +36,10 @@ krab_core = { workspace = true, features = ["rest", "redis-store"] }
 # honour the opt-out and emit the wrappers.
 krab_client = { workspace = true, default-features = false, features = ["demo-islands"] }
 krab_macros = { workspace = true }
+# Real digests for the asset manifest. The manifest used to publish a
+# hardcoded `sha256-demo-manifest-checksum`, which described no file.
+sha2 = "0.10"
+base64 = "0.22"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tower = { workspace = true, features = ["full"] }

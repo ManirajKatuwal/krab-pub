@@ -667,3 +667,57 @@ fn an_initially_empty_dynamic_renders_when_items_arrive() {
     batch(|| set_count.set(1));
     assert_eq!(count_lis(), 1, "and back");
 }
+
+#[wasm_bindgen_test]
+fn dynamic_region_reconciliation_cleans_up_registration() {
+    let root = mount_root();
+    let (show, set_show) = create_signal(true);
+
+    let baseline_regions = krab_client::dynamic_region_count();
+
+    let node = view! {
+        <div>
+            <Show when={move || show.get()} fallback={|| view! { <span>"empty"</span> }}>
+                <p>"active branch"</p>
+            </Show>
+        </div>
+    };
+
+    let built = krab_client::build_dom_for_test(&node).expect("build");
+    root.append_child(&built).expect("append");
+
+    // `>= baseline` was the original assertion here, which no arrangement of
+    // the runtime could fail — the count is a `usize` that starts at the
+    // baseline. The registration has to be observed going up.
+    let registered = krab_client::dynamic_region_count();
+    assert_eq!(
+        registered,
+        baseline_regions + 1,
+        "the Show branch must register exactly one dynamic region"
+    );
+
+    // Toggle away
+    batch(|| set_show.set(false));
+    assert!(root.inner_html().contains("empty"));
+
+    // Toggle back
+    batch(|| set_show.set(true));
+    assert!(root.inner_html().contains("active branch"));
+
+    // Re-rendering runs through the same anchor, so a registration per render
+    // would show up here as growth. This is the half of "cleans up
+    // registration" that reconciliation itself is responsible for.
+    assert_eq!(
+        krab_client::dynamic_region_count(),
+        registered,
+        "re-rendering a region must reuse its registration, not accumulate one per render"
+    );
+
+    // And the half that teardown is responsible for.
+    krab_client::unmount(&root);
+    assert_eq!(
+        krab_client::dynamic_region_count(),
+        baseline_regions,
+        "unmounting the subtree must unregister the region anchored inside it"
+    );
+}

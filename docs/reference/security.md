@@ -40,6 +40,29 @@ KRAB_AUTH_MODE=static
 - A single bearer token (`KRAB_BEARER_TOKEN`) is accepted.
 - **Blocked in non-dev environments** — startup fails with a clear error message.
 
+### Unauthenticated routes
+
+`auth_middleware` skips a baseline list of open paths: `/`, `/health`, `/ready`,
+the `/api/v1/auth/*` endpoints a caller needs before it holds a token,
+`/api/status`, and the demo-app routes the workspace services serve
+(`/contact`, `/data/dashboard`, `/rpc/version`, `/rpc/now`,
+`/asset-manifest.json`, `/blog/*`, `/pkg/*`). Trailing `*` is a prefix match.
+
+- `KRAB_AUTH_OPEN_PATHS` **replaces** that baseline rather than extending it, so
+  a deployment can close defaults it does not serve. An explicitly empty value
+  closes every one of them.
+- **The metrics endpoints are not on the baseline list.** `/metrics` and
+  `/metrics/prometheus` require auth unless `KRAB_METRICS_PUBLIC=true`, which is
+  additive over `KRAB_AUTH_OPEN_PATHS` — reopening metrics does not mean
+  restating every other open path. They were open by default through `0.4.0`,
+  which handed anonymous callers a service's full route inventory, request
+  volumes, error counts and latency distributions; on a low-traffic service,
+  per-route timing is enough to infer individual user activity. Prefer
+  authenticating the scraper or binding metrics to a network only it can reach.
+- The baseline is framework-owned and still carries app-shaped entries from the
+  bundled services. Audit it against your own routes rather than assuming it
+  describes your application.
+
 ---
 
 ## Secret Management
@@ -170,9 +193,9 @@ When disabled, middleware ignores forwarded headers and falls back to the TCP pe
 ### Current proxy-header trust semantics
 
 - [`extract_client_ip()`](../../crates/framework/krab_core/src/http.rs#L590) only consults `x-forwarded-for` and `x-real-ip` when [`KRAB_TRUST_PROXY_HEADERS`](../../crates/framework/krab_core/src/config.rs#L253) is enabled.
-- When enabled, [`extract_client_ip()`](../../crates/framework/krab_core/src/http.rs#L590) takes the left-most `x-forwarded-for` value if present, otherwise `x-real-ip`.
+- When enabled, [`extract_client_ip()`](../../crates/framework/krab_core/src/http_security.rs) reads `x-forwarded-for` from the **right**: it skips `KRAB_TRUSTED_PROXY_HOPS` entries (default 1, i.e. the rightmost entry is the client as seen by your own proxy) and requires the candidate to parse as an IP address. The left-most entry is whatever the client chose to send and is never used. A candidate that does not parse falls through to `x-real-ip`, then to the socket peer address.
 - When proxy headers are disabled or absent, [`extract_client_ip()`](../../crates/framework/krab_core/src/http.rs#L590) now falls back to the socket peer address when Axum connect-info is available, and only then to `unknown`.
-- Krab does **not** currently implement a trusted proxy CIDR allowlist or hop-count validation in [`extract_client_ip()`](../../crates/framework/krab_core/src/http.rs#L590). This means `KRAB_TRUST_PROXY_HEADERS=true` should only be enabled behind an ingress or reverse proxy that strips and rewrites those headers.
+- Krab validates by **hop count**, not by a proxy CIDR allowlist: `KRAB_TRUSTED_PROXY_HOPS` must equal the number of proxies you control in front of the service, or a client can pad the header and be trusted. Enable `KRAB_TRUST_PROXY_HEADERS=true` only behind an ingress or reverse proxy that appends to `x-forwarded-for` rather than passing the client's copy through.
 
 ---
 
@@ -194,8 +217,7 @@ CSRF protection in Krab is currently **opt-in**, not universally enforced.
 
 ### Current limitation
 
-- The WASM server-function client helper in [`call_server_fn()`](../../crates/framework/krab_core/src/server_fn.rs#L230) looks for a cookie named `csrf_token`, but the HTTP middleware currently issues and validates `krab_csrf_token` in [`csrf_token_endpoint()`](../../crates/framework/krab_core/src/http.rs#L752).
-- As a result, CSRF propagation for server functions is **not aligned by default** with the middleware-issued token name and should not be described as guaranteed protection until the names or integration are unified.
+- The WASM server-function client and the HTTP middleware share one set of constants in [`krab_core::csrf`](../../crates/framework/krab_core/src/csrf.rs) — cookie `krab_csrf_token`, header `x-csrf-token`, endpoint `/api/csrf-token`, JSON field `csrf_token` — so they cannot drift. [`call_server_fn()`](../../crates/framework/krab_core/src/server_fn.rs) fetches a token from the endpoint and sends it in the header on every call. (An earlier revision of this page described the two as using different cookie names; that was true once and is not now.)
 
 ## Browser security headers and CSP
 
@@ -251,19 +273,43 @@ Local runs require `cargo-deny` to be installed; without it, the dependency audi
 | Supply chain attack  | `cargo-deny` advisories + license + source enforcement                                                         |
 | Migration tampering  | Checksum validation on all applied migrations; drift detection                                                 |
 | Privilege escalation | RBAC enforcement on admin endpoints; scope/role validation                                                     |
-| Timing attacks       | Constant-time comparison (`constant_time_eq`) for token validation; `rsa` crate not present in dependency tree |
+| Timing attacks       | Constant-time comparison (`constant_time_eq`) for token validation. The `rsa` crate **is** in the dependency tree, unused: `sqlx-macros-core` depends on `sqlx-mysql` unconditionally and that pulls `rsa`. Krab compiles only the Postgres and SQLite drivers, so the code path is unreachable; `RUSTSEC-2023-0071` is the one standing advisory exception, recorded in `.cargo/audit.toml` |
 
 ---
 
 ## Known Limitations
 
-### Instance-Local Rate Limiting
+### Rate limiting and auth-failure tracking depend on a shared store
 
-The per-IP rate limiter (`global_rate_limit_middleware`) and auth-failure rate limiter use a distributed store (Redis) for state, but each instance tracks its own window counters. Under horizontal scaling, an attacker can distribute requests across instances to exceed the effective per-IP limit by a factor of the instance count.
+The per-IP rate limiter (`global_rate_limit_middleware`) and the auth-failure
+rate limiter both increment their window counters through
+`DistributedStore::incr` against a **shared** store — Redis when
+`KRAB_REDIS_URL` is configured (the `redis-store` feature), an in-process
+`MemoryStore` otherwise. Redis `INCR`/`EXPIRE` are atomic, so under horizontal
+scaling counted against the same Redis the per-IP and auth-failure limits hold
+across replicas rather than being multiplied by instance count.
 
-**Mitigation before horizontal scaling**: migrate rate limit counters to a shared Redis cluster with atomic `INCR`/`EXPIRE` operations coordinated across all instances.
+The caveat is the store choice, not per-instance counting:
 
-**Current posture**: acceptable for single-instance deployments. Auth failure counting now fails closed on store unavailability (returns 429) to prevent silent bypass.
+- **Configure `KRAB_REDIS_URL` for any deployment of more than one replica.**
+  With the default in-memory store each process keeps its own counters, so an
+  attacker can spread requests across instances and multiply the effective
+  limit by the replica count.
+- **The binary must be built with `redis-store` *and* given the URL.** A
+  binary compiled without that feature cannot honour `KRAB_REDIS_URL`:
+  `RuntimeState`'s store builder reports a non-empty URL as an initialization
+  error, and the boot-path constructor `RuntimeState::try_new` turns that into
+  a refusal to start in `staging`, `prod`, and unrecognised environments
+  (`dev` warns and falls back to `MemoryStore`). A malformed URL fails the
+  same way, since `RedisStore::from_url` validates it at construction; a
+  well-formed but unreachable Redis is *not* caught at startup — it surfaces
+  later as per-operation store errors, handled by the policies below. The
+  lenient `RuntimeState::new` always warns and falls back to the in-memory
+  store, so it is not a boot path for a multi-replica deployment.
+- The rate limiter honours the `KRAB_RATE_LIMIT_FAIL_OPEN` knob on store
+  errors (open in dev by default, closed elsewhere). Auth-failure tracking
+  always **fails closed** — an unavailable store answers `429` rather than
+  silently letting the attempt through.
 
 ### SHA-1 Transitive Dependency
 

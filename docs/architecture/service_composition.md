@@ -9,9 +9,48 @@ Krab treats service composition as part of the framework contract.
 Each registered service should define:
 
 - `command` and `args`
+- `port`, and `service_name` where it differs from the section key
 - optional `depends_on` and `startup_dependencies`
 - `[services.<name>.healthcheck]` targeting `/ready`
 - `[services.<name>.restart_policy]`
+
+## Service Identity
+
+`port` and `service_name` are the identity the orchestrator injects into each
+child as `KRAB_PORT` and `KRAB_SERVICE_NAME`. Both variables are per-service and
+neither has a workspace-wide meaning: the default a binary passes to
+`KrabConfig::from_env_checked` applies only while the variable is unset, so one
+exported value applies to every service that inherits it. Declaring the identity
+here is what makes the topology asserted by the health-probe URLs also true of
+the processes behind them.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `port` | none | Bind port, injected as `KRAB_PORT` |
+| `service_name` | the `[services.<name>]` key | Identity in telemetry, protocol selection, and migration records, injected as `KRAB_SERVICE_NAME` |
+
+Precedence for a child's environment, lowest first:
+
+1. the environment the orchestrator itself was started with, which the child
+   inherits;
+2. the identity injected from `port` and `service_name`;
+3. explicit `[services.<name>.env]` entries.
+
+Explicit entries win last, so a manifest can still set anything the typed fields
+do not express. The injected layer sits above inheritance, which is what stops
+an ambient `KRAB_PORT` from moving a service out from under its own probe — a
+failure that presents as a readiness timeout on a healthy service rather than as
+a bind error. A service that declares no `port` still inherits whatever is
+ambient and logs `service_port_unpinned_inheriting_ambient_krab_port` when it
+does.
+
+The manifest is validated before anything is spawned. Two services declaring the
+same port, or resolving to the same `service_name`, are rejected by name, as is
+`port = 0`. A declared port that disagrees with the port in that service's probe
+URL is warned about rather than rejected, since a probe may legitimately address
+a proxy. `krab topology doctor` performs the duplicate-port check statically.
+
+See [ADR 0012](../adr/0012-orchestrator-owns-service-identity.md).
 
 ## Health Semantics
 
@@ -41,6 +80,17 @@ Restarts are scheduled rather than slept through: one service waiting out its ba
 Startup order is the topological order of `depends_on` and `startup_dependencies`, resolved deterministically — a cycle or an unknown dependency is a startup error, not a warning.
 
 Shutdown and watch-triggered restarts use the same graph in reverse, so a dependency outlives everything that talks to it and comes back before its dependents do.
+
+## Reference Service
+
+[`services/service_users_split`](../../services/service_users_split/) is the in-tree
+worked example: one domain contract behind a REST adapter and a GraphQL adapter in a
+single process, registered with the orchestrator on port 3207. It carries the same
+runtime governance as every other Krab service — `apply_common_http_layers` over an
+`AppState` that implements `HasRuntimeState` — which is what supplies the `AuthContext`
+its adapters read. A split service that skips that call has no authenticated identity to
+give its adapters, and every API route answers 500 while `/health` and `/ready` stay
+green.
 
 ## Boundary Semantics
 

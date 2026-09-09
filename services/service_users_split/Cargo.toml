@@ -17,12 +17,20 @@ async-graphql-axum.workspace = true
 axum.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
-krab_core = { workspace = true, features = ["graphql", "rest"] }
+# `redis-store` matches the other three reference services: without it a
+# configured `KRAB_REDIS_URL` is a boot refusal rather than a shared store, so
+# the auth-failure and rate-limit counters could never be replica-wide.
+# `auth` is deliberately absent — that feature is Argon2 password credential
+# verification, and this service authenticates bearer tokens only.
+krab_core = { workspace = true, features = ["graphql", "rest", "redis-store"] }
 
 [dev-dependencies]
 tower.workspace = true
 http-body-util.workspace = true
+# The HTTP suites drive the real router, so they mint the same bearer tokens a
+# client would rather than hand-injecting an `AuthContext` extension.
+jsonwebtoken = "9"
+serial_test = "3"

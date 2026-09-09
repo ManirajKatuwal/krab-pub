@@ -26,7 +26,7 @@
 //!
 //! ## Replicas
 //!
-//! [`IsrCache::new`] is backed by [`MemoryStore`](crate::store::MemoryStore) —
+//! [`IsrCache::new`] is backed by [`MemoryStore`] —
 //! per-process, and therefore **only correct for a single replica**. Under more
 //! than one, each process keeps its own copy and
 //! [`invalidate_prefix`](IsrCache::invalidate_prefix) clears exactly one of
@@ -424,11 +424,20 @@ fn retention_for(policy: &IsrPolicy) -> Duration {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Content digest for an ISR entry's `ETag`.
+///
+/// SHA-256 truncated to 64 bits, not `DefaultHasher`. `DefaultHasher`'s output
+/// is explicitly not guaranteed stable across Rust releases, so two replicas
+/// built by different toolchains derived different ETags from byte-identical
+/// HTML — every cross-replica revalidation missed. The digest must be a
+/// function of the content alone, and nothing else.
+///
+/// The rendered shape (`"krab-"` plus 16 hex characters) is unchanged.
 fn compute_etag(html: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    html.hash(&mut hasher);
-    format!("\"krab-{:016x}\"", hasher.finish())
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(html.as_bytes());
+    let hex = format!("{:x}", digest);
+    format!("\"krab-{}\"", &hex[..16])
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -834,5 +843,41 @@ mod tests {
     fn short_max_age_still_gets_a_usable_retention_floor() {
         let retention = retention_for(&IsrPolicy::revalidate(Duration::from_secs(1)));
         assert_eq!(retention, MIN_RETENTION);
+    }
+}
+
+#[cfg(test)]
+mod etag_stability_tests {
+    use super::*;
+
+    /// Pinned by value on purpose. An ETag has to be reproducible on any
+    /// machine that renders the same bytes, so a change in how it is derived
+    /// must fail here rather than surface as silent revalidation misses
+    /// between replicas built on different toolchains.
+    #[test]
+    fn etag_is_a_pinned_function_of_the_content() {
+        // Cross-checked against `sha256sum`, not copied from this code's own
+        // output: `printf '%s' '<h1>hello</h1>' | sha256sum` starts 4db7ef63…
+        assert_eq!(compute_etag("<h1>hello</h1>"), "\"krab-4db7ef630005c462\"");
+        assert_eq!(compute_etag(""), "\"krab-e3b0c44298fc1c14\"");
+    }
+
+    #[test]
+    fn etag_differs_for_different_content_and_repeats_for_the_same() {
+        assert_eq!(compute_etag("<p>a</p>"), compute_etag("<p>a</p>"));
+        assert_ne!(compute_etag("<p>a</p>"), compute_etag("<p>b</p>"));
+    }
+
+    #[test]
+    fn etag_keeps_its_rendered_shape() {
+        let etag = compute_etag("anything");
+
+        assert!(etag.starts_with("\"krab-"));
+        assert!(etag.ends_with('"'));
+        // `"krab-` (6) + 16 hex + `"` (1)
+        assert_eq!(etag.len(), 23);
+        assert!(etag["\"krab-".len()..etag.len() - 1]
+            .chars()
+            .all(|c| c.is_ascii_hexdigit()));
     }
 }

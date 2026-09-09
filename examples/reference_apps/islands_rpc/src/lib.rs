@@ -15,7 +15,7 @@
 //!   browser.
 //! - [`add_task`] is a `#[server]` function mounted at `/api/rpc/add_task`,
 //!   called from `TaskCounter`'s click handler.
-//! - [`krab_boot`] hydrates and then starts the **client router**, and
+//! - `krab_boot` hydrates and then starts the **client router**, and
 //!   [`page_for`] renders two routes sharing one outlet, so moving between them
 //!   is an outlet swap rather than a document load — the islands and their
 //!   signal state survive it.

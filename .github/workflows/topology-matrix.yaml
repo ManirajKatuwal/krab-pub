@@ -1,5 +1,13 @@
 name: topology-matrix
 
+# What makes the two legs differ is the ambient env below, not the test command.
+# `services/service_frontend/src/topology_matrix_tests.rs` resolves
+# `KRAB_RUNTIME_TOPOLOGY` / `KRAB_RUNTIME_ENDPOINTS_JSON` the way `main` does and
+# asserts a different consequence per mode, so `monolith` and `distributed` take
+# different assertion paths. Keep both legs and keep the env at job scope: with
+# it dropped, the suite falls back to its documented monolith default and the
+# distributed leg silently stops testing anything.
+
 on:
   pull_request:
     paths:
@@ -39,6 +47,16 @@ jobs:
         run: |
           echo "KRAB_RUNTIME_TOPOLOGY=${KRAB_RUNTIME_TOPOLOGY}"
           echo "KRAB_RUNTIME_ENDPOINTS_JSON=${KRAB_RUNTIME_ENDPOINTS_JSON}"
+          # A leg whose env did not reach the runner would run as the monolith
+          # default and pass without testing its own topology. Refuse that.
+          test -n "${KRAB_RUNTIME_TOPOLOGY}" || {
+            echo "::error::KRAB_RUNTIME_TOPOLOGY is empty; this leg would test nothing"
+            exit 1
+          }
+          test -n "${KRAB_RUNTIME_ENDPOINTS_JSON}" || {
+            echo "::error::KRAB_RUNTIME_ENDPOINTS_JSON is empty; this leg would test nothing"
+            exit 1
+          }
 
       - name: Run frontend tests in topology mode
         run: cargo test -p service_frontend

@@ -203,11 +203,22 @@ pub fn server(attr: TokenStream, item: TokenStream) -> TokenStream {
             axum::Json(__raw_args): axum::Json<serde_json::Value>,
         ) -> axum::response::Response {
             use axum::response::IntoResponse;
-            let __args = match serde_json::from_value::<#args_struct_name>(__raw_args.clone()) {
+            let __args = match serde_json::from_value::<#args_struct_name>(__raw_args) {
                 Ok(v) => v,
                 Err(e) => {
-                    let msg = format!("Validation failed for '{}': {}. Payload: {}", stringify!(#fn_name), e, __raw_args);
-                    return krab_core::server_fn::ServerFnError::validation(msg).into_response();
+                    // The request body is not echoed back: a rejected payload
+                    // routinely carries the very credential that made it
+                    // invalid, and error responses are among the most heavily
+                    // logged objects in any stack. The deserializer's message is
+                    // not returned verbatim either — serde embeds submitted
+                    // values in it — but the schema facts inside it are what
+                    // make the error actionable, so those are kept.
+                    // `from_deserialization_error` draws that line.
+                    return krab_core::server_fn::ServerFnError::from_deserialization_error(
+                        stringify!(#fn_name),
+                        &e,
+                    )
+                    .into_response();
                 }
             };
             #respond

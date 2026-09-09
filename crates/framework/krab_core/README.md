@@ -39,7 +39,7 @@ Deprecated aliases, removable no earlier than `0.3.0`: `grpc` →
 
 ```toml
 [dependencies]
-krab_core = { version = "0.1", features = ["rest", "db"] }
+krab_core = { version = "0.5", features = ["rest", "db-postgres"] }
 ```
 
 ## Documentation

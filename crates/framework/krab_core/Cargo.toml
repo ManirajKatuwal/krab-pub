@@ -29,7 +29,7 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 tower-http = { workspace = true, optional = true, features = ["compression-gzip", "cors", "request-id", "trace", "limit", "timeout"] }
-tower = { workspace = true, optional = true, features = ["util", "limit"] }
+tower = { workspace = true, optional = true, features = ["util", "limit", "load-shed"] }
 jsonwebtoken = { version = "9", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 # Content types for static assets. Came in with `krab_core::static_assets`, which
@@ -58,10 +58,16 @@ async-graphql = { workspace = true, optional = true }
 # live in an application crate.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "macros", "uuid", "time"], optional = true }
 
-# Migration checksums. SHA-256 rather than std's DefaultHasher, whose output is
-# documented as unstable across Rust releases — a persisted checksum must
-# survive a toolchain bump. Already in the dependency tree via sqlx/argon2.
-sha2 = { version = "0.10", optional = true }
+# Migration checksums and ISR ETags. SHA-256 rather than std's DefaultHasher,
+# whose output is documented as unstable across Rust releases — a persisted
+# checksum must survive a toolchain bump, and an ETag must agree between
+# replicas that may not be built by the same compiler.
+#
+# Not optional: it was reachable only through `db-postgres`, but `isr` compiles
+# on every non-wasm build and needs the same stable digest. Already in the
+# dependency tree via sqlx/argon2, and dead-stripped from wasm bundles, where
+# `isr` is gated out.
+sha2 = { version = "0.10" }
 
 [features]
 default = []
@@ -88,7 +94,7 @@ web = ["dep:web-sys", "dep:js-sys", "dep:wasm-bindgen"]
 
 # Postgres: connection pooling plus the full migration governance surface —
 # checksum validation, drift detection, rollback, promotion policy.
-db-postgres = ["dep:sqlx", "sqlx/postgres", "dep:sha2"]
+db-postgres = ["dep:sqlx", "sqlx/postgres"]
 
 # SQLite: the driver only. Migration governance is Postgres-specific and does
 # not apply; see docs/reference/database.md.

@@ -680,6 +680,52 @@ fn the_saas_template_requests_db_postgres_not_the_deprecated_db_alias() {
     assert_no_deprecated_aliases(&features, "`krab new --template saas`");
 }
 
+#[test]
+fn the_fullstack_template_configures_dual_targets_and_wasm_assets() {
+    let (_temp, root) = scaffold("fullstack");
+
+    let manifest = read(&root, "Cargo.toml");
+    assert!(
+        manifest.contains("crate-type = [\"cdylib\", \"rlib\"]"),
+        "{manifest}"
+    );
+    assert!(
+        manifest.contains("[target.'cfg(not(target_arch = \"wasm32\"))'.dependencies]"),
+        "{manifest}"
+    );
+    assert!(
+        manifest.contains("[target.'cfg(target_arch = \"wasm32\")'.dependencies]"),
+        "{manifest}"
+    );
+    assert!(manifest.contains("features = [\"web\"]"), "{manifest}");
+
+    let lib_rs = read(&root, "src/lib.rs");
+    assert!(lib_rs.contains("#[island]"), "{lib_rs}");
+    assert!(lib_rs.contains("#[server]"), "{lib_rs}");
+    assert!(lib_rs.contains("krab_boot"), "{lib_rs}");
+
+    let main_rs = read(&root, "src/main.rs");
+    assert!(main_rs.contains("greet_server_handler"), "{main_rs}");
+    assert!(main_rs.contains("ServeDir::new(\"dist\")"), "{main_rs}");
+
+    let krab_toml = read(&root, "krab.toml");
+    assert!(
+        krab_toml.contains(&format!("client_package = \"{PROJECT}\"")),
+        "{krab_toml}"
+    );
+    assert!(
+        krab_toml.contains(&format!("client_artifact_stem = \"{PROJECT}\"")),
+        "{krab_toml}"
+    );
+
+    let strict = run(&root, &["doctor", "--diagnostics", "--strict"]);
+    assert!(
+        strict.success,
+        "a freshly generated fullstack project must pass its own strict gate: {}",
+        strict.report()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Binary identity.
 // ---------------------------------------------------------------------------

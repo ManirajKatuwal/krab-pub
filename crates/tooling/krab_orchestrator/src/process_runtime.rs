@@ -10,10 +10,17 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tracing::{error, info, warn};
 
-use crate::configuration::{KrabConfig, ServiceDefinition, DEFAULT_SHUTDOWN_TIMEOUT_MS};
+use crate::configuration::{
+    KrabConfig, ServiceDefinition, DEFAULT_SHUTDOWN_TIMEOUT_MS, PORT_ENV_KEY,
+};
 
 const ORCHESTRATOR_ARTIFACT_ROOT: &str = "internal/audit/orchestrator";
 const PROBE_BODY_EXCERPT_LIMIT: usize = 160;
+/// How long to wait for a child to be reaped after the force-kill path has run.
+///
+/// Every kill there is best-effort, so this is the bound that keeps a child the
+/// system refused to kill from hanging the entire shutdown sequence.
+const FORCE_KILL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Default)]
 struct ProbeFailureDiagnostics {
@@ -423,15 +430,21 @@ pub(super) async fn terminate_child(
 
     #[cfg(unix)]
     {
-        use nix::sys::signal::{kill, Signal};
+        use nix::sys::signal::{killpg, Signal};
         use nix::unistd::Pid;
 
         if let Some(pid_u32) = child.id() {
-            let pid = Pid::from_raw(pid_u32 as i32);
-            if let Err(err) = kill(pid, Signal::SIGTERM) {
-                warn!(service = %name, pid = pid_u32, error = %err, "service_sigterm_failed");
+            // The group, not the pid. `krab.toml` spawns services as
+            // `cargo run --bin X`, so the direct child is cargo and the service
+            // is a grandchild; cargo does not forward signals, so signalling
+            // the pid alone killed cargo and left the service running with its
+            // port still bound. `spawn_service` makes the child its own group
+            // leader, so its pgid equals its pid and this reaches both.
+            let pgid = Pid::from_raw(pid_u32 as i32);
+            if let Err(err) = killpg(pgid, Signal::SIGTERM) {
+                warn!(service = %name, pgid = pid_u32, error = %err, "service_sigterm_failed");
             } else {
-                info!(service = %name, pid = pid_u32, "service_sigterm_sent");
+                info!(service = %name, pgid = pid_u32, "service_sigterm_sent");
             }
         }
     }
@@ -457,19 +470,137 @@ pub(super) async fn terminate_child(
         }
     }
 
-    if let Err(err) = child.kill().await {
-        warn!(service = %name, error = %err, "service_force_kill_failed");
-        return;
+    // Windows has neither process groups nor signals, and `Child::kill` reaches
+    // only the direct child — `cargo`, which does not pass the kill on to the
+    // service binary. The service would survive the orchestrator with its port
+    // still bound, and since `9f2e92b` the orchestrator owns ports, so the next
+    // run fails to bind. `taskkill /T` walks the tree instead.
+    #[cfg(windows)]
+    {
+        let mut tree_killed = false;
+
+        if let Some(pid) = child.id() {
+            match tokio::process::Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &pid.to_string()])
+                .output()
+                .await
+            {
+                Ok(out) if out.status.success() => {
+                    info!(service = %name, pid, "service_process_tree_killed");
+                    tree_killed = true;
+                }
+                Ok(out) => {
+                    warn!(
+                        service = %name,
+                        pid,
+                        code = ?out.status.code(),
+                        stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                        "service_process_tree_kill_reported_failure"
+                    );
+                }
+                Err(err) => {
+                    warn!(service = %name, pid, error = %err, "service_process_tree_kill_failed_to_run");
+                }
+            }
+        }
+
+        // `taskkill` is not guaranteed to be on PATH, and it reports failure for
+        // a tree it cannot open. Without this fallback the child stays live and
+        // the unbounded `wait` below never returns — shutdown hangs rather than
+        // leaking. `kill` reaches only `cargo`, so the grandchild can still
+        // survive; that is a leak, and a leak beats a hang.
+        if !tree_killed {
+            if let Err(err) = child.start_kill() {
+                warn!(service = %name, error = %err, "service_force_kill_failed");
+            } else {
+                warn!(service = %name, "service_force_killed_direct_child_only_tree_may_survive");
+            }
+        }
     }
 
-    match child.wait().await {
-        Ok(status) => {
-            info!(service = %name, status = %status, code = ?status.code(), "service_stopped_forcefully");
+    // The force path has the same problem the graceful path does: `Child::kill`
+    // signals `cargo`, not the service it spawned. Signal the group, exactly as
+    // the SIGTERM above does, or a service that outlived the shutdown budget is
+    // left running with its port bound — the leak this whole function exists to
+    // prevent, reappearing at the one moment it matters most.
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{killpg, Signal};
+        use nix::unistd::Pid;
+
+        if let Some(pid_u32) = child.id() {
+            let pgid = Pid::from_raw(pid_u32 as i32);
+            if let Err(err) = killpg(pgid, Signal::SIGKILL) {
+                warn!(service = %name, pgid = pid_u32, error = %err, "service_group_force_kill_failed");
+            } else {
+                info!(service = %name, pgid = pid_u32, "service_group_force_killed");
+            }
         }
-        Err(err) => {
-            warn!(service = %name, error = %err, "service_wait_failed_after_force_kill");
+
+        // `start_kill`, not `kill().await`: the latter is `start_kill` followed
+        // by an *unbounded* `wait`, which would sit in front of the bounded reap
+        // below and defeat it. Signal now, reap once, with the timeout.
+        if let Err(err) = child.start_kill() {
+            warn!(service = %name, error = %err, "service_force_kill_failed");
         }
     }
+
+    #[cfg(not(any(unix, windows)))]
+    if let Err(err) = child.start_kill() {
+        warn!(service = %name, error = %err, "service_force_kill_failed");
+    }
+
+    // Bounded. Every kill above is best-effort — `taskkill` may be missing, the
+    // group may be gone, the child may be unkillable — and an unbounded wait on
+    // a live child hangs the whole shutdown, which is worse than reporting the
+    // service as unreaped and moving on to the next one.
+    match tokio::time::timeout(FORCE_KILL_REAP_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => {
+            info!(service = %name, status = %status, code = ?status.code(), "service_stopped_forcefully");
+        }
+        Ok(Err(err)) => {
+            warn!(service = %name, error = %err, "service_wait_failed_after_force_kill");
+        }
+        Err(_) => {
+            warn!(
+                service = %name,
+                timeout_ms = FORCE_KILL_REAP_TIMEOUT.as_millis() as u64,
+                "service_still_running_after_force_kill_abandoning_wait"
+            );
+        }
+    }
+}
+
+/// Build the child command for a service: program, arguments, resolved
+/// environment, and working directory.
+///
+/// Split out of [`spawn_service`] so the environment a child actually receives
+/// can be observed in a test without also taking on the log forwarders and the
+/// artifact directory.
+pub(super) fn build_command(name: &str, service: &ServiceDefinition) -> Command {
+    let child_env = service.resolved_env(name);
+
+    // The child inherits this process's environment and the resolved map is
+    // merged over it — there is no `env_clear()` — so anything the manifest
+    // does not speak for is still ambient. `KRAB_PORT` was the case where that
+    // mattered most: one exported value moved every service off its own port
+    // and out from under its own health probe.
+    if service.port_is_unpinned() {
+        if let Ok(ambient) = std::env::var(PORT_ENV_KEY) {
+            warn!(
+                service = %name,
+                ambient_port = %ambient,
+                "service_port_unpinned_inheriting_ambient_krab_port"
+            );
+        }
+    }
+
+    let mut cmd = Command::new(&service.command);
+    cmd.args(&service.args).envs(&child_env);
+    if let Some(cwd) = &service.cwd {
+        cmd.current_dir(cwd);
+    }
+    cmd
 }
 
 /// Spawn a configured service process using its command, arguments, environment, and cwd.
@@ -477,19 +608,34 @@ pub(super) async fn spawn_service(
     name: &str,
     service: &ServiceDefinition,
 ) -> Result<tokio::process::Child> {
-    let mut cmd = Command::new(&service.command);
-    cmd.args(&service.args)
-        .envs(&service.env)
-        .stdout(Stdio::piped())
+    let mut cmd = build_command(name, service);
+
+    // Give the child its own process group so shutdown can reach the whole
+    // tree: the direct child is usually `cargo run`, which spawns the service
+    // as a grandchild and does not forward signals to it. As group leader the
+    // child's pgid equals its pid, which is what `terminate_child` signals.
+    //
+    // The children no longer share the terminal's foreground group, so a
+    // Ctrl-C at the console reaches only the orchestrator. That is the correct
+    // arrangement here — `main` installs a `ctrl_c` handler and shuts the
+    // services down in dependency order — and it removes the race where the
+    // terminal and the orchestrator both signalled the same processes.
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // Backstop for the paths that never reach `shutdown_children`: if the
-        // orchestrator panics or is killed outright, the runtime still reaps
-        // its children instead of leaving every service running and its port
-        // bound.
+        // Partial backstop for the paths that never reach `shutdown_children`.
+        // Be precise about what it buys: `kill_on_drop` signals the direct
+        // child only, which is `cargo run`, and cargo does not pass it on. So a
+        // dropped handle reaps cargo and can leave the service itself running
+        // with its port bound — the same gap the group signalling in
+        // `terminate_child` exists to close, and one this cannot close because
+        // `Drop` is synchronous and the child map is not reachable from it.
+        //
+        // What that means in practice: an orchestrator panic or SIGKILL may
+        // leak services. `krab bootstrap` shutting down normally does not.
         .kill_on_drop(true);
-    if let Some(cwd) = &service.cwd {
-        cmd.current_dir(cwd);
-    }
 
     let mut child = cmd.spawn().with_context(|| {
         format!(
@@ -516,6 +662,8 @@ pub(super) async fn spawn_service(
         command = %service.command,
         args = ?service.args,
         cwd = ?service.cwd,
+        krab_service_name = %service.effective_service_name(name),
+        krab_port = ?service.port,
         stdout_log = %stdout_log.display(),
         stderr_log = %stderr_log.display(),
         artifact_dir = %orchestrator_artifact_dir().display(),
@@ -778,8 +926,151 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{compact_excerpt, sanitize_artifact_component, ProbeFailureDiagnostics};
+    use super::ProbeFailureDiagnostics;
+    use super::{build_command, compact_excerpt, sanitize_artifact_component, Stdio, PORT_ENV_KEY};
+    use crate::configuration::{ServiceDefinition, SERVICE_NAME_ENV_KEY};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
     use std::time::Duration;
+
+    /// `set_var`/`remove_var` are process-global, so the tests that stage an
+    /// ambient `KRAB_PORT` take a turn rather than racing each other.
+    static AMBIENT_ENV: Mutex<()> = Mutex::new(());
+
+    /// Echoes the two identity variables the orchestrator injects, separated by
+    /// `|`, using the shell that exists on the platform running the test.
+    fn echo_identity_service() -> ServiceDefinition {
+        #[cfg(windows)]
+        let (command, args) = (
+            "cmd".to_string(),
+            vec![
+                "/C".to_string(),
+                format!("echo %{SERVICE_NAME_ENV_KEY}%^|%{PORT_ENV_KEY}%"),
+            ],
+        );
+        #[cfg(not(windows))]
+        let (command, args) = (
+            "sh".to_string(),
+            vec![
+                "-c".to_string(),
+                format!("printf '%s|%s' \"${SERVICE_NAME_ENV_KEY}\" \"${PORT_ENV_KEY}\""),
+            ],
+        );
+
+        ServiceDefinition {
+            command,
+            args,
+            port: None,
+            service_name: None,
+            env: HashMap::new(),
+            cwd: None,
+            watch: false,
+            restart_on_exit: false,
+            restart_backoff_ms: 500,
+            max_restart_attempts: 5,
+            healthcheck_url: None,
+            healthcheck_timeout_ms: 1200,
+            shutdown_timeout_ms: 5000,
+            depends_on: vec![],
+            startup_dependencies: vec![],
+            restart_policy: None,
+            healthcheck: None,
+        }
+    }
+
+    /// Spawn through the real command-building path with `ambient` staged in
+    /// this process's environment.
+    ///
+    /// The child's *inherited* environment is captured at `spawn`, not at
+    /// build, so the staging has to survive that call — but no longer: the
+    /// lock is released before anything is awaited, both because a
+    /// `MutexGuard` may not be held across an await and because the ambient
+    /// variables must not outlive the spawn they were staged for.
+    fn spawn_with_ambient(
+        name: &str,
+        service: &ServiceDefinition,
+        ambient: &[(&str, &str)],
+    ) -> tokio::process::Child {
+        let _guard = AMBIENT_ENV.lock().unwrap_or_else(|err| err.into_inner());
+        // Restored, not removed: a developer running the suite with KRAB_PORT
+        // exported would otherwise lose it for the rest of the test binary,
+        // and the next test to stage an ambient value would be measuring a
+        // different starting environment than the first one did.
+        let previous: Vec<(&str, Option<String>)> = ambient
+            .iter()
+            .map(|(key, _)| (*key, std::env::var(key).ok()))
+            .collect();
+        for (key, value) in ambient {
+            std::env::set_var(key, value);
+        }
+
+        let child = build_command(name, service)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("child process spawns");
+
+        for (key, value) in &previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        child
+    }
+
+    async fn observed_identity(child: tokio::process::Child) -> String {
+        let output = child
+            .wait_with_output()
+            .await
+            .expect("child process completes");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn the_spawn_path_injects_the_declared_port_and_name_over_an_ambient_one() {
+        // The reproduction, in miniature: an exported `KRAB_PORT` used to reach
+        // every child, because the orchestrator merges per-service env over an
+        // inherited environment and never spoke for the port itself.
+        let mut service = echo_identity_service();
+        service.port = Some(3001);
+
+        let child = spawn_with_ambient(
+            "auth",
+            &service,
+            &[(PORT_ENV_KEY, "3000"), (SERVICE_NAME_ENV_KEY, "krab")],
+        );
+        let observed = observed_identity(child).await;
+
+        assert_eq!(observed, "auth|3001", "child saw {observed}");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_env_entry_still_wins_over_the_injected_default() {
+        let mut service = echo_identity_service();
+        service.port = Some(3001);
+        service.service_name = Some("auth".to_string());
+        service.env.insert(PORT_ENV_KEY.to_string(), "3999".into());
+        service
+            .env
+            .insert(SERVICE_NAME_ENV_KEY.to_string(), "pinned".into());
+
+        let child = spawn_with_ambient("auth", &service, &[(PORT_ENV_KEY, "3000")]);
+        let observed = observed_identity(child).await;
+
+        assert_eq!(observed, "pinned|3999", "child saw {observed}");
+    }
+
+    #[tokio::test]
+    async fn a_service_with_no_declared_port_still_inherits_the_ambient_one() {
+        // Unchanged behaviour for manifests that declare no port — the
+        // orchestrator invents nothing, it only warns.
+        let service = echo_identity_service();
+
+        let child = spawn_with_ambient("frontend", &service, &[(PORT_ENV_KEY, "3000")]);
+        let observed = observed_identity(child).await;
+
+        assert_eq!(observed, "frontend|3000", "child saw {observed}");
+    }
 
     #[test]
     fn compact_excerpt_normalizes_whitespace_and_truncates() {

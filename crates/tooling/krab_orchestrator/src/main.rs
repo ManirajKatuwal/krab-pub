@@ -22,6 +22,62 @@ use crate::watch_runtime::{build_event_watch_runtime, watch_fingerprint};
 /// woken. Independent of `watch.poll_ms`, which paces filesystem scanning.
 const SUPERVISION_TICK: Duration = Duration::from_millis(500);
 
+/// Resolves on any signal that should take the services down with us.
+///
+/// `ctrl_c` alone is not enough once children live in their own process
+/// groups (see `spawn_service`): a SIGHUP from a closing terminal or a SIGTERM
+/// from a supervisor reaches the orchestrator only, and if the orchestrator
+/// dies of it without running `shutdown_children`, every service survives with
+/// its port bound. In 0.4.0 the children shared the terminal's group and died
+/// with it — by accident, but they died. Handling the signals restores that
+/// outcome deliberately. Registration failure is logged and degrades to
+/// Ctrl-C only rather than refusing to start: a supervisor that cannot be
+/// listened for is a worse-shutdown problem, not a no-startup one.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(s) => Some(s),
+            Err(err) => {
+                warn!(error = %err, signal = "SIGTERM", "shutdown_signal_registration_failed");
+                None
+            }
+        };
+        let mut hangup = match signal(SignalKind::hangup()) {
+            Ok(s) => Some(s),
+            Err(err) => {
+                warn!(error = %err, signal = "SIGHUP", "shutdown_signal_registration_failed");
+                None
+            }
+        };
+
+        async fn recv_or_pending(stream: Option<&mut tokio::signal::unix::Signal>) {
+            match stream {
+                Some(s) => {
+                    s.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        }
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => info!(signal = "SIGINT", "shutdown_signal_kind"),
+            _ = recv_or_pending(terminate.as_mut()) => info!(signal = "SIGTERM", "shutdown_signal_kind"),
+            _ = recv_or_pending(hangup.as_mut()) => info!(signal = "SIGHUP", "shutdown_signal_kind"),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        // Windows has no SIGHUP/SIGTERM; console close and Ctrl-C both arrive
+        // through `ctrl_c`.
+        let _ = tokio::signal::ctrl_c().await;
+        info!(signal = "CTRL_C", "shutdown_signal_kind");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing("krab_orchestrator");
@@ -35,7 +91,7 @@ async fn main() -> Result<()> {
     let config = load_krab_config().map_err(|err| {
         error!(error = %err, "krab_config_load_failed");
         err.context(
-            "failed to load krab.toml; ensure it exists in the directory the orchestrator is started from",
+            "failed to load krab.toml; it must exist in the directory the orchestrator is started from, parse as TOML, and declare a service graph whose ports and names are unique",
         )
     })?;
 
@@ -81,7 +137,7 @@ async fn run_supervisor(config: KrabConfig) -> Result<()> {
         info!("Watch mode disabled; enabling exit supervision loop.");
         loop {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
+                _ = shutdown_signal() => {
                     info!("shutdown_signal_received");
                     shutdown_children(&config, &startup_order, &mut children).await;
                     return Ok(());
@@ -129,7 +185,7 @@ async fn run_supervisor(config: KrabConfig) -> Result<()> {
 
         loop {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
+                _ = shutdown_signal() => {
                     info!("shutdown_signal_received");
                     shutdown_children(&config, &startup_order, &mut children).await;
                     return Ok(());
@@ -184,7 +240,7 @@ async fn run_supervisor(config: KrabConfig) -> Result<()> {
 
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = shutdown_signal() => {
                 info!("shutdown_signal_received");
                 shutdown_children(&config, &startup_order, &mut children).await;
                 return Ok(());
@@ -277,6 +333,8 @@ mod tests {
         ServiceDefinition {
             command: "cargo".to_string(),
             args: vec![],
+            port: None,
+            service_name: None,
             env: HashMap::new(),
             cwd: None,
             watch: false,

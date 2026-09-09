@@ -6,7 +6,7 @@ an island, and calls a server function.
 Every command here was run against this version of the framework. Where a step
 has a sharp edge, it is called out rather than left for you to hit.
 
-**Prerequisites:** Rust stable 1.75+ ([rustup.rs](https://rustup.rs/)).
+**Prerequisites:** Rust stable 1.89+ ([rustup.rs](https://rustup.rs/)).
 
 ---
 
@@ -40,8 +40,8 @@ cp .env.example .env
 cargo run
 ```
 
-Four templates are available via `--template`: `default` (shown here), `saas`,
-`edge-ssr`, and `event-stream`.
+Five templates are available via `--template`: `default` (shown here), `saas`,
+`edge-ssr`, `event-stream`, and `fullstack`.
 
 You get a service on `http://127.0.0.1:3000` with `/`, `/health`, and `/ready`,
 plus a `krab.toml`, a `Dockerfile`, a Kubernetes manifest, and a CI workflow.
@@ -163,8 +163,8 @@ The `default` template is server-only, so this part needs three additions.
    crate-type = ["cdylib", "rlib"]
 
    [target.'cfg(target_arch = "wasm32")'.dependencies]
-   krab_core   = { version = "0.2", features = ["web"] }
-   krab_client = { version = "0.2", features = ["web"] }
+   krab_core   = { version = "0.5", features = ["web"] }
+   krab_client = { version = "0.5", features = ["web"] }
    inventory   = "0.3"
    wasm-bindgen = "0.2"
 

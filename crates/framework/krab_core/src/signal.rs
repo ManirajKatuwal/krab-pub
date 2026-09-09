@@ -22,7 +22,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 thread_local! {
     /// The reactive node currently executing, if any. Reads subscribe to it.
@@ -42,6 +41,13 @@ thread_local! {
     static PENDING_EFFECTS: RefCell<Vec<Rc<EffectState>>> = const { RefCell::new(Vec::new()) };
     #[cfg(feature = "web")]
     static MICROTASK_QUEUED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Consecutive microtask drain generations on the browser path in which
+    /// the effects that ran queued still more effects. This is the browser
+    /// analogue of `FLUSH_DEPTH`: a write from inside an effect cannot nest
+    /// a frame there, it lands in the next generation instead. Capped at
+    /// [`MAX_FLUSH_DEPTH`]; reset the moment a generation settles.
+    #[cfg(all(feature = "web", target_arch = "wasm32"))]
+    static DRAIN_CHAIN_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Something that depends on a signal.
@@ -279,30 +285,18 @@ impl EffectState {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-struct SignalId(u64);
-
-impl SignalId {
-    fn new() -> Self {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-        SignalId(NEXT_ID.fetch_add(1, Ordering::Relaxed))
-    }
-}
-
 struct SignalState<T> {
     value: T,
     subscribers: Vec<Subscriber>,
 }
 
 struct SignalInner<T> {
-    id: SignalId,
     state: Rc<RefCell<SignalState<T>>>,
 }
 
 impl<T> Clone for SignalInner<T> {
     fn clone(&self) -> Self {
         Self {
-            id: self.id,
             state: self.state.clone(),
         }
     }
@@ -310,7 +304,6 @@ impl<T> Clone for SignalInner<T> {
 
 pub fn create_signal<T>(value: T) -> (ReadSignal<T>, WriteSignal<T>) {
     let inner = SignalInner {
-        id: SignalId::new(),
         state: Rc::new(RefCell::new(SignalState {
             value,
             subscribers: Vec::new(),
@@ -534,6 +527,14 @@ impl Drop for BatchGuard {
 fn schedule_async(#[allow(unused_variables)] effects: Vec<Rc<EffectState>>) {
     #[cfg(all(feature = "web", target_arch = "wasm32"))]
     {
+        // Scheduling never rejects work. The cutoff belongs to the drain
+        // itself, below: a write made from inside an effect lands in the next
+        // microtask generation, so counting *generations that kept feeding the
+        // next one* is the browser equivalent of the native `FLUSH_DEPTH`
+        // frame count. Counting the writes themselves, as this used to, made
+        // sixty-four effects each writing one signal in a single flush look
+        // like a livelock and silently dropped every later delivery — a stale
+        // DOM, no diagnostic, from an entirely legitimate wide fan-out.
         PENDING_EFFECTS.with(|pending| {
             let mut p = pending.borrow_mut();
             for effect in effects {
@@ -551,6 +552,36 @@ fn schedule_async(#[allow(unused_variables)] effects: Vec<Rc<EffectState>>) {
                 });
                 for effect in effects {
                     run_effect(effect);
+                }
+
+                // Anything queued while the loop above ran was written by one
+                // of those effects, so this generation chained into another.
+                let chained = PENDING_EFFECTS.with(|pending| !pending.borrow().is_empty());
+                if !chained {
+                    DRAIN_CHAIN_DEPTH.with(|d| d.set(0));
+                    return;
+                }
+
+                let depth = DRAIN_CHAIN_DEPTH.with(|d| {
+                    let next = d.get() + 1;
+                    d.set(next);
+                    next
+                });
+                if depth >= MAX_FLUSH_DEPTH {
+                    // Effects have been feeding each other for
+                    // `MAX_FLUSH_DEPTH` consecutive generations with no sign
+                    // of settling. Drop the queue rather than spin the
+                    // microtask loop forever; the values are already
+                    // committed, so the next legitimate write re-runs the
+                    // dependents.
+                    let dropped = PENDING_EFFECTS.with(|pending| {
+                        let mut p = pending.borrow_mut();
+                        let n = p.len();
+                        p.clear();
+                        n
+                    });
+                    DRAIN_CHAIN_DEPTH.with(|d| d.set(0));
+                    tracing::error!(chain_depth = depth, dropped, "signal_flush_depth_exceeded");
                 }
             });
 

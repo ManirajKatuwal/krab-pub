@@ -52,10 +52,10 @@ variable marked **secret** has them.
 | Variable | Required | Default | Accepts |
 |---|---|---|---|
 | `KRAB_ENVIRONMENT` | **Yes** | — | `local` \| `dev` \| `staging` \| `prod`. Gates secret-sourcing enforcement and migration promotion policy |
-| `KRAB_SERVICE_NAME` | No | `krab` | Service identity used in telemetry, migration records, and protocol selection |
+| `KRAB_SERVICE_NAME` | No | per service | **Per-service.** Service identity used in telemetry (the `service` field on every log line and metric), migration records, and the `KRAB_PROTOCOL_ENABLED_<NAME>` lookup. The default is whatever the binary passes to `KrabConfig::from_env_checked` — `frontend`, `auth`, `users`, `users-split` for the reference services, not `krab`. Setting it in a shared environment renames **every** service that inherits it, and it degrades silently: nothing fails, they simply all report one name. Under `krab bootstrap` the orchestrator injects each service's own value from `[services.X].service_name` in `krab.toml` |
 | `KRAB_SERVICE` | No | `service` | Fallback service identity for protocol selection when `KRAB_SERVICE_NAME` is unset |
 | `KRAB_HOST` | No | `127.0.0.1` | Bind address |
-| `KRAB_PORT` | No | `3000` | Bind port. Reference services use `3000` frontend, `3001` auth, `3002` users, `3207` users-split |
+| `KRAB_PORT` | No | per service | **Per-service.** Bind port. The per-service default (`3000` frontend, `3001` auth, `3002` users, `3207` users-split) is a *fallback*, not a floor: when `KRAB_PORT` is set it overrides all of them simultaneously, so every service that inherits it tries to bind the same port. Under `krab bootstrap` the orchestrator injects each service's own value from `[services.X].port` in `krab.toml`, which is what keeps a service on the port its health probe addresses |
 | `KRAB_PUBLIC_BASE_URL` | No | `http://localhost:3000` | Public origin for SEO metadata (`canonical`, `og:url`) and `/robots.txt`, `/sitemap.xml`. **Set explicitly to your external HTTPS URL in staging and prod** |
 | `RUST_LOG` | No | `info` | `tracing-subscriber` env filter, e.g. `info,krab_core=debug` |
 
@@ -66,7 +66,8 @@ variable marked **secret** has them.
 | `KRAB_AUTH_MODE` | **Yes** | — | `static` \| `jwt`. `static` is for local and dev only |
 | `KRAB_BEARER_TOKEN` | Conditional | — | **Secret.** Shared token when `KRAB_AUTH_MODE=static` |
 | `KRAB_AUTH_PUBLIC_PATHS` | No | — | Comma-separated paths exempt from auth, **in addition to** the open-path list. Trailing `*` is a prefix match. Everything else is deny-by-default on protected routers |
-| `KRAB_AUTH_OPEN_PATHS` | No | built-in list | Comma-separated patterns **replacing** the built-in open (no-auth) path list (`/`, `/health`, `/ready`, auth endpoints, `/metrics`, `/metrics/prometheus`, `/blog/*`, `/pkg/*`, …). Trailing `*` is a prefix match. Set it to close default-open paths such as `/metrics`; an explicitly empty value closes them all. Unset keeps the backward-compatible defaults |
+| `KRAB_AUTH_OPEN_PATHS` | No | built-in list | Comma-separated patterns **replacing** the built-in open (no-auth) path list (`/`, `/health`, `/ready`, auth endpoints, `/blog/*`, `/pkg/*`, …). Trailing `*` is a prefix match. Set it to close default-open paths; an explicitly empty value closes them all. Unset keeps the built-in defaults. Does **not** govern the metrics endpoints — see `KRAB_METRICS_PUBLIC` |
+| `KRAB_METRICS_PUBLIC` | No | `false` | Allow anonymous `GET /metrics` and `/metrics/prometheus`. **Off by default:** metrics publish route names, traffic shape, error rates, and latency distributions. Prefer authenticating your scraper or binding metrics to a network only it can reach; set `true` only when that surface is deliberately public. Applies on top of `KRAB_AUTH_OPEN_PATHS`, so it reopens metrics whether or not that list is set |
 | `KRAB_AUTH_ADMIN_ROLE` | No | `admin` | Role name granting admin routes |
 | `KRAB_AUTH_ADMIN_SCOPE` | No | `admin` | Scope name granting admin routes |
 | `KRAB_AUTH_REQUIRED_ROLES` | No | — | Comma-separated roles required on protected routes |
@@ -83,6 +84,8 @@ variable marked **secret** has them.
 | `KRAB_AUTH_BOOTSTRAP_PASSWORD` | No | — | **Secret.** Bootstrap account password, as an Argon2id PHC hash. Plaintext is accepted in `dev`/`local` only and hashed at startup |
 | `KRAB_AUTH_LOGIN_USERS_JSON` | No | — | **Secret.** JSON object of `username` → Argon2id PHC hash. Generate entries with `krab auth hash-password --username <name>` |
 | `KRAB_SERVICE_AUTH_SCOPE` | No | `service:internal` | Scope required for service-to-service calls |
+| `KRAB_FRONTEND_DOWNSTREAM_BEARER_TOKEN` | No | — | **Secret.** Downstream bearer token for frontend to authenticate calls to backend services |
+| `KRAB_FRONTEND_PKG_DIR` | No | `dist/pkg` | Directory holding the built `krab_client.js`. The frontend hashes that file to publish a real `integrity` digest and `?h=` cache buster in `/asset-manifest.json`; when it cannot be read, no integrity is published and the browser treats hydration as degraded |
 | `KRAB_AUTH_BASE_URL` | No | `http://127.0.0.1:3001` | Auth service base URL for inter-service calls. Overridden by runtime topology when set |
 | `KRAB_USERS_BASE_URL` | No | `http://127.0.0.1:3002` | Users service base URL for inter-service calls. Overridden by runtime topology when set |
 
@@ -109,11 +112,14 @@ Required when `KRAB_AUTH_MODE=jwt`.
 | `KRAB_RATE_LIMIT_CAPACITY` | No | `120` | Token-bucket burst capacity |
 | `KRAB_RATE_LIMIT_REFILL_PER_SEC` | No | `60` | Token-bucket refill rate |
 | `KRAB_RATE_LIMIT_FAIL_OPEN` | No | `true` in `dev`, `false` elsewhere | Whether to allow requests when the limiter backing store is unreachable |
+| `KRAB_AUTH_FAILURE_WINDOW_SECS` | No | `60` | Length (seconds) of the fixed window for per-IP auth-failure tracking. Windows are tumbling, not sliding — the counter is keyed on `floor(unix_secs / window)` and resets at the boundary, so a client can spend up to `2 x KRAB_AUTH_FAILURE_THRESHOLD` failures across two adjacent windows. `0` and unparseable values fall back to `60` |
+| `KRAB_AUTH_FAILURE_THRESHOLD` | No | `100` | Max auth failures per client IP allowed within the window before 429 is returned. `0` is valid and means lockdown: the first auth failure in the window is answered 429. Unparseable values fall back to `100` |
 | `KRAB_TRUST_PROXY_HEADERS` | No | `false` | Trust `X-Forwarded-*` for client IP and protocol. **Only enable behind a proxy you control** |
 | `KRAB_TRUSTED_PROXY_HOPS` | No | `1` | Only with `KRAB_TRUST_PROXY_HEADERS=true`: how many trusted proxy hops to skip from the right of `X-Forwarded-For` when choosing the client IP. `1` = rightmost entry. The candidate must parse as an IP or it is ignored |
 | `KRAB_CORS_ORIGINS` | No | — | Comma-separated allowed origins. Unset means no cross-origin allowance |
 | `KRAB_HTTP_REQUEST_TIMEOUT_SECS` | No | `30` | Per-request timeout applied innermost in the common HTTP stack; overruns return 408. `0` disables |
 | `KRAB_HTTP_MAX_CONCURRENCY` | No | `1024` | Maximum concurrently processed requests. Excess requests queue (backpressure) and are bounded by the request timeout. `0` disables |
+| `KRAB_HTTP_OVERLOAD_MODE` | No | `queue` | Concurrency overload strategy: `queue` (wait in queue bounded by timeout) or `shed` (fast-fail excess requests with 503 Service Unavailable). Trimmed and case-insensitive; an unrecognised value falls back to `queue` and logs `env_value_invalid_using_default` |
 
 ## Database
 

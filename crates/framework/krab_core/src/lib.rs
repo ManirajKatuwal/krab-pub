@@ -43,6 +43,14 @@ pub mod isr;
 pub mod layout;
 pub mod protocol;
 pub mod render_policy;
+// Compiled on every target, but only half of it: the suspense-marker parsing
+// (`SuspenseMarker`, `SuspenseState`, `is_finalized_ssr_snapshot`) is plain
+// string handling and was reachable from `wasm32` in 0.4.0. The streaming
+// writer is gated *inside* the module — `ChunkedStreamWriter` times its
+// flushes with `std::time::Instant`, which on `wasm32-unknown-unknown` compiles
+// and then panics at runtime, and ADR 0009 records that streaming has no client
+// half. Gating the whole `pub mod` here, as 0.5.0 first did, would have taken
+// the parser off the browser with the writer and broken code that worked.
 pub mod render_stream;
 pub mod resilience;
 pub mod service_contract;
@@ -77,6 +85,26 @@ fn escape_html_text(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// True when `name` can be emitted as a raw HTML attribute name.
+///
+/// Attribute *values* are escaped on the way out, but a name is interpolated
+/// into the tag itself, where escaping is not enough: [`escape_html_attr`]
+/// leaves spaces and `=` untouched, so a name such as `x onload=alert(1)`
+/// would still introduce an event handler. Names are therefore validated
+/// against the HTML name grammar and dropped when they fail it — the same
+/// disposition a browser gives a name it cannot parse.
+///
+/// `view!` builds names from literal tokens, so this only bites callers who
+/// construct [`Attribute`] directly with a runtime-supplied name.
+pub(crate) fn is_valid_attr_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == ':' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -341,22 +369,25 @@ impl Render for Element {
         let attrs = self
             .attributes
             .iter()
+            .filter(|a| is_valid_attr_name(&a.name))
             .map(|a| format!(" {}=\"{}\"", a.name, escape_html_attr(&a.value)))
             .collect::<String>();
         let children = self.children.iter().map(|c| c.render()).collect::<String>();
 
         // Note: events are not rendered to HTML string
 
-        if self.children.is_empty() {
-            match self.tag.as_str() {
-                "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link"
-                | "meta" | "param" | "source" | "track" | "wbr" => {
-                    format!("<{}{}/>", self.tag, attrs)
-                }
-                _ => format!("<{}{}></{}>", self.tag, attrs, self.tag),
+        match self.tag.as_str() {
+            // A void element has no closing tag, children or not. Giving one
+            // children is a caller error, and `<br>x</br>` is malformed markup;
+            // a browser parses that source as `<br>` followed by the text, so
+            // that is what is emitted here rather than silently dropping the
+            // children on the floor.
+            "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta"
+            | "param" | "source" | "track" | "wbr" => {
+                format!("<{}{}/>{}", self.tag, attrs, children)
             }
-        } else {
-            format!("<{}{}>{}</{}>", self.tag, attrs, children, self.tag)
+            _ if self.children.is_empty() => format!("<{}{}></{}>", self.tag, attrs, self.tag),
+            _ => format!("<{}{}>{}</{}>", self.tag, attrs, children, self.tag),
         }
     }
 }
@@ -535,5 +566,98 @@ mod tests {
                 .and_then(|child| attr_value(child, HYDRATION_NODE_ID_ATTR)),
             Some("nested-boundary/0")
         );
+    }
+}
+
+#[cfg(test)]
+mod render_safety_tests {
+    use super::*;
+
+    fn el(tag: &str, attrs: Vec<Attribute>, children: Vec<Node>) -> Element {
+        Element {
+            tag: tag.to_string(),
+            attributes: attrs,
+            children,
+            events: Vec::new(),
+        }
+    }
+
+    fn attr(name: &str, value: &str) -> Attribute {
+        Attribute {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn attribute_name_that_would_open_a_second_attribute_is_dropped() {
+        // Escaping the name would not help: `escape_html_attr` leaves the space
+        // and the `=` intact, so this would still render an event handler.
+        let node = el(
+            "div",
+            vec![attr("x onload=alert(1)", "v"), attr("class", "ok")],
+            vec![],
+        );
+
+        let html = node.render();
+
+        assert!(
+            !html.contains("onload"),
+            "injected handler survived: {html}"
+        );
+        assert_eq!(html, "<div class=\"ok\"></div>");
+    }
+
+    #[test]
+    fn ordinary_attribute_names_still_render() {
+        let node = el(
+            "div",
+            vec![
+                attr("data-krab-boundary-id", "counter/0"),
+                attr("aria-label", "hi"),
+                attr("xml:lang", "en"),
+                attr("_private", "1"),
+            ],
+            vec![],
+        );
+
+        let html = node.render();
+
+        assert!(html.contains("data-krab-boundary-id=\"counter/0\""));
+        assert!(html.contains("aria-label=\"hi\""));
+        assert!(html.contains("xml:lang=\"en\""));
+        assert!(html.contains("_private=\"1\""));
+    }
+
+    #[test]
+    fn attribute_values_are_still_escaped() {
+        let node = el("div", vec![attr("title", "\"><script>x</script>")], vec![]);
+
+        let html = node.render();
+
+        assert!(!html.contains("<script>"), "unescaped value: {html}");
+        assert!(html.contains("&quot;&gt;&lt;script&gt;"));
+    }
+
+    #[test]
+    fn void_element_with_children_does_not_emit_a_closing_tag() {
+        let node = el(
+            "br",
+            vec![],
+            vec![Node::Text("after the break".to_string())],
+        );
+
+        let html = node.render();
+
+        // `<br>x</br>` is malformed; a browser parses that source as `<br>`
+        // followed by the text, so that is what is rendered.
+        assert_eq!(html, "<br/>after the break");
+        assert!(!html.contains("</br>"));
+    }
+
+    #[test]
+    fn void_and_normal_elements_without_children_are_unchanged() {
+        assert_eq!(el("br", vec![], vec![]).render(), "<br/>");
+        assert_eq!(el("div", vec![], vec![]).render(), "<div></div>");
     }
 }

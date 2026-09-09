@@ -12,9 +12,18 @@ public_paths = ["services/service_frontend/public"]
 bootstrap_bin = "krab_orchestrator"
 hmr_signal_path = "dist/.hmr_signal"
 
+# `port` and `service_name` are the identity the orchestrator injects into each
+# child as KRAB_PORT and KRAB_SERVICE_NAME. They are what makes the topology the
+# health probes below assert also true of the processes behind them: without
+# them, one exported KRAB_PORT moves every service onto the same port and the
+# failure surfaces as a readiness timeout rather than a bind error. Explicit
+# `[services.X].env` entries still win over both.
+
 [services.auth]
 command = "cargo"
 args = ["run", "--bin", "service_auth"]
+port = 3001
+service_name = "auth"
 env = { RUST_LOG = "info" }
 healthcheck_url = "http://127.0.0.1:3001/health"
 healthcheck_timeout_ms = 1500
@@ -33,6 +42,8 @@ interval_ms = 300
 [services.users]
 command = "cargo"
 args = ["run", "--bin", "service_users"]
+port = 3002
+service_name = "users"
 env = { RUST_LOG = "info" }
 depends_on = ["auth"]
 startup_dependencies = ["auth"]
@@ -53,6 +64,8 @@ interval_ms = 300
 [services.frontend]
 command = "cargo"
 args = ["run", "--bin", "service_frontend"]
+port = 3000
+service_name = "frontend"
 env = { RUST_LOG = "info" }
 depends_on = ["auth", "users"]
 startup_dependencies = ["auth", "users"]
@@ -73,6 +86,10 @@ interval_ms = 300
 [services.users_split]
 command = "cargo"
 args = ["run", "--bin", "service_users_split"]
+port = 3207
+# The one service whose reported identity differs from its manifest key, which
+# would otherwise default to `users_split`.
+service_name = "users-split"
 env = { RUST_LOG = "info" }
 healthcheck_url = "http://127.0.0.1:3207/health"
 healthcheck_timeout_ms = 1500

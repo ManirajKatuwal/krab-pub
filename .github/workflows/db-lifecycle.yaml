@@ -30,6 +30,11 @@ jobs:
     env:
       DATABASE_URL: postgres://postgres:ci_db_test_secret@localhost:5432/krab_test
       RUST_LOG: info
+      # The db tests skip and report `ok` when no database is reachable. This
+      # job provides one, so a skip here means the service container broke —
+      # a bad image, changed credentials, a health-check timeout. Without this
+      # the gate degrades silently to a green that proves nothing.
+      KRAB_REQUIRE_DB_TESTS: "1"
 
     steps:
       - uses: actions/checkout@v4
@@ -48,6 +53,16 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # The `db_tests` module is the only place the migration ledger,
+      # checksum rewriting, drift policy, governance gating and promotion
+      # rules are asserted against a real database. Everywhere else in CI it
+      # skips for want of one: `ops-hardening.yaml` compiles the driver but
+      # provides no Postgres, and the rehearsal below exercises exactly one of
+      # these eleven tests. This job owns the database, so the assertions
+      # belong here.
+      - name: 0. Database-backed krab_core tests
+        run: cargo test -p krab_core --features "db-postgres rest" db_tests
 
       - name: 1. Fresh Migration
         run: cargo run --package krab_cli -- db lifecycle --diagnostics

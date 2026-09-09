@@ -43,7 +43,7 @@ use web_sys::Element;
 
 #[path = "support/mod.rs"]
 mod support;
-use support::document;
+use support::{document, settle};
 
 wasm_bindgen_test_configure!(run_in_browser);
 
@@ -493,5 +493,76 @@ fn a_marker_mismatch_is_counted_and_reported_as_patched() {
         attr(&island, "data-krab-boundary-state").as_deref(),
         Some("patched"),
         "the boundary must not report a clean 'ok' over a mis-wired subtree"
+    );
+}
+
+// `async` and `settle()`: on the browser path a signal write is delivered on a
+// microtask, so reading the DOM synchronously after `click()` observes the
+// pre-click markup. Written without the await, this asserted that the handler
+// had *not* run yet and failed on the count it was checking for.
+#[wasm_bindgen_test]
+async fn second_hydration_pass_does_not_duplicate_event_closures() {
+    let markup = counter_ssr(5);
+    let island = mount(&markup);
+
+    krab_client::hydrate();
+    let closures_first = krab_client::event_closure_count();
+    assert!(
+        closures_first > 0,
+        "first hydration pass must register event closures"
+    );
+
+    // Second hydrate pass over the same document
+    krab_client::hydrate();
+    let closures_second = krab_client::event_closure_count();
+    assert_eq!(
+        closures_first, closures_second,
+        "second hydration pass must not allocate new event closures"
+    );
+
+    let btn: web_sys::HtmlElement = island
+        .query_selector("button")
+        .unwrap()
+        .unwrap()
+        .dyn_into()
+        .unwrap();
+    btn.click();
+    settle().await;
+
+    let text = island.inner_html();
+    assert!(
+        text.contains('6'),
+        "handler must fire once on click after second hydration (got {text})"
+    );
+    assert!(
+        !text.contains('7'),
+        "a duplicated closure would have incremented twice (got {text})"
+    );
+}
+
+#[wasm_bindgen_test]
+fn unmounting_root_releases_closures_and_dynamic_regions() {
+    let root = support::mount_container("krab-unmount-test-root");
+    root.set_inner_html(&counter_ssr(10));
+
+    let baseline_closures = krab_client::event_closure_count();
+    let baseline_regions = krab_client::dynamic_region_count();
+
+    krab_client::hydrate_within(&root);
+    assert!(
+        krab_client::event_closure_count() > baseline_closures,
+        "hydrate_within must register closures"
+    );
+
+    krab_client::unmount(&root);
+    assert_eq!(
+        krab_client::event_closure_count(),
+        baseline_closures,
+        "unmount must release all registered event closures"
+    );
+    assert_eq!(
+        krab_client::dynamic_region_count(),
+        baseline_regions,
+        "unmount must release all dynamic regions"
     );
 }

@@ -16,6 +16,388 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.5.0] — 2026-09-09
+
+Security and correctness release. Four changes are breaking: metrics are no
+longer anonymously readable by default, the orchestrator owns each service's
+port and name, `render_stream`'s streaming writer is no longer compiled for
+`wasm32`, and `ErrorCategory` is `#[non_exhaustive]` (exhaustive `match`es need
+a wildcard arm). See
+[the migration guide](docs/guides/migration_guide.md) before upgrading a running
+deployment.
+
+All four ship without the prior-release deprecation notice
+[`RELEASE_POLICY.md`](RELEASE_POLICY.md) §"Breaking Change Policy" asks for, and
+that is deliberate rather than an oversight. Metrics closing is a security fix,
+so a deprecation minor would have meant another release with every deployment's
+route inventory and traffic shape anonymously readable. The orchestrator change
+fixed a live defect — every service reporting the same `service` label, and a
+single ambient `KRAB_PORT` moving all of them onto one port. The `render_stream`
+writer on `wasm32` had nothing to deprecate: any call there was already a
+guaranteed runtime panic, and the marker parser that did work there stays
+available. Migration guidance, the requirement that was met, is in
+[`docs/reference/api.md`](docs/reference/api.md) for each.
+
+### Added
+
+- `krab_core::server_fn::ServerFnError::from_deserialization_error` and
+  `krab_core::server_fn::redact_submitted_values`: the value-redacting error path
+  `#[server]` handlers now use, public so hand-written handlers can match it. The
+  `#[server]` expansion in `krab_macros` 0.5 calls the former, so `krab_macros` and
+  `krab_core` must be upgraded together — a proc-macro crate cannot pin its host.
+- `KRAB_FRONTEND_PKG_DIR` (default: `dist/pkg`): the directory holding the built
+  `krab_client.js`. The frontend hashes that file to publish the asset manifest's
+  `integrity` digest and `?h=` cache buster; it links `/pkg/krab_client.js` without
+  serving it, so the location has to be told to it.
+
+- `[services.X].port` and `[services.X].service_name` in `krab.toml`: the orchestrator now
+  owns each service's identity and injects it as `KRAB_PORT` / `KRAB_SERVICE_NAME` at
+  spawn. Precedence, lowest first, is the inherited environment, then this injected
+  identity, then explicit `[services.X].env` entries. `service_name` defaults to the
+  `[services.<key>]` table key; `port` has no default and an undeclared port still
+  inherits whatever is ambient, logging
+  `service_port_unpinned_inheriting_ambient_krab_port` when it does. All four workspace
+  services declare both. See
+  [ADR 0012](docs/adr/0012-orchestrator-owns-service-identity.md).
+- `krab.toml` validation, at orchestrator startup and statically in `krab topology
+  doctor`: two services declaring the same port, or resolving to the same
+  `service_name`, are reported by name before anything is spawned, as is a port outside
+  1-65535. The orchestrator treats these as startup errors; `krab topology doctor`
+  reports them as violations. A declared port that disagrees with the port in that
+  service's probe URL is warned about, not rejected.
+- `KRAB_AUTH_FAILURE_WINDOW_SECS` (default: 60) and `KRAB_AUTH_FAILURE_THRESHOLD`
+  (default: 100): operator-configurable knobs for the per-client-IP auth-failure
+  rate limiter (`auth_middleware`). Window and failure count are shared across
+  replicas via `DistributedStore` (backed by Redis when `KRAB_REDIS_URL` is set).
+  When failures exceed the threshold within the window, subsequent unauthorized
+  attempts return `429 Too Many Requests`. A threshold of `0` is valid and blocks
+  on the first auth failure in the window. The window is fixed (tumbling), not
+  sliding — the counter is keyed on `floor(unix_secs / window)` and resets at the
+  boundary — so the worst case a client can spend is `2 x` the threshold across
+  two adjacent windows; size the threshold accordingly. Also added a
+  multi-replica shared-state auth-failure validation scenario in
+  `scripts/shared_state_validation.py` and `.github/workflows/nft.yaml`: the NFT
+  stack starts `service_auth` with `KRAB_AUTH_FAILURE_THRESHOLD=10` and the new
+  optional `KRAB_SHARED_STATE_MAX_BLOCK_INDEX` knob bounds the first block at
+  request 60, so a pass proves the shared per-IP auth-failure counter fired
+  across all three replicas. Without that bound a block near the global rate
+  limiter's capacity of 120 satisfied the check, which the token bucket does on
+  its own. A second new knob, `KRAB_SHARED_STATE_CLIENT_IP`, sends that address
+  as `X-Forwarded-For` so the scenario meets full counters: the bound alone only
+  rules out a block *later* than 60, and the rate-limit scenario that runs before
+  it drains the shared per-IP token bucket from the same container, leaving a
+  bucket that blocks early enough to satisfy the bound by itself. Unset, neither
+  knob applies and the rate-limit scenario is unchanged.
+- `KRAB_HTTP_OVERLOAD_MODE=queue|shed`: support for fast-failing excess concurrent HTTP
+  requests with `503 Service Unavailable` (`SERVICE_OVERLOADED`) via `tower/load-shed`.
+- Signal WASM microtask drain chain depth limiter (`DRAIN_CHAIN_DEPTH`) bounded at
+  `MAX_FLUSH_DEPTH = 64`, cutting off runaway self-writing and mutually recursive signal
+  loops. It counts consecutive drain generations that keep queueing more effects — the
+  browser analogue of the native `FLUSH_DEPTH` frame count — so a wide fan-out of
+  independent effect writes in one flush is delivered in full.
+- `ErrorCategory::Unavailable` (HTTP 503), distinct from `RateLimited` (429): the service
+  is out of capacity rather than the caller being over quota.
+- `krab_client` headless browser integration suite `cycle_browser.rs` covering WASM signal self-writes,
+  infinite loop cutoff, wide effect fan-out delivery, and scoped effect disposal.
+- `krab new <name> --template fullstack` scaffolds a complete full-stack Krab
+  application with server-side rendering (SSR), client-side WASM island hydration
+  via `krab_client`, `#[server]` functions, and static file serving (`/pkg` and
+  `/public` via `tower-http`) out of the box. Dual-target dependencies (native
+  axum/tokio/rest and wasm32 web/hydration) and wasm-pack build configurations
+  are generated automatically.
+
+### Changed
+
+- **`rust-version` is `1.89`.** Every manifest said `1.75` through 0.4.0, and it was never
+  true: the resolved dependency graph needs 1.89 (`async-graphql` 7.2 under `graphql`) and
+  1.88 (`time` 0.3.47 under either database driver), and `krab_cli` needs 1.85
+  unconditionally, so `cargo install krab_cli` on 1.75–1.84 failed with a dependency error
+  rather than a clear MSRV message. The number now states the measured floor, and `krab new`
+  projects declare the same `1.89`. A correction of a claim, not a policy change.
+- `service_users::run_split_target` no longer configures the process environment; callers
+  must invoke the now-public `configure_split_target_env` before building the runtime, as
+  the three `users_*` binaries do. `service_users` is a workspace service, not a published
+  crate, so no framework API is affected.
+
+- **Breaking for downstream `krab.toml` consumers:** a service's identity now defaults to
+  its manifest key. A `[services.api]` entry running a binary whose own default name is
+  `backend` reports `service=api` in telemetry after this change; declare
+  `service_name = "backend"` to keep the old value. The alternative was leaving
+  `KRAB_SERVICE_NAME` unpinned for every service that had not opted in, which is the
+  defect being fixed.
+- **Breaking for downstream `krab.toml` consumers:** the orchestrator reads `krab.toml`
+  only. `config`'s `File::with_name` incidentally accepted `krab.yaml`, `krab.json` and
+  others; nothing in the workspace, the docs, or the `krab new` templates has ever
+  produced one. `krab_orchestrator` drops its `config` dependency for `toml`.
+- `krab topology split --register` writes `port` and `service_name` into the `[services.X]`
+  entry it registers, alongside the probe URL it already generated. (`krab generate
+  service` does not touch `krab.toml`; an earlier draft of this entry credited it.)
+- **Breaking:** `/metrics` and `/metrics/prometheus` are no longer on the default
+  unauthenticated open-path list. Every service built on Krab was handing anonymous callers
+  its full route inventory, request volumes, error counts and latency histograms. Set
+  `KRAB_METRICS_PUBLIC=true` to restore anonymous scraping — one line, and greppable across
+  an estate to answer "who is exposing metrics?". The flag is additive over
+  `KRAB_AUTH_OPEN_PATHS`, which *replaces* the baseline list rather than extending it, so
+  reopening metrics no longer means restating every other default. The bundled
+  `docker-compose.yml` sets it for the local monitoring stack.
+- **Breaking on `wasm32` only, for the streaming writer:** `ChunkedStreamWriter`,
+  `FinishedStream`, `StreamTelemetry` and `render_to_chunk_stream` are no longer compiled
+  for `wasm32`. The writer was reaching the browser bundle with a bare
+  `std::time::Instant`, which compiles there and panics at runtime, and streaming SSR
+  has no client half (see [ADR 0009](docs/adr/0009-resource-ssr-semantics.md)). Any
+  browser call into it was already a guaranteed panic, so nothing that worked stops
+  working. The gate sits **inside** the module, not on it: `SuspenseMarker`,
+  `SuspenseState` and `is_finalized_ssr_snapshot` are pure string parsing, worked on
+  `wasm32` in `0.4.0`, and still compile there at the same paths. An earlier cut of this
+  release gated the whole module and would have broken browser-side marker parsing
+  while claiming nothing could break; the review caught it before the tag.
+- **Breaking:** `krab_core::http::ErrorCategory` is now `#[non_exhaustive]`. Rust callers
+  that `match` on a category need a wildcard arm. Taken in the same release as the
+  `Unavailable` addition so that every future category is a non-breaking addition;
+  constructing the existing variants is unaffected.
+- `KRAB_HTTP_OVERLOAD_MODE` is trimmed and validated. An unrecognised value falls back to
+  `queue` and logs `env_value_invalid_using_default` instead of selecting it silently.
+
+### Governance
+
+- `krab db rehearsal` now requires a reachable database (`KRAB_REQUIRE_DB_TESTS=1`) and
+  writes no evidence file when the rehearsal does not run. It previously recorded
+  `rollback_rehearsal: ok` when the underlying test skipped for want of a database —
+  an artifact RELEASE_POLICY trusts as proof of rehearsal, produced by a rehearsal that
+  never happened.
+- `db-lifecycle.yaml` runs `krab_core`'s `db_tests` against its Postgres service. Ten of
+  those eleven tests — migration ledger, checksum rewriting, drift policy, governance
+  gating, promotion rules — previously ran against a real database nowhere in CI; only
+  the rollback rehearsal did. `ops-hardening.yaml`'s per-driver steps are documented as
+  compile-isolation checks, which is all they ever were.
+- `db-lifecycle.yaml` sets `KRAB_REQUIRE_DB_TESTS=1`. The job provides Postgres, so a skip
+  there means the service container broke; the gate no longer degrades silently to green.
+- `[workspace.metadata.krab] next_version` declares the version `[Unreleased]` will ship
+  as, and `scripts/check_workspace_layout.py` fails any `#[deprecated(since = ..)]` or
+  `docs/reference/api.md` "As of X" reference naming a release beyond it. Those references
+  have to name a release before it exists, so a renumbered release used to leave them
+  silently false — and a `since` naming the wrong version is worse than none.
+- `topology-matrix.yaml` now proves the topology it configures. The workflow set
+  `KRAB_RUNTIME_TOPOLOGY` and `KRAB_RUNTIME_ENDPOINTS_JSON` for both legs, but nothing under
+  `services/` read either one from a test — every topology-sensitive case built a
+  `TopologyRuntime` literal, so the `monolith` and `distributed` jobs ran byte-identical
+  code and the gate could not fail on a topology defect. `service_frontend` gains an
+  ambient-env suite that resolves the topology the way `main` does
+  (`TopologyRuntime::from_env_checked`) and asserts the consequences per leg: which base
+  URL `resolve_service_base_url` returns, and whether `build_users_adapter` wires the
+  in-process or the remote REST adapter. The legs now take different assertion paths, a
+  distributed leg missing its endpoint map fails instead of degrading to monolith, and a
+  plain `cargo test -p service_frontend` with no topology env still passes against the
+  documented default.
+
+### Security
+
+- SSR no longer lets caller-supplied data break out of an HTML context. JSON-LD is
+  escaped for embedding (`<`, `>` and `&` become their `\uXXXX` JSON escapes, which a
+  JSON parser reads back unchanged), inline `<script>` bodies have `</script` rewritten
+  to `<\/script`, and attribute *names* are validated against the HTML name grammar and
+  dropped when they fail. Escaping a name was never enough: the escaper leaves spaces
+  and `=` intact, so a name like `x onload=alert(1)` still opened an event handler.
+  `view!` builds names from literal tokens, so only callers constructing `Attribute` or
+  `ScriptTag.extra_attrs` with runtime-supplied names were exposed — but JSON-LD exists
+  precisely to carry dynamic data, which made that path a stored-XSS vector in any
+  application using the API as intended.
+- `#[server]` validation failures no longer echo the request payload back in the error
+  message. A rejected body routinely carries the very credential that made it invalid,
+  and error responses are among the most heavily logged objects in a stack. The
+  deserializer's own message is returned only after `ServerFnError::from_deserialization_error`
+  has run it through `redact_submitted_values`: serde embeds submitted values in it —
+  quoted strings (with `\"` escapes honoured, so an embedded quote cannot end the
+  redaction early) and backticked non-strings (integer, boolean, floating point,
+  character) and enum/field names (unknown variant, unknown field) — and every one of
+  those becomes `<redacted>`. What survives is schema: the missing field's name, the
+  permitted set, the expected type, line and column. This also drops the clone of the
+  request body that existed only to feed the echo.
+
+- `h2` bumped to 0.4.16 for [RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258)
+  (unbounded queueing of empty DATA frames in the `hyper` stack). Lockfile only.
+
+### Deprecated
+
+- `krab_core::db::postgres::run_migrations`, superseded by `run_versioned_migrations`.
+  It only creates an unused `_krab_migrations` table. Removed in 0.6.0.
+- `krab_core::render_stream::SuspenseMarker`, deprecated in 0.5.0 and removed in 0.6.0.
+  It parses `<!--krab:suspense:{id}:{state}-->` markers emitted by server-side streaming,
+  and streaming has no client half ([ADR 0009](docs/adr/0009-resource-ssr-semantics.md)),
+  so nothing in the browser consumes them. The one real use — deciding whether a rendered
+  snapshot has every boundary resolved and is therefore safe to cache — is now the new
+  public `krab_core::render_stream::is_finalized_ssr_snapshot`, which takes the rendered
+  HTML and returns a `bool`. Behavior is unchanged: `service_frontend` now calls that
+  shared helper instead of re-parsing markers itself. `SuspenseState` stays public because
+  `ChunkedStreamWriter::write_suspense_marker` takes it.
+
+### Fixed
+
+- The orchestrator shuts its services down on SIGTERM and SIGHUP, not only Ctrl-C. Because
+  0.5.0 spawns children into their own process groups, a closing terminal or a supervisor's
+  SIGTERM reached the orchestrator alone and killed it without running the shutdown path,
+  leaving every service running with its port bound. In 0.4.0 the children happened to
+  share the terminal's group and died with it; they now die on purpose. Windows is
+  unchanged (console close and Ctrl-C both arrive as `ctrl_c`).
+- `/api/hmr` no longer reloads the page in a loop after the first signal. The receiver is
+  cloned out of the app state per request and inherits the parent's unseen version, so once
+  any signal had ever been sent every reconnect fired immediately; the subscription now
+  marks itself current before listening. The earlier fix covered only the case where no
+  signal had been sent yet.
+- `service_auth`'s refresh handler fails closed on store *reads* as well as writes. Its
+  replay and revocation lookups turned a store outage into "not used" / "not revoked" —
+  the one answer those checks must never give by default. They now return 503 like the
+  write paths already did.
+- The orchestrator no longer orphans the services it starts. `krab.toml` spawns services
+  as `cargo run --bin X`, so the direct child is cargo and the service is a grandchild;
+  cargo does not forward signals, so `SIGTERM` to the child's pid killed cargo and left
+  the service running with its port still bound. Children are now spawned into their own
+  process group and signalled with `killpg`. On Windows, which has neither process groups
+  nor signals, the forceful path uses `taskkill /T /F` to kill the tree instead of a
+  `Child::kill` that reached only cargo. Since `9f2e92b` the orchestrator owns ports, so
+  a leaked service also made the next `krab bootstrap` fail to bind. The forceful path
+  signals the group too, not just the graceful one — a service that outlived its shutdown
+  budget was still being killed by pid, which is the same leak at the one moment it matters
+  most. On Windows a `taskkill` that cannot run now falls back to `Child::kill`, and the
+  wait for the child to be reaped is bounded: previously that wait was unbounded with no
+  fallback behind it, so a `taskkill` failure hung shutdown instead of leaking.
+  `kill_on_drop` remains a partial backstop — it reaps cargo, not the service — so an
+  orchestrator panic or `SIGKILL` can still leak; normal shutdown does not.
+- ISR `ETag`s are derived with SHA-256 instead of `DefaultHasher`, whose output is
+  explicitly not stable across Rust releases. Two replicas built by different toolchains
+  derived different ETags from byte-identical HTML, so every cross-replica revalidation
+  missed. The rendered shape — `krab-` plus 16 hex characters — is unchanged.
+- `rollback_to_version` takes the migration advisory lock the forward path has always
+  taken. A rollback could otherwise interleave with another replica still migrating
+  forward, or with a second rollback, racing both the DDL and the `krab_migrations`
+  bookkeeping — exactly the rolling-deploy window the lock exists to close.
+- The split `service_users` binaries publish their target's identity to the environment
+  from `fn main()`, before the Tokio runtime is built, rather than from inside an
+  `async fn`. `std::env::set_var` mutates a process-global table that is read without
+  synchronisation, so it is only sound while the process is still single-threaded, and a
+  multi-threaded runtime has already spawned its workers. It is also why that call is
+  `unsafe` in edition 2024.
+- The frontend's hot-reload poller starts only in dev. It `stat`ed `dist/.hmr_signal`
+  every 100 ms forever, with no shutdown — roughly 864,000 syscalls a day in production
+  for a file only the dev workflow ever writes.
+- `/asset-manifest.json` publishes a real digest of the client bundle, or none at all. It
+  previously shipped a constant `sha256-demo-manifest-checksum` and `?h=6f2c1a` that
+  described no file ever built, while the browser checked only that the string began with
+  `sha256-`. When the bundle cannot be read the `integrity` field is now absent, which the
+  browser already reads as degraded. The digest is keyed on the bundle's modification time
+  and length rather than computed once per process, so a bundle rebuilt while the server
+  runs is re-hashed instead of advertising the digest of the bytes it replaced — a wrong
+  integrity value is worse than none, because the browser enforces it. When
+  `KRAB_FRONTEND_PKG_DIR` is unset the bundle is looked for next to the executable as well
+  as under `dist/pkg`. `build.rs` no longer writes the same invented digest into
+  `public/__ssg/asset-manifest.json`, which the original fix left behind.
+
+- The dev hot-reload endpoint no longer reloads the page in a loop. `/api/hmr` replayed the
+  watch channel's current value to every new subscriber and the client reloads on any
+  message, so a browser on localhost reconnected and reloaded indefinitely without a file
+  having changed. Only actual signals are sent now.
+- A void element given children no longer renders malformed markup: `<br>x</br>` is now
+  `<br/>x`, which is how a browser parses that source, instead of emitting a closing tag
+  for an element that cannot have one.
+
+- An exported `KRAB_PORT` no longer moves every service onto one port. The per-service
+  default (`3000` frontend, `3001` auth, `3002` users, `3207` users-split) is a fallback
+  used only when the variable is unset, so a single ambient value applied to all of them
+  — and because `krab.toml` pinned it for none while hardcoding the ports into every
+  health-probe URL, the failure surfaced as a **readiness-probe timeout on a service that
+  was running fine on the wrong port**, with no bind error anywhere. (`service_listening`
+  is logged before the bind is attempted, so it is not evidence of a successful bind.)
+  `KRAB_SERVICE_NAME` had the identical defect and never failed at all: every service
+  reported the same `service` field in logs, metrics, protocol selection, and migration
+  records. Both are now injected per service by the orchestrator. A service run directly
+  rather than through `krab bootstrap` still takes the ambient value.
+- `[services.X].env` keys in `krab.toml` keep the case the manifest wrote. The
+  orchestrator parsed the file with `config`, which lowercases every key it reads, so
+  `RUST_LOG = "info"` reached children as `rust_log` — invisible on Windows, whose
+  environment variables are case-insensitive, and completely inert on Linux and macOS,
+  including in containers and CI. Entries that have been silently doing nothing will
+  take effect. Parsing now uses `toml`, the same parser `krab doctor` and `krab topology
+  doctor` already apply to this file.
+- `.env.example` no longer ships `KRAB_SERVICE_NAME=krab` and `KRAB_PORT=3000`
+  uncommented. Both are per-service identity, wrong as workspace-wide defaults in a
+  four-service repo, and copied straight into `.env` by the documented first step.
+- `service_users_split` answers its API again. Its router never applied
+  `apply_common_http_layers`, which is the only thing in the workspace that inserts the
+  `AuthContext` extension both adapters extract, so `/api/v1/users/me` and
+  `/api/v1/graphql` returned `500 Internal Server Error` to every caller while `/health`
+  and `/ready` stayed green — a service the orchestrator reported healthy with its whole
+  API dead. It now carries the same governance layers as the other three reference
+  services (auth, rate limiting, CSRF, protocol resolution, request id, tracing, metrics,
+  timeout and concurrency), boots through `KrabConfig` + `serve_with_graceful_shutdown`
+  with `3207` as the default port instead of a hardcoded bind, builds its runtime state
+  with the fail-closed `RuntimeState::try_new`, and enables the `redis-store` feature so
+  `KRAB_REDIS_URL` is honoured rather than refused. Unauthenticated API calls are now
+  `401`. The conformance suite drives the real router with a minted bearer token instead
+  of hand-injecting an `AuthContext` extension, which is what let the defect ship.
+  `KRAB_PROTOCOL_ENABLED_USERS_SPLIT` also works now: `ProtocolConfig::from_env` derives
+  the `KRAB_PROTOCOL_ENABLED_<NAME>` key from `KRAB_SERVICE_NAME`, then `KRAB_SERVICE`,
+  then the literal `service` — never from a crate's own default name — so running the
+  binary directly, which sets neither, the framework looked for
+  `KRAB_PROTOCOL_ENABLED_SERVICE` and the documented key did nothing. The service now
+  applies the override under its own name, with the framework's precedence (a
+  service-local list wins over `KRAB_PROTOCOL_ENABLED`, and the default protocol stays in
+  the enabled set).
+
+- `docs/reference/security.md` no longer claims rate limiting and auth-failure
+  tracking are instance-local. They were rewritten to reflect that both counters
+  already increment through `DistributedStore::incr` — Redis-backed atomic
+  `INCR`/`EXPIRE` when `KRAB_REDIS_URL` is configured — so per-IP and
+  auth-failure limits hold across replicas sharing the same store. The caveat is
+  now stated correctly: with the default in-memory store (no Redis), each
+  process keeps its own counters, which is why `KRAB_REDIS_URL` is required for
+  multi-replica deployments. The section also now records that a shared
+  store needs both the `redis-store` feature and `KRAB_REDIS_URL`, and what the
+  runtime does when only one of the two is present. Also corrected the
+  `production_readiness.md` Phase 1, Phase 2, and Phase 3 checklists: Phase 3
+  and the Phase 1 store-integration item describe work that is already
+  implemented, while the two load-validation items stay open and annotated —
+  Phase 1's multi-replica check has only a local containerised PASS behind it,
+  never a CI run, and Phase 2's distributed cache TTL/invalidation path is
+  still unexercised under load. The document header no longer claims blanket
+  completion.
+- `krab_core::static_assets::resolve_static_pkg_path` documents that it blocks the calling
+  thread, and that async callers must wrap it in `spawn_blocking` (or use `ServeDir`).
+  Its two `canonicalize` calls are what refuse symlinks escaping the static root, so they
+  are deliberately not cached or replaced with a lexical check: the static root is commonly
+  a deploy symlink that repoints per release, and memoising it would keep serving a retired
+  release. Pinned by a new test that plants an escaping symlink and asserts refusal.
+- `KRAB_HTTP_OVERLOAD_MODE=shed` now answers `503 Service Unavailable` as documented; it
+  was returning `429 Too Many Requests`, which load balancer and alert policies keyed on
+  503 would not match.
+- `service_frontend` ISR cache keys escape `@` and `%` in the path and locale, so a request
+  path that itself contains `@` can no longer be read as a locale suffix — the multi-locale
+  poisoning the locale dimension was added to prevent. Existing cached entries miss once
+  under the new key format.
+- `krab new --template fullstack` output passes `cargo fmt --all --check`: the crate's own
+  `use` line is now emitted in sorted position rather than at a fixed offset.
+- `krab new --template fullstack` takes `krab_client` with `default-features = false`, so
+  the deprecated `demo-islands` `Counter` no longer collides with the template's own
+  `Counter` in the island registry.
+- `krab dev` builds the client with `cargo build --lib`, so a single-crate project with both
+  a `[[bin]]` and a `cdylib` no longer tries to compile its axum/tokio binary for
+  `wasm32-unknown-unknown`, and it looks for the wasm artifact under the crate name cargo
+  actually emits (`demo_fullstack.wasm`, not `demo-fullstack.wasm`).
+- `service_auth` token revocation and refresh marker persistence now fail closed with
+  `503 Service Unavailable` on store errors instead of silently swallowing failures.
+- `service_frontend` ISR cache keying and revalidation now incorporate the locale dimension,
+  preventing multi-locale cache poisoning and English revalidation overwrites.
+- `service_frontend` request-path `spawn_blocking` task failures map to 500 error responses
+  instead of panicking worker threads — in the home handlers, and, as of the release
+  review, in `/about`, `/greet` and `/blog/{slug}` too, which had the same `unwrap` at a
+  second site.
+- `KRAB_FRONTEND_DOWNSTREAM_BEARER_TOKEN` routed through `krab_core::config::read_env_or_file`.
+
+### Removed
+
+- Removed unused `SignalId` from `krab_core::signal`.
+
 ---
 
 ## [0.4.0] — 2026-08-12

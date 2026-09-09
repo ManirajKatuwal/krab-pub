@@ -1166,9 +1166,9 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "h2"
-version = "0.4.13"
+version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f44da3a8150a6703ed5d34e164b875fd14c2cdab9af1252a9a1020bde2bdc54"
+checksum = "a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -1667,7 +1667,7 @@ dependencies = [
 
 [[package]]
 name = "krab_cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1683,7 +1683,7 @@ dependencies = [
 
 [[package]]
 name = "krab_client"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "inventory",
  "js-sys",
@@ -1699,7 +1699,7 @@ dependencies = [
 
 [[package]]
 name = "krab_core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1732,7 +1732,7 @@ dependencies = [
 
 [[package]]
 name = "krab_macros"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "axum",
  "krab_core",
@@ -1747,16 +1747,16 @@ dependencies = [
 
 [[package]]
 name = "krab_orchestrator"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
- "config",
  "krab_core",
  "nix",
  "notify",
  "reqwest",
  "serde",
  "tokio",
+ "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
 ]
@@ -2543,7 +2543,7 @@ dependencies = [
 
 [[package]]
 name = "reference_app_islands_rpc"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2883,7 +2883,7 @@ dependencies = [
 
 [[package]]
 name = "service_auth"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2902,11 +2902,12 @@ dependencies = [
 
 [[package]]
 name = "service_frontend"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "bytes",
  "futures-util",
  "http-body-util",
@@ -2919,6 +2920,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "sha2",
  "tokio",
  "tokio-stream",
  "tower",
@@ -2929,7 +2931,7 @@ dependencies = [
 
 [[package]]
 name = "service_users"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-graphql",
@@ -2949,7 +2951,7 @@ dependencies = [
 
 [[package]]
 name = "service_users_split"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-graphql",
@@ -2957,13 +2959,14 @@ dependencies = [
  "async-trait",
  "axum",
  "http-body-util",
+ "jsonwebtoken",
  "krab_core",
  "serde",
  "serde_json",
+ "serial_test",
  "tokio",
  "tower",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

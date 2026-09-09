@@ -9,7 +9,7 @@ Participation in this project is governed by the
 
 ## Prerequisites
 
-1. Install stable Rust (1.75+) via [rustup](https://rustup.rs/).
+1. Install stable Rust (1.89+) via [rustup](https://rustup.rs/).
 2. Install required tools:
    ```sh
    cargo install wasm-pack        # WASM client builds

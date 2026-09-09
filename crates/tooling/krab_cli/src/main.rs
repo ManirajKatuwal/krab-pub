@@ -356,6 +356,8 @@ enum ProjectTemplate {
     EdgeSsr,
     /// Event-stream dashboard with WebSocket and SSE
     EventStream,
+    /// Full-stack SSR with WASM island hydration and server functions
+    Fullstack,
 }
 
 #[derive(Clone, ValueEnum, Debug)]

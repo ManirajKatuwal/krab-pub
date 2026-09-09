@@ -11,7 +11,7 @@ mod tests {
     use std::time::Duration;
     use tower::ServiceExt;
 
-    use crate::http::{apply_common_http_layers, RuntimeState};
+    use crate::http::{apply_common_http_layers, OverloadMode, RuntimeState};
 
     #[derive(Clone)]
     struct TestState {
@@ -55,13 +55,17 @@ mod tests {
             "KRAB_AUTH_REQUIRE_TENANT_MATCH",
             "KRAB_JWT_REQUIRE_KID",
             "KRAB_AUTH_OPEN_PATHS",
+            "KRAB_METRICS_PUBLIC",
             "KRAB_TRUST_PROXY_HEADERS",
             "KRAB_TRUSTED_PROXY_HOPS",
             "KRAB_RATE_LIMIT_CAPACITY",
             "KRAB_RATE_LIMIT_REFILL_PER_SEC",
             "KRAB_RATE_LIMIT_FAIL_OPEN",
+            "KRAB_AUTH_FAILURE_WINDOW_SECS",
+            "KRAB_AUTH_FAILURE_THRESHOLD",
             "KRAB_HTTP_REQUEST_TIMEOUT_SECS",
             "KRAB_HTTP_MAX_CONCURRENCY",
+            "KRAB_HTTP_OVERLOAD_MODE",
             "KRAB_PROTOCOL_TENANT_HINT_UNTRUSTED",
         ] {
             std::env::remove_var(key);
@@ -699,9 +703,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    /// `/metrics` sits on the default open-path list for backward
-    /// compatibility, but operators must be able to close it:
-    /// `KRAB_AUTH_OPEN_PATHS` replaces the whole list when set.
+    /// `/metrics` is closed by default, and an explicit open-path list that
+    /// omits it must keep it closed too — `KRAB_AUTH_OPEN_PATHS` replaces the
+    /// whole list when set, and only `KRAB_METRICS_PUBLIC` reopens metrics.
     #[tokio::test]
     #[serial]
     async fn test_open_paths_env_can_close_metrics() {
@@ -1022,6 +1026,120 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn test_load_shed_mode_drops_excess_requests_with_503() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+        std::env::set_var("KRAB_AUTH_OPEN_PATHS", "/slow_shed");
+        std::env::set_var("KRAB_HTTP_MAX_CONCURRENCY", "1");
+        std::env::set_var("KRAB_HTTP_OVERLOAD_MODE", "shed");
+
+        let entered = Arc::new(Notify::new());
+        let entered_clone = entered.clone();
+        let release = Arc::new(Notify::new());
+        let release_clone = release.clone();
+
+        let state = TestState {
+            runtime: RuntimeState::new(),
+        };
+        let app = apply_common_http_layers(
+            Router::new().route(
+                "/slow_shed",
+                axum::routing::get(move || {
+                    let entered = entered_clone.clone();
+                    let release = release_clone.clone();
+                    async move {
+                        entered.notify_one();
+                        release.notified().await;
+                        "done"
+                    }
+                }),
+            ),
+            state.clone(),
+        )
+        .with_state(state);
+
+        let notify_enter_wait = entered.notified();
+        let app1 = app.clone();
+        let handle1 = tokio::spawn(async move {
+            app1.oneshot(
+                Request::builder()
+                    .uri("/slow_shed")
+                    .header("x-forwarded-for", "10.10.0.65")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        });
+
+        // Wait until request 1 is holding the single permit inside the handler
+        notify_enter_wait.await;
+
+        let app2 = app.clone();
+        let res2 = app2
+            .oneshot(
+                Request::builder()
+                    .uri("/slow_shed")
+                    .header("x-forwarded-for", "10.10.0.66")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Release request 1
+        release.notify_one();
+        let res1 = handle1.await.unwrap();
+
+        assert_eq!(res1.status(), StatusCode::OK);
+        // 503 and not 429: shed mode reports that the *service* is out of
+        // capacity, which is what `.env.example` and
+        // `docs/reference/environment.md` promise and what LB and alert
+        // policies match on. `KRAB_HTTP_OVERLOAD_MODE` is cleared by
+        // `reset_auth_env`, so a failure here cannot leak shed mode into the
+        // serial tests that follow.
+        assert_eq!(res2.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    #[serial]
+    fn test_overload_mode_env_is_trimmed_and_validated() {
+        let _guard = env_lock();
+        reset_auth_env();
+
+        assert_eq!(crate::http::overload_mode_from_env(), OverloadMode::Queue);
+
+        for raw in ["shed", " shed ", "SHED", "\t Shed\n"] {
+            std::env::set_var("KRAB_HTTP_OVERLOAD_MODE", raw);
+            assert_eq!(
+                crate::http::overload_mode_from_env(),
+                OverloadMode::Shed,
+                "{raw:?} must select shed mode"
+            );
+        }
+
+        // Unknown values fall back to queue rather than to shed: a typo must
+        // not turn shedding on, and it must not turn it off silently either —
+        // the fallback logs `env_value_invalid_using_default`.
+        for raw in ["queue", " ", "", "sched", "drop"] {
+            std::env::set_var("KRAB_HTTP_OVERLOAD_MODE", raw);
+            assert_eq!(
+                crate::http::overload_mode_from_env(),
+                OverloadMode::Queue,
+                "{raw:?} must fall back to queue mode"
+            );
+        }
+
+        reset_auth_env();
+    }
+
     /// The JWT verifier cache is built once per `RuntimeState`: rotating the
     /// env secret mid-flight must not affect an existing state (no
     /// per-request provider reload), while a freshly built state picks up
@@ -1093,28 +1211,152 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// Metrics used to be on the default open-path list, so an unconfigured
+    /// service published its route inventory, traffic shape, error counts and
+    /// latency histograms to anyone who asked. The default is now closed.
     #[tokio::test]
     #[serial]
-    async fn test_metrics_stays_open_by_default() {
+    async fn test_metrics_requires_auth_by_default() {
         let _guard = env_lock();
         reset_auth_env();
         std::env::set_var("KRAB_AUTH_MODE", "jwt");
         std::env::set_var("KRAB_JWT_SECRET", "secret");
 
-        let app = test_app();
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/metrics")
-                    .header("x-forwarded-for", "10.10.0.51")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        for uri in ["/metrics", "/metrics/prometheus"] {
+            let app = test_app();
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("x-forwarded-for", "10.10.0.51")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
 
-        // The test router has no /metrics route; the point is that the auth
-        // layer passes the request through (404 from routing, not 401).
-        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{uri} must not be anonymously reachable without an explicit opt-in"
+            );
+        }
+    }
+
+    /// The documented single-step restore for anyone scraping the old default.
+    #[tokio::test]
+    #[serial]
+    async fn test_metrics_public_env_restores_anonymous_scraping() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+        std::env::set_var("KRAB_METRICS_PUBLIC", "true");
+
+        for uri in ["/metrics", "/metrics/prometheus"] {
+            let app = test_app();
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("x-forwarded-for", "10.10.0.52")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            // The test router has no metrics route; the point is that the auth
+            // layer passes the request through (404 from routing, not 401).
+            assert_ne!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "KRAB_METRICS_PUBLIC=true must reopen {uri}"
+            );
+        }
+
+        std::env::remove_var("KRAB_METRICS_PUBLIC");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_auth_failure_threshold_env_is_configurable() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+        // Pin the window well beyond the test's runtime. With the 60s default
+        // an epoch boundary between the 3rd and 4th request would reset the
+        // counter and flip the 429 assertion below to 401.
+        std::env::set_var("KRAB_AUTH_FAILURE_WINDOW_SECS", "3600");
+        std::env::set_var("KRAB_AUTH_FAILURE_THRESHOLD", "3");
+
+        let app = test_app();
+
+        let make_req = |ip: &str| {
+            Request::builder()
+                .uri("/protected")
+                .header("Authorization", "Bearer invalid-token")
+                .header("x-forwarded-for", ip)
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // First 3 failures from 10.10.0.1 return 401 (accumulating up to threshold).
+        for _ in 0..3 {
+            let res = app.clone().oneshot(make_req("10.10.0.1")).await.unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // 4th failure exceeds threshold (3) -> returns 429 Too Many Requests.
+        let res = app.clone().oneshot(make_req("10.10.0.1")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // A different client IP has not reached the threshold and still gets 401.
+        let res = app.clone().oneshot(make_req("10.10.0.2")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        std::env::remove_var("KRAB_AUTH_FAILURE_WINDOW_SECS");
+        std::env::remove_var("KRAB_AUTH_FAILURE_THRESHOLD");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_auth_failure_window_rolls_over() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+        std::env::set_var("KRAB_AUTH_FAILURE_WINDOW_SECS", "2");
+        std::env::set_var("KRAB_AUTH_FAILURE_THRESHOLD", "1");
+
+        let app = test_app();
+
+        let make_req = || {
+            Request::builder()
+                .uri("/protected")
+                .header("Authorization", "Bearer invalid-token")
+                .header("x-forwarded-for", "10.10.0.3")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // 1st failure -> 401 (threshold is 1)
+        let res = app.clone().oneshot(make_req()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // 2nd failure immediately -> 429 (count is 2 > threshold 1)
+        let res = app.clone().oneshot(make_req()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Sleep longer than the 2-second window duration to ensure epoch rollover.
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+
+        // After window rollover, a new window counter starts -> 401.
+        let res = app.clone().oneshot(make_req()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        std::env::remove_var("KRAB_AUTH_FAILURE_WINDOW_SECS");
+        std::env::remove_var("KRAB_AUTH_FAILURE_THRESHOLD");
     }
 }

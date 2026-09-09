@@ -28,6 +28,7 @@ This document is the public API contract for currently exposed HTTP and GraphQL 
 | `CONFLICT` | 409 |
 | `TOO_MANY_REQUESTS` | 429 |
 | `PROTOCOL_NOT_SUPPORTED` | 400 |
+| `SERVICE_OVERLOADED` | 503 |
 | `INTERNAL_SERVER_ERROR` | 500 |
 
 The error envelope also carries a machine-readable `category`. As of **0.3.0**
@@ -39,6 +40,18 @@ strings. Two consequences for clients on the 0.2.x → 0.3.0 upgrade:
   **403**; use the `unauthenticated` category (401) for authentication failures.
 - A `code=TOO_MANY_REQUESTS` under any category other than `rate_limited` no
   longer forces **429**; rate limiting now uses the `rate_limited` category.
+
+As of **0.5.0** `ErrorCategory` is `#[non_exhaustive]`. A Rust client that
+matches on it needs a wildcard arm; in exchange, every future category is a
+non-breaking addition. This is a one-time cost taken in the same release that
+adds `unavailable`, rather than a cost repeated on each new category.
+
+As of **0.5.0** the category set gains `unavailable` (503), used for
+`SERVICE_OVERLOADED` when `KRAB_HTTP_OVERLOAD_MODE=shed` drops a request the
+service has no capacity for. It is deliberately distinct from `rate_limited`
+(429), which says the *caller* asked for too much; load balancer and alerting
+policies that retry or fail over on 503 need the difference. Clients that match
+exhaustively on `category` gain one variant.
 
 A request to a route family whose protocol is disabled by configuration returns
 **400 `PROTOCOL_NOT_SUPPORTED`** (previously it reached the handler). Requests
@@ -53,8 +66,39 @@ All services expose:
 |---|---|---|
 | `GET` | `/health` | Liveness check |
 | `GET` | `/ready` | Readiness check |
-| `GET` | `/metrics` | JSON metrics snapshot |
-| `GET` | `/metrics/prometheus` | Prometheus metrics format |
+| `GET` | `/metrics` | JSON metrics snapshot — **requires auth** unless `KRAB_METRICS_PUBLIC=true` |
+| `GET` | `/metrics/prometheus` | Prometheus metrics format — **requires auth** unless `KRAB_METRICS_PUBLIC=true` |
+
+As of **0.5.0** the two metrics endpoints are no longer anonymous by default: a
+route inventory with per-route volumes, error counts and latency histograms is
+reconnaissance, and on a low-traffic service enough to infer individual user
+activity. Scrapers must authenticate, or the operator opts back in with
+`KRAB_METRICS_PUBLIC=true` (see
+[`environment.md`](environment.md)). `/health` and `/ready` are unchanged and
+remain anonymous.
+
+### Service identity and ports
+
+The base URLs in the sections below are declared, not ambient. As of **0.5.0**
+the orchestrator owns each service's identity: `[services.X].port` and
+`[services.X].service_name` in `krab.toml` are injected into the child as
+`KRAB_PORT` and `KRAB_SERVICE_NAME` at spawn, above the inherited environment
+and below explicit `[services.X].env` entries. Previously an ambient `KRAB_PORT`
+moved every service onto one port, and the failure surfaced as a readiness-probe
+timeout rather than a bind error. See
+[ADR 0012](../adr/0012-orchestrator-owns-service-identity.md).
+
+Three consequences for a deployment upgrading from 0.4.0:
+
+- `service_name` defaults to the `[services.<key>]` table key, so the `service`
+  label on log lines and on the metrics this document exposes follows the
+  manifest key unless the field is declared.
+- Two services declaring the same `port`, two resolving to the same
+  `service_name`, or a `port` outside 1-65535 are startup errors, reported by
+  name before anything is spawned. `krab topology doctor` reports the same
+  statically.
+- The orchestrator reads `krab.toml` only; `krab.yaml` and `krab.json` were
+  previously accepted incidentally.
 
 `GET /ready` returns readiness and dependency state, for example:
 
@@ -294,6 +338,26 @@ after first paint:
 A bundle built without `krab_client`'s `web` feature exports the same names and
 does nothing. See [Hydration](../architecture/hydration.md#building-a-bundle-that-hydrates).
 
+As of **0.5.0** the streaming writer in `krab_core::render_stream` is not compiled
+for `wasm32`. A crate that names it in code built for `wasm32-unknown-unknown`
+no longer compiles;
+native targets are unchanged.
+
+The streaming half could not have worked there: streaming SSR has no client half
+([ADR 0009](../adr/0009-resource-ssr-semantics.md)), nothing in `krab_client`
+consumes the `<!--krab:suspense:*-->` markers, and `ChunkedStreamWriter` timed
+its flushes with a bare `std::time::Instant`, which compiles on that target and
+panics on first use — so any browser call into it was already a guaranteed
+runtime panic.
+
+The gate is on the writer, not the module. `SuspenseMarker::parse`,
+`SuspenseState` and `is_finalized_ssr_snapshot` are pure string parsing, worked
+on `wasm32` in `0.4.0`, and remain available there at the same paths — including
+`is_finalized_ssr_snapshot`, the replacement for the deprecated `SuspenseMarker`.
+What is gone from `wasm32` is `ChunkedStreamWriter`, `FinishedStream`,
+`StreamTelemetry` and `render_to_chunk_stream`. Callers sharing a crate across
+both targets gate those imports with `#[cfg(not(target_arch = "wasm32"))]`.
+
 ### Client-side navigation requests
 
 When `start_router()` handles a link click or a Back/Forward, it fetches the
@@ -318,3 +382,27 @@ contract as any other `GET` on the route.
 - REST routes are versioned by path prefix: `/api/v1/...`
 - GraphQL versioning is schema-driven
 - Breaking changes require migration guidance and release notes in [`CHANGELOG.md`](../../CHANGELOG.md)
+
+### Rust API deprecations
+
+| Item | Deprecated in | Removed in | Replacement |
+|---|---|---|---|
+| `krab_core::db::postgres::run_migrations` | 0.5.0 | 0.6.0 | `krab_core::db::postgres::run_versioned_migrations` |
+| `krab_client` feature `demo-islands` (`Counter`, `Toggle`, `Likes`) | 0.4.0 | 0.6.0 | Define islands in your own crate with `#[island]` |
+| `krab_core::render_stream::SuspenseMarker` | 0.5.0 | 0.6.0 | `krab_core::render_stream::is_finalized_ssr_snapshot` |
+
+`run_migrations` only ever applied one bootstrap migration creating a
+`_krab_migrations` table that nothing in the framework reads; the real ledger,
+checksums, rollback SQL and failure policy all belong to
+`run_versioned_migrations`. Callers should pass their own `&[Migration]` slice
+and a `MigrationFailurePolicy`. See
+[`database.md`](database.md) for the migration contract.
+
+`SuspenseMarker` only ever parsed the `<!--krab:suspense:{id}:{state}-->`
+markers emitted by server-side streaming.
+[ADR 0009](../adr/0009-resource-ssr-semantics.md) records streaming as having no
+client half, so nothing in the browser consumes those markers and there is no
+stable meaning for a downstream crate to build on the parsed form. The one real
+use — deciding whether a rendered snapshot has every boundary resolved and is
+therefore safe to cache — is now `is_finalized_ssr_snapshot`, which takes the
+rendered HTML and returns a `bool`.

@@ -35,7 +35,10 @@ impl ProtocolAwareClient {
         let use_gateway_external_mode = bool_env("KRAB_PROTOCOL_EXTERNAL_MODE", false);
         let gateway_base_url = env_trimmed("KRAB_PROTOCOL_GATEWAY_BASE_URL")
             .map(|v| v.trim_end_matches('/').to_string());
-        let downstream_bearer_token = env_trimmed("KRAB_FRONTEND_DOWNSTREAM_BEARER_TOKEN");
+        let downstream_bearer_token =
+            krab_core::config::read_env_or_file("KRAB_FRONTEND_DOWNSTREAM_BEARER_TOKEN")
+                .ok()
+                .flatten();
 
         Ok(Self {
             http,
