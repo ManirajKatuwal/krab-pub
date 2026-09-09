@@ -77,6 +77,29 @@ activity. Scrapers must authenticate, or the operator opts back in with
 [`environment.md`](environment.md)). `/health` and `/ready` are unchanged and
 remain anonymous.
 
+### Service identity and ports
+
+The base URLs in the sections below are declared, not ambient. As of **0.5.0**
+the orchestrator owns each service's identity: `[services.X].port` and
+`[services.X].service_name` in `krab.toml` are injected into the child as
+`KRAB_PORT` and `KRAB_SERVICE_NAME` at spawn, above the inherited environment
+and below explicit `[services.X].env` entries. Previously an ambient `KRAB_PORT`
+moved every service onto one port, and the failure surfaced as a readiness-probe
+timeout rather than a bind error. See
+[ADR 0012](../adr/0012-orchestrator-owns-service-identity.md).
+
+Three consequences for a deployment upgrading from 0.4.0:
+
+- `service_name` defaults to the `[services.<key>]` table key, so the `service`
+  label on log lines and on the metrics this document exposes follows the
+  manifest key unless the field is declared.
+- Two services declaring the same `port`, two resolving to the same
+  `service_name`, or a `port` outside 1-65535 are startup errors, reported by
+  name before anything is spawned. `krab topology doctor` reports the same
+  statically.
+- The orchestrator reads `krab.toml` only; `krab.yaml` and `krab.json` were
+  previously accepted incidentally.
+
 `GET /ready` returns readiness and dependency state, for example:
 
 ```json
@@ -314,6 +337,26 @@ after first paint:
 
 A bundle built without `krab_client`'s `web` feature exports the same names and
 does nothing. See [Hydration](../architecture/hydration.md#building-a-bundle-that-hydrates).
+
+As of **0.5.0** the streaming writer in `krab_core::render_stream` is not compiled
+for `wasm32`. A crate that names it in code built for `wasm32-unknown-unknown`
+no longer compiles;
+native targets are unchanged.
+
+The streaming half could not have worked there: streaming SSR has no client half
+([ADR 0009](../adr/0009-resource-ssr-semantics.md)), nothing in `krab_client`
+consumes the `<!--krab:suspense:*-->` markers, and `ChunkedStreamWriter` timed
+its flushes with a bare `std::time::Instant`, which compiles on that target and
+panics on first use — so any browser call into it was already a guaranteed
+runtime panic.
+
+The gate is on the writer, not the module. `SuspenseMarker::parse`,
+`SuspenseState` and `is_finalized_ssr_snapshot` are pure string parsing, worked
+on `wasm32` in `0.4.0`, and remain available there at the same paths — including
+`is_finalized_ssr_snapshot`, the replacement for the deprecated `SuspenseMarker`.
+What is gone from `wasm32` is `ChunkedStreamWriter`, `FinishedStream`,
+`StreamTelemetry` and `render_to_chunk_stream`. Callers sharing a crate across
+both targets gate those imports with `#[cfg(not(target_arch = "wasm32"))]`.
 
 ### Client-side navigation requests
 

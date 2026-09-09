@@ -17,7 +17,7 @@ signatures.
 
 ```toml
 [dependencies]
-krab_macros = "0.1"
+krab_macros = "0.5"
 ```
 
 ## Documentation

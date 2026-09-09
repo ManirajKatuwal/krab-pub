@@ -43,16 +43,14 @@ pub mod isr;
 pub mod layout;
 pub mod protocol;
 pub mod render_policy;
-// Server-side: streaming SSR assembles the response body before it ever
-// reaches a browser, and `ChunkedStreamWriter` times its flushes with
-// `std::time::Instant`. On `wasm32-unknown-unknown` that clock has no
-// implementation and `Instant::now()` panics at runtime rather than failing to
-// compile — so an ungated `pub mod` here shipped a live panic into the island
-// bundle, reachable the moment anything constructed a writer. It is also dead
-// payload: ADR 0009 records that streaming has no client half, and nothing in
-// `krab_client` consumes the `<!--krab:suspense:*-->` markers. Gated alongside
-// `isr`, `ws`, and `telemetry` for the same reason.
-#[cfg(not(target_arch = "wasm32"))]
+// Compiled on every target, but only half of it: the suspense-marker parsing
+// (`SuspenseMarker`, `SuspenseState`, `is_finalized_ssr_snapshot`) is plain
+// string handling and was reachable from `wasm32` in 0.4.0. The streaming
+// writer is gated *inside* the module — `ChunkedStreamWriter` times its
+// flushes with `std::time::Instant`, which on `wasm32-unknown-unknown` compiles
+// and then panics at runtime, and ADR 0009 records that streaming has no client
+// half. Gating the whole `pub mod` here, as 0.5.0 first did, would have taken
+// the parser off the browser with the writer and broken code that worked.
 pub mod render_stream;
 pub mod resilience;
 pub mod service_contract;

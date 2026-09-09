@@ -29,10 +29,10 @@ whichever features you need, then pick between them with `KRAB_DB_DRIVER`:
 
 ```toml
 # Postgres only — the usual production choice
-krab_core = { version = "0.4.0", features = ["db-postgres"] }
+krab_core = { version = "0.5.0", features = ["db-postgres"] }
 
 # Both, selected per environment
-krab_core = { version = "0.4.0", features = ["db-postgres", "db-sqlite"] }
+krab_core = { version = "0.5.0", features = ["db-postgres", "db-sqlite"] }
 ```
 
 > **`db` is a deprecated alias for `db-postgres`.** It is kept for one minor

@@ -25,10 +25,10 @@ resolver = "2"
 # either this or the current version. `release: X` bumps
 # `[workspace.package] version` to this value and moves this one forward.
 [workspace.metadata.krab]
-next_version = "0.5.0"
+next_version = "0.6.0"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
@@ -54,8 +54,8 @@ categories = ["web-programming", "wasm", "development-tools"]
 # NOTE: these entries are for *normal* dependencies only. `krab_core` and
 # `krab_macros` dev-depend on each other; see the comments at those two sites
 # for why those must stay path-only.
-krab_core = { version = "0.4.0", path = "crates/framework/krab_core" }
-krab_macros = { version = "0.4.0", path = "crates/framework/krab_macros" }
+krab_core = { version = "0.5.0", path = "crates/framework/krab_core" }
+krab_macros = { version = "0.5.0", path = "crates/framework/krab_macros" }
 #
 # `krab_client` carries `default-features = false` here, and members opt back
 # in. Its defaults are `web` + `demo-islands`, and `web` decides which half of
@@ -66,7 +66,7 @@ krab_macros = { version = "0.4.0", path = "crates/framework/krab_macros" }
 # dependency unless the workspace entry sets it too, warning
 # "`default-features` is ignored for krab_client ... this could become a hard
 # error in the future" — so the opt-out has to live here.
-krab_client = { version = "0.4.0", path = "crates/framework/krab_client", default-features = false }
+krab_client = { version = "0.5.0", path = "crates/framework/krab_client", default-features = false }
 
 axum = "=0.8.8"
 async-graphql = "=7.2.1"

@@ -15,10 +15,12 @@ It is a **Cargo workspace**, not an application. Changes here affect downstream
 framework consumers, so API surface and governance artifacts matter as much as
 the code.
 
-- Version: `0.4.0` (workspace-wide, `[workspace.package]` in `Cargo.toml`; see
-  `docs/operations/release_0_4_0_checklist.md`). Published to crates.io. Note
+- Version: `0.5.0` (workspace-wide, `[workspace.package]` in `Cargo.toml`; see
+  `docs/operations/release_0_5_0_checklist.md`). Published to crates.io. Note
   that `0.3.0` was tagged and released on GitHub but never reached the registry,
   so crates.io goes `0.2.0` → `0.4.0` — the missing number is deliberate.
+  `[workspace.metadata.krab] next_version` must always be one ahead of
+  `version`; `scripts/check_workspace_layout.py` fails the build otherwise.
 - Edition: 2021, Rust stable 1.75+
 - License: MIT
 

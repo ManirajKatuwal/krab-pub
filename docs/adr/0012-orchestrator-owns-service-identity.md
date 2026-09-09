@@ -3,7 +3,12 @@
 ## Status
 
 **Accepted** — 2026-09-07, by the repository owner. Implemented in the same
-change (0.4.x).
+change, released in `0.5.0`.
+
+> Corrected 2026-09-09: this line said "0.4.x". The decision and its reasoning
+> are unchanged — only the release number was wrong, having been written while
+> the change sat unreleased on `main`. `0.4.0` shipped 2026-08-12, before this
+> ADR existed.
 
 ## Context
 

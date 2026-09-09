@@ -56,7 +56,8 @@ choose Krab at all, read [Why Krab](guides/why_krab.md) first.
 | [db_rollback_runbook.md](operations/db_rollback_runbook.md) | Database rollback and disaster recovery |
 | [slo_alerts.md](operations/slo_alerts.md) | Service Level Objectives and burn-rate alerts |
 | [api_governance.md](operations/api_governance.md) | API versioning, schema, and change policy |
-| [release_0_4_0_checklist.md](operations/release_0_4_0_checklist.md) | Release checklist for 0.4.0 — the current release |
+| [release_0_5_0_checklist.md](operations/release_0_5_0_checklist.md) | Release checklist for 0.5.0 — the current release |
+| [release_0_4_0_checklist.md](operations/release_0_4_0_checklist.md) | Release checklist for 0.4.0 — the crates.io reconciliation release, kept for reference |
 | [release_0_2_0_checklist.md](operations/release_0_2_0_checklist.md) | Release checklist for 0.2.0 — the first public release, kept for reference |
 
 ## Decision records

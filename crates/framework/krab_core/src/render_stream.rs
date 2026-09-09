@@ -1,15 +1,29 @@
 //! Chunked streaming SSR: byte-budgeted output, suspense-boundary markers,
 //! and flush timing.
 //!
-//! Server-only — the module is `#[cfg(not(target_arch = "wasm32"))]` at its
-//! declaration in `lib.rs`. The `Instant` below is the reason it has to be:
-//! `Instant::now()` compiles for `wasm32-unknown-unknown` but panics when
-//! called, so keeping the clock means keeping the module off that target.
-//! Anything added here may assume a server clock and a server allocator;
-//! nothing here may be reached from the browser bundle.
+//! Two halves, gated differently:
+//!
+//! - The **marker vocabulary** — [`SuspenseState`], [`SuspenseMarker`] and
+//!   [`is_finalized_ssr_snapshot`] — is pure string parsing and compiles on
+//!   every target. It was reachable from `wasm32` in `0.4.0`, when this module
+//!   was exported unconditionally, and it stays reachable: a browser-side crate
+//!   that parses `<!--krab:suspense:*-->` markers keeps compiling.
+//! - The **streaming writer** — everything from [`StreamTelemetry`] down — is
+//!   `#[cfg(not(target_arch = "wasm32"))]`. `ChunkedStreamWriter` times its
+//!   flushes with `std::time::Instant`, and `Instant::now()` compiles for
+//!   `wasm32-unknown-unknown` but panics when called, so an ungated writer
+//!   shipped a live panic into the island bundle. It is also dead payload there:
+//!   ADR 0009 records that streaming has no client half.
+//!
+//! The gate used to sit on the `pub mod` in `lib.rs`, which took the parsing
+//! half off `wasm32` along with the writer and turned a dead-code removal into
+//! a breaking change for anyone parsing markers in the browser. Anything added
+//! below the writer's gate may assume a server clock; anything above it may not.
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::Render;
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
 /// Lifecycle state of a streaming SSR suspense boundary.
@@ -27,6 +41,8 @@ pub enum SuspenseState {
 }
 
 impl SuspenseState {
+    // Only the writer serialises states; on `wasm32` there is no writer.
+    #[cfg(not(target_arch = "wasm32"))]
     fn as_str(self) -> &'static str {
         match self {
             SuspenseState::Pending => "pending",
@@ -141,6 +157,7 @@ pub fn is_finalized_ssr_snapshot(html: &str) -> bool {
 
 /// Streaming SSR telemetry snapshot for performance budgets and regressions.
 #[derive(Debug, Clone)]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct StreamTelemetry {
     pub ttfb_ms: Option<u128>,
     pub first_visible_chunk_ms: Option<u128>,
@@ -162,6 +179,7 @@ pub struct StreamTelemetry {
 /// callers can tell a complete render apart from one that was truncated by
 /// the byte budget or cancelled mid-flight.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct FinishedStream {
     /// Emitted chunks, in order.
     pub chunks: Vec<String>,
@@ -171,6 +189,7 @@ pub struct FinishedStream {
     pub cancelled: bool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl FinishedStream {
     /// Emitted chunks, in order.
     pub fn chunks(&self) -> &[String] {
@@ -204,6 +223,7 @@ impl FinishedStream {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct ChunkedStreamWriter {
     chunk_size: usize,
     flush_threshold: usize,
@@ -222,12 +242,14 @@ pub struct ChunkedStreamWriter {
     cancel_reason: Option<String>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Default for ChunkedStreamWriter {
     fn default() -> Self {
         Self::new(1024, 4096)
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl ChunkedStreamWriter {
     pub fn new(chunk_size: usize, flush_threshold: usize) -> Self {
         Self {
@@ -415,10 +437,12 @@ impl ChunkedStreamWriter {
 
 /// Render into the chunk stream. Returns `true` if the rendered output was
 /// accepted, `false` if it was dropped (budget exceeded or stream cancelled).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn render_to_chunk_stream(renderable: &impl Render, writer: &mut ChunkedStreamWriter) -> bool {
     writer.write(&renderable.render())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn nearest_char_boundary(s: &str, target: usize) -> usize {
     if target >= s.len() {
         return s.len();
@@ -430,7 +454,9 @@ fn nearest_char_boundary(s: &str, target: usize) -> usize {
     i
 }
 
-#[cfg(test)]
+// The writer tests need the server clock; the marker tests could run anywhere
+// but `krab_core` has no `wasm32` test runner, so one gate covers both.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use crate::{annotate_hydration_tree, Element, Node};

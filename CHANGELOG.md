@@ -16,6 +16,29 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.5.0] — 2026-09-09
+
+Security and correctness release. Three changes are breaking: metrics are no
+longer anonymously readable by default, the orchestrator owns each service's
+port and name, and `render_stream`'s streaming writer is no longer compiled for
+`wasm32`. See
+[the migration guide](docs/guides/migration_guide.md) before upgrading a running
+deployment.
+
+All three ship without the prior-release deprecation notice
+[`RELEASE_POLICY.md`](RELEASE_POLICY.md) §"Breaking Change Policy" asks for, and
+that is deliberate rather than an oversight. Metrics closing is a security fix,
+so a deprecation minor would have meant another release with every deployment's
+route inventory and traffic shape anonymously readable. The orchestrator change
+fixed a live defect — every service reporting the same `service` label, and a
+single ambient `KRAB_PORT` moving all of them onto one port. The `render_stream`
+writer on `wasm32` had nothing to deprecate: any call there was already a
+guaranteed runtime panic, and the marker parser that did work there stays
+available. Migration guidance, the requirement that was met, is in
+[`docs/reference/api.md`](docs/reference/api.md) for each.
+
 ### Added
 
 - `KRAB_FRONTEND_PKG_DIR` (default: `dist/pkg`): the directory holding the built
@@ -106,11 +129,17 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
   `KRAB_AUTH_OPEN_PATHS`, which *replaces* the baseline list rather than extending it, so
   reopening metrics no longer means restating every other default. The bundled
   `docker-compose.yml` sets it for the local monitoring stack.
-- **Breaking on `wasm32` only:** `krab_core::render_stream` is no longer compiled for
-  `wasm32`. It was reaching the browser bundle with a bare `std::time::Instant`, which
-  compiles there and panics at runtime, and streaming SSR has no client half
-  (see [ADR 0009](docs/adr/0009-resource-ssr-semantics.md)). Native targets are unchanged;
-  no working browser code can break, since any call was already a guaranteed panic.
+- **Breaking on `wasm32` only, for the streaming writer:** `ChunkedStreamWriter`,
+  `FinishedStream`, `StreamTelemetry` and `render_to_chunk_stream` are no longer compiled
+  for `wasm32`. The writer was reaching the browser bundle with a bare
+  `std::time::Instant`, which compiles there and panics at runtime, and streaming SSR
+  has no client half (see [ADR 0009](docs/adr/0009-resource-ssr-semantics.md)). Any
+  browser call into it was already a guaranteed panic, so nothing that worked stops
+  working. The gate sits **inside** the module, not on it: `SuspenseMarker`,
+  `SuspenseState` and `is_finalized_ssr_snapshot` are pure string parsing, worked on
+  `wasm32` in `0.4.0`, and still compile there at the same paths. An earlier cut of this
+  release gated the whole module and would have broken browser-side marker parsing
+  while claiming nothing could break; the review caught it before the tag.
 - **Breaking:** `krab_core::http::ErrorCategory` is now `#[non_exhaustive]`. Rust callers
   that `match` on a category need a wildcard arm. Taken in the same release as the
   `Unavailable` addition so that every future category is a non-breaking addition;

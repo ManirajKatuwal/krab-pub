@@ -54,7 +54,7 @@ the `/api/v1/auth/*` endpoints a caller needs before it holds a token,
 - **The metrics endpoints are not on the baseline list.** `/metrics` and
   `/metrics/prometheus` require auth unless `KRAB_METRICS_PUBLIC=true`, which is
   additive over `KRAB_AUTH_OPEN_PATHS` — reopening metrics does not mean
-  restating every other open path. They were open by default before `0.4.0`,
+  restating every other open path. They were open by default through `0.4.0`,
   which handed anonymous callers a service's full route inventory, request
   volumes, error counts and latency distributions; on a low-traffic service,
   per-route timing is enough to infer individual user activity. Prefer

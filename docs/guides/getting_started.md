@@ -163,8 +163,8 @@ The `default` template is server-only, so this part needs three additions.
    crate-type = ["cdylib", "rlib"]
 
    [target.'cfg(target_arch = "wasm32")'.dependencies]
-   krab_core   = { version = "0.2", features = ["web"] }
-   krab_client = { version = "0.2", features = ["web"] }
+   krab_core   = { version = "0.5", features = ["web"] }
+   krab_client = { version = "0.5", features = ["web"] }
    inventory   = "0.3"
    wasm-bindgen = "0.2"
 
