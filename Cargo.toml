@@ -30,7 +30,7 @@ next_version = "0.6.0"
 [workspace.package]
 version = "0.5.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.89"
 license = "MIT"
 authors = ["Maniraj Katuwal"]
 description = "A full-stack rust web framework"

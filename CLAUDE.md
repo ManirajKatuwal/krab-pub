@@ -21,7 +21,9 @@ the code.
   so crates.io goes `0.2.0` → `0.4.0` — the missing number is deliberate.
   `[workspace.metadata.krab] next_version` must always be one ahead of
   `version`; `scripts/check_workspace_layout.py` fails the build otherwise.
-- Edition: 2021, Rust stable 1.75+
+- Edition: 2021, Rust stable 1.89+ (`rust-version` in `Cargo.toml` is the
+  measured floor of the resolved graph — `async-graphql` 7.2 and `time` 0.3.47 —
+  not a Krab choice; it said 1.75 through 0.4.0 and was never true)
 - License: MIT
 
 ---

@@ -6,7 +6,7 @@ an island, and calls a server function.
 Every command here was run against this version of the framework. Where a step
 has a sharp edge, it is called out rather than left for you to hit.
 
-**Prerequisites:** Rust stable 1.75+ ([rustup.rs](https://rustup.rs/)).
+**Prerequisites:** Rust stable 1.89+ ([rustup.rs](https://rustup.rs/)).
 
 ---
 

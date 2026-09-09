@@ -150,12 +150,12 @@ impl ServerFnError {
     /// `#[server]` handlers use this rather than formatting the deserializer's
     /// message directly. Serde's diagnostics mix two kinds of information:
     ///
-    /// - **Schema facts**, which the caller needs and which are safe to return —
-    ///   `missing field \`excited\``, `expected one of \`a\`, \`b\``, the
-    ///   expected type, the line and column.
-    /// - **Submitted values**, which must not come back — `invalid type: string
-    ///   "hunter2"` and `unknown variant \`hunter2\`` both quote what the caller
-    ///   sent. A rejected body routinely carries the very credential that made
+    /// - **Schema facts**, which the caller needs and which are safe to return:
+    ///   the field name in a "missing field" error, the permitted set in an
+    ///   "expected one of" list, the expected type, the line and column.
+    /// - **Submitted values**, which must not come back: the quoted string in an
+    ///   "invalid type: string" error, the backticked token in "unknown variant"
+    ///   or "integer" errors — all of them quote what the caller sent. A rejected body routinely carries the very credential that made
     ///   it invalid, and error responses are among the most heavily logged
     ///   objects in a stack, so returning one writes it to every log that
     ///   touches the response.
@@ -173,37 +173,66 @@ impl ServerFnError {
 
 /// Strip caller-supplied values out of a serde diagnostic, keeping schema facts.
 ///
-/// Two shapes carry values, and each needs different handling:
+/// Serde spells a submitted value in exactly two ways, and both are handled:
 ///
-/// - Double-quoted spans (`invalid type: string "hunter2"`) — the quoted text is
-///   always the submitted value.
-/// - `unknown variant \`x\`` / `unknown field \`x\`` — the first backticked token
-///   is submitted, while every later one (`expected one of ...`) is schema.
-///   `missing field \`x\`` is the opposite: that token is schema, and keeping it
-///   is the whole point.
+/// - **Double-quoted**, for strings: `invalid type: string "hunter2"`. The
+///   quoted span is a `{:?}` rendering, so a `"` inside the value arrives as
+///   `\"` — a scanner that closes on the first `"` would emit the tail of the
+///   secret verbatim. Backslash escapes are honoured.
+/// - **Backticked after a type word**, for everything else — the serde forms
+///   "integer", "boolean", "floating point" and "character", each followed by
+///   the value in backticks — and the enum/field forms "unknown variant" and
+///   "unknown field", followed by the caller's token. Only the token after one
+///   of those prefixes is submitted; "missing field" and "expected one of" are
+///   followed by schema names, and keeping those is the point.
+///
+/// The first cut handled quoted strings and the two enum/field prefixes only,
+/// which redacted a mistyped password but returned a mistyped PIN.
 pub fn redact_submitted_values(message: &str) -> String {
     const REDACTED: &str = "<redacted>";
+    // Every serde `Unexpected` variant that carries a value renders as the
+    // type word followed by the value in backticks; the field/variant errors
+    // do the same with a caller-supplied name. Anything else backticked in a
+    // serde message is schema.
+    const VALUE_PREFIXES: [&str; 6] = [
+        "unknown variant `",
+        "unknown field `",
+        "integer `",
+        "boolean `",
+        "floating point `",
+        "character `",
+    ];
 
-    let mut out = String::with_capacity(message.len());
+    // Pass one: backticked values, every occurrence.
+    let mut pass_one = String::with_capacity(message.len());
     let mut rest = message;
-
-    // Backticked token immediately after one of these prefixes is caller data.
-    for prefix in ["unknown variant `", "unknown field `"] {
-        if let Some(start) = rest.find(prefix) {
-            let after = start + prefix.len();
-            if let Some(end) = rest[after..].find('`') {
-                out.push_str(&rest[..after]);
-                out.push_str(REDACTED);
-                rest = &rest[after + end..];
-                break;
-            }
-        }
+    loop {
+        let next = VALUE_PREFIXES
+            .iter()
+            .filter_map(|prefix| rest.find(prefix).map(|at| (at, *prefix)))
+            .min_by_key(|(at, _)| *at);
+        let Some((at, prefix)) = next else { break };
+        let after = at + prefix.len();
+        let Some(len) = rest[after..].find('`') else {
+            break;
+        };
+        pass_one.push_str(&rest[..after]);
+        pass_one.push_str(REDACTED);
+        rest = &rest[after + len..];
     }
+    pass_one.push_str(rest);
 
-    // Everything inside double quotes is a submitted value.
+    // Pass two: quoted values, honouring backslash escapes inside them.
+    let mut out = String::with_capacity(pass_one.len());
     let mut in_quotes = false;
-    for ch in rest.chars() {
+    let mut chars = pass_one.chars();
+    while let Some(ch) = chars.next() {
         match ch {
+            '\\' if in_quotes => {
+                // An escaped character is part of the value; drop it and the
+                // escape, and in particular do not let `\"` close the span.
+                chars.next();
+            }
             '"' if in_quotes => {
                 out.push_str(REDACTED);
                 out.push('"');
@@ -717,6 +746,56 @@ mod tests {
         assert!(!message.contains("hunter2"), "value leaked: {message}");
         assert!(message.contains("`read`"), "permitted set lost: {message}");
         assert!(message.contains("`write`"), "permitted set lost: {message}");
+    }
+
+    #[test]
+    fn redaction_removes_non_string_values_too() {
+        // serde renders a mistyped number, bool, float or char in backticks
+        // after a type word, not in quotes. A `pin: String` field sent as
+        // `123456` produced `invalid type: integer `123456`, expected a string`
+        // in the first cut — the PIN, returned and logged.
+        for (message, secret) in [
+            (
+                "invalid type: integer `123456`, expected a string",
+                "123456",
+            ),
+            ("invalid type: boolean `true`, expected a string", "true"),
+            ("invalid type: floating point `1.5`, expected u64", "1.5"),
+            ("invalid value: character `Z`, expected a digit", "Z"),
+        ] {
+            let redacted = redact_submitted_values(message);
+            assert!(!redacted.contains(secret), "value leaked: {redacted}");
+            assert!(redacted.contains("expected"), "diagnostic lost: {redacted}");
+        }
+    }
+
+    #[test]
+    fn redaction_honours_escaped_quotes_inside_a_string_value() {
+        // `{:?}` renders an embedded `"` as `\\"`. A scanner that closes on it
+        // emits everything after it — here, the whole secret.
+        let redacted =
+            redact_submitted_values(r#"invalid type: string "x\"hunter2", expected u64"#);
+        assert!(
+            !redacted.contains("hunter2"),
+            "value leaked past an escaped quote: {redacted}"
+        );
+        assert!(
+            redacted.contains("expected u64"),
+            "diagnostic lost: {redacted}"
+        );
+    }
+
+    #[test]
+    fn redaction_handles_a_message_with_several_values() {
+        let redacted = redact_submitted_values(
+            r#"invalid value: integer `42`, expected one of `read`, `write`; got string "hunter2""#,
+        );
+        assert!(!redacted.contains("42"), "integer leaked: {redacted}");
+        assert!(!redacted.contains("hunter2"), "string leaked: {redacted}");
+        assert!(
+            redacted.contains("`read`") && redacted.contains("`write`"),
+            "schema lost: {redacted}"
+        );
     }
 
     #[test]

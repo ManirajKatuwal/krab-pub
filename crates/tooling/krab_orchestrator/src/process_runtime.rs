@@ -510,7 +510,7 @@ pub(super) async fn terminate_child(
         // leaking. `kill` reaches only `cargo`, so the grandchild can still
         // survive; that is a leak, and a leak beats a hang.
         if !tree_killed {
-            if let Err(err) = child.kill().await {
+            if let Err(err) = child.start_kill() {
                 warn!(service = %name, error = %err, "service_force_kill_failed");
             } else {
                 warn!(service = %name, "service_force_killed_direct_child_only_tree_may_survive");
@@ -537,15 +537,16 @@ pub(super) async fn terminate_child(
             }
         }
 
-        // The group signal does not reap the direct child; this does, so the
-        // `wait` below returns promptly instead of on the timeout.
-        if let Err(err) = child.kill().await {
+        // `start_kill`, not `kill().await`: the latter is `start_kill` followed
+        // by an *unbounded* `wait`, which would sit in front of the bounded reap
+        // below and defeat it. Signal now, reap once, with the timeout.
+        if let Err(err) = child.start_kill() {
             warn!(service = %name, error = %err, "service_force_kill_failed");
         }
     }
 
     #[cfg(not(any(unix, windows)))]
-    if let Err(err) = child.kill().await {
+    if let Err(err) = child.start_kill() {
         warn!(service = %name, error = %err, "service_force_kill_failed");
     }
 

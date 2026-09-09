@@ -102,11 +102,13 @@ ambient `KRAB_PORT` exists and logs
 `service_port_unpinned_inheriting_ambient_krab_port` when it does, so the
 un-migrated case is noisy rather than silent.
 
-#### `krab_core::render_stream` is not compiled for `wasm32`
+#### `krab_core::render_stream`'s streaming writer is not compiled for `wasm32`
 
 **Breaking on `wasm32` only, and only at compile time.** A crate that names
-`krab_core::render_stream` in code compiled for `wasm32-unknown-unknown` now
-fails to compile with an unresolved-module error. Native targets are unchanged:
+`ChunkedStreamWriter`, `FinishedStream`, `StreamTelemetry` or
+`render_to_chunk_stream` in code compiled for `wasm32-unknown-unknown` now
+fails to compile; the module itself, and its marker parser, remain. Native
+targets are unchanged:
 `ChunkedStreamWriter`, `SuspenseState` and streaming SSR behave exactly as they
 did.
 

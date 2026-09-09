@@ -1254,7 +1254,15 @@ async fn hmr_handler(
     // value immediately on subscribe, and the client reloads the page on any
     // message it receives. That is a reload loop — connect, receive, reload,
     // connect — with no file having changed. Only actual signals should reach it.
-    let stream = WatchStream::from_changes(state.hmr_rx)
+    // `state.hmr_rx` is cloned out of `AppState` for every request, and a clone
+    // inherits its parent's notion of what has been seen. The parent receiver
+    // never observes anything, so once a single signal has ever been sent,
+    // every fresh clone starts with an unseen version and `from_changes` yields
+    // it immediately: connect, receive, reload, connect. Mark the clone as
+    // current first, so only signals sent *after* this subscription reach it.
+    let mut rx = state.hmr_rx;
+    rx.mark_unchanged();
+    let stream = WatchStream::from_changes(rx)
         .map(|sig| Ok(axum::response::sse::Event::default().data(sig.to_string())));
 
     axum::response::Sse::new(stream)
@@ -1887,6 +1895,38 @@ mod tests {
             .await
             .expect("a real signal must be delivered");
         assert_eq!(delivered, Some(8));
+    }
+
+    #[tokio::test]
+    async fn hmr_subscriber_cloned_after_a_signal_does_not_replay_it() {
+        use futures_util::StreamExt;
+        use tokio_stream::wrappers::WatchStream;
+
+        // The shape the handler actually sees: a receiver cloned from a
+        // long-lived parent that has never observed the channel, after at least
+        // one signal has been sent. Without `mark_unchanged` the clone is born
+        // with an unseen version and `from_changes` hands it over at once — the
+        // reload loop the first fix missed, because that test used a fresh
+        // receiver.
+        let (tx, parent) = tokio::sync::watch::channel(0u64);
+        tx.send(1).expect("first signal");
+
+        let mut subscriber = parent.clone();
+        subscriber.mark_unchanged();
+        let mut stream = WatchStream::from_changes(subscriber);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), stream.next())
+                .await
+                .is_err(),
+            "a subscriber created after a signal must not be handed that signal"
+        );
+
+        tx.send(2).expect("second signal");
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("a signal sent after subscribing must be delivered");
+        assert_eq!(delivered, Some(2));
     }
 
     #[test]

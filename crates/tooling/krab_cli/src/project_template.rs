@@ -109,14 +109,16 @@ impl DependencySource {
 
 /// Minimum toolchain the generated dependency set actually needs.
 ///
-/// `axum 0.8.8` declares `rust-version = "1.78"`, and the generated manifest
-/// floats its dependencies (`axum = "0.8"`, `tokio = "1.0"`, ...) to the latest
-/// compatible release, so the real floor is set by whatever those resolve to —
-/// not by this workspace's own `rust-version = "1.75"`. Declaring it in the
-/// generated manifest turns an MSRV mismatch into Cargo's own
-/// "package requires rustc 1.78" message instead of a type error deep inside a
-/// dependency, and keeps the Dockerfile's toolchain choice checkable.
-const GENERATED_PROJECT_MSRV: &str = "1.78";
+/// A generated project depends on `krab_core`, whose resolved graph needs
+/// 1.89 (`async-graphql` 7.2 under `graphql`, `time` 0.3.47 under either
+/// database driver), and the generated manifest floats its other dependencies
+/// (`axum = "0.8"`, `tokio = "1.0"`, ...) to the latest compatible release, so
+/// the real floor is whatever those resolve to. This matches the workspace's
+/// own `rust-version`, which said `1.75` through 0.4.0 and was never true.
+/// Declaring it in the generated manifest turns an MSRV mismatch into Cargo's
+/// own "package requires rustc 1.89" message instead of a type error deep
+/// inside a dependency, and keeps the Dockerfile's toolchain choice checkable.
+const GENERATED_PROJECT_MSRV: &str = "1.89";
 
 #[derive(Clone, Copy)]
 struct TemplateMetadata {

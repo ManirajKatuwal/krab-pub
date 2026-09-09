@@ -194,7 +194,7 @@ impl MemoryStore {
         use std::sync::atomic::Ordering;
 
         let total = self.evictions.fetch_add(1, Ordering::Relaxed) + 1;
-        if total == 1 || total % EVICTION_WARN_EVERY == 0 {
+        if total == 1 || total.is_multiple_of(EVICTION_WARN_EVERY) {
             tracing::warn!(
                 event = "memory_store_evicted",
                 evicted_total = total,

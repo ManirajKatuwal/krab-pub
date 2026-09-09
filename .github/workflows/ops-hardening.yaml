@@ -156,6 +156,27 @@ jobs:
   release-certification-evidence:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # `release certify` runs the rollback rehearsal with KRAB_REQUIRE_DB_TESTS=1
+    # since 0.5.0 (crates/tooling/krab_cli/src/release_ops.rs), so without a
+    # reachable Postgres the certify step fails deterministically and the job
+    # produces a bundle that looks like a policy failure. Same service block as
+    # db-lifecycle.yaml; keep the two in step.
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci_db_test_secret
+          POSTGRES_DB: krab_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:ci_db_test_secret@localhost:5432/krab_test
     steps:
       - uses: actions/checkout@v4
 

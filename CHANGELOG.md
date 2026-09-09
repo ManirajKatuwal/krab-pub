@@ -20,14 +20,15 @@ Nothing yet.
 
 ## [0.5.0] — 2026-09-09
 
-Security and correctness release. Three changes are breaking: metrics are no
+Security and correctness release. Four changes are breaking: metrics are no
 longer anonymously readable by default, the orchestrator owns each service's
-port and name, and `render_stream`'s streaming writer is no longer compiled for
-`wasm32`. See
+port and name, `render_stream`'s streaming writer is no longer compiled for
+`wasm32`, and `ErrorCategory` is `#[non_exhaustive]` (exhaustive `match`es need
+a wildcard arm). See
 [the migration guide](docs/guides/migration_guide.md) before upgrading a running
 deployment.
 
-All three ship without the prior-release deprecation notice
+All four ship without the prior-release deprecation notice
 [`RELEASE_POLICY.md`](RELEASE_POLICY.md) §"Breaking Change Policy" asks for, and
 that is deliberate rather than an oversight. Metrics closing is a security fix,
 so a deprecation minor would have meant another release with every deployment's
@@ -41,6 +42,11 @@ available. Migration guidance, the requirement that was met, is in
 
 ### Added
 
+- `krab_core::server_fn::ServerFnError::from_deserialization_error` and
+  `krab_core::server_fn::redact_submitted_values`: the value-redacting error path
+  `#[server]` handlers now use, public so hand-written handlers can match it. The
+  `#[server]` expansion in `krab_macros` 0.5 calls the former, so `krab_macros` and
+  `krab_core` must be upgraded together — a proc-macro crate cannot pin its host.
 - `KRAB_FRONTEND_PKG_DIR` (default: `dist/pkg`): the directory holding the built
   `krab_client.js`. The frontend hashes that file to publish the asset manifest's
   `integrity` digest and `?h=` cache buster; it links `/pkg/krab_client.js` without
@@ -104,6 +110,12 @@ available. Migration guidance, the requirement that was met, is in
 
 ### Changed
 
+- **`rust-version` is `1.89`.** Every manifest said `1.75` through 0.4.0, and it was never
+  true: the resolved dependency graph needs 1.89 (`async-graphql` 7.2 under `graphql`) and
+  1.88 (`time` 0.3.47 under either database driver), and `krab_cli` needs 1.85
+  unconditionally, so `cargo install krab_cli` on 1.75–1.84 failed with a dependency error
+  rather than a clear MSRV message. The number now states the measured floor, and `krab new`
+  projects declare the same `1.89`. A correction of a claim, not a policy change.
 - `service_users::run_split_target` no longer configures the process environment; callers
   must invoke the now-public `configure_split_target_env` before building the runtime, as
   the three `users_*` binaries do. `service_users` is a workspace service, not a published
@@ -119,8 +131,9 @@ available. Migration guidance, the requirement that was met, is in
   only. `config`'s `File::with_name` incidentally accepted `krab.yaml`, `krab.json` and
   others; nothing in the workspace, the docs, or the `krab new` templates has ever
   produced one. `krab_orchestrator` drops its `config` dependency for `toml`.
-- `krab generate service` writes `port` and `service_name` into the `[services.X]` entry
-  it registers, alongside the probe URL it already generated.
+- `krab topology split --register` writes `port` and `service_name` into the `[services.X]`
+  entry it registers, alongside the probe URL it already generated. (`krab generate
+  service` does not touch `krab.toml`; an earlier draft of this entry credited it.)
 - **Breaking:** `/metrics` and `/metrics/prometheus` are no longer on the default
   unauthenticated open-path list. Every service built on Krab was handing anonymous callers
   its full route inventory, request volumes, error counts and latency histograms. Set
@@ -194,12 +207,14 @@ available. Migration guidance, the requirement that was met, is in
 - `#[server]` validation failures no longer echo the request payload back in the error
   message. A rejected body routinely carries the very credential that made it invalid,
   and error responses are among the most heavily logged objects in a stack. The
-  deserializer's own message is not returned either: serde embeds offending values in it
-  (`unknown variant `...``, `invalid type: string "..."`), so echoing it reopens the same
-  leak through a narrower pipe. What a caller gets is the rejecting function, the class of
-  failure (malformed JSON, unexpected end of input, or a body that does not match the
-  expected shape), and the line and column — actionable without returning any submitted
-  value. This also drops the clone of the request body that existed only to feed the echo.
+  deserializer's own message is returned only after `ServerFnError::from_deserialization_error`
+  has run it through `redact_submitted_values`: serde embeds submitted values in it —
+  quoted strings (with `\"` escapes honoured, so an embedded quote cannot end the
+  redaction early) and backticked non-strings (integer, boolean, floating point,
+  character) and enum/field names (unknown variant, unknown field) — and every one of
+  those becomes `<redacted>`. What survives is schema: the missing field's name, the
+  permitted set, the expected type, line and column. This also drops the clone of the
+  request body that existed only to feed the echo.
 
 - `h2` bumped to 0.4.16 for [RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258)
   (unbounded queueing of empty DATA frames in the `hyper` stack). Lockfile only.
@@ -220,6 +235,21 @@ available. Migration guidance, the requirement that was met, is in
 
 ### Fixed
 
+- The orchestrator shuts its services down on SIGTERM and SIGHUP, not only Ctrl-C. Because
+  0.5.0 spawns children into their own process groups, a closing terminal or a supervisor's
+  SIGTERM reached the orchestrator alone and killed it without running the shutdown path,
+  leaving every service running with its port bound. In 0.4.0 the children happened to
+  share the terminal's group and died with it; they now die on purpose. Windows is
+  unchanged (console close and Ctrl-C both arrive as `ctrl_c`).
+- `/api/hmr` no longer reloads the page in a loop after the first signal. The receiver is
+  cloned out of the app state per request and inherits the parent's unseen version, so once
+  any signal had ever been sent every reconnect fired immediately; the subscription now
+  marks itself current before listening. The earlier fix covered only the case where no
+  signal had been sent yet.
+- `service_auth`'s refresh handler fails closed on store *reads* as well as writes. Its
+  replay and revocation lookups turned a store outage into "not used" / "not revoked" —
+  the one answer those checks must never give by default. They now return 503 like the
+  write paths already did.
 - The orchestrator no longer orphans the services it starts. `krab.toml` spawns services
   as `cargo run --bin X`, so the direct child is cargo and the service is a grandchild;
   cargo does not forward signals, so `SIGTERM` to the child's pid killed cargo and left
@@ -359,7 +389,9 @@ available. Migration guidance, the requirement that was met, is in
 - `service_frontend` ISR cache keying and revalidation now incorporate the locale dimension,
   preventing multi-locale cache poisoning and English revalidation overwrites.
 - `service_frontend` request-path `spawn_blocking` task failures map to 500 error responses
-  instead of panicking worker threads.
+  instead of panicking worker threads — in the home handlers, and, as of the release
+  review, in `/about`, `/greet` and `/blog/{slug}` too, which had the same `unwrap` at a
+  second site.
 - `KRAB_FRONTEND_DOWNSTREAM_BEARER_TOKEN` routed through `krab_core::config::read_env_or_file`.
 
 ### Removed

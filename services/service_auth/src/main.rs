@@ -473,15 +473,19 @@ async fn refresh_handler(
     }
 
     let used_key = format!("auth:refresh:used:{}", claims.jti);
-    if state
-        .runtime
-        .store
-        .get(&used_key)
-        .await
-        .ok()
-        .flatten()
-        .is_some()
-    {
+    // Fail closed. `.ok().flatten()` here turned a store outage into "not
+    // used", which is the one answer a replay or revocation check must
+    // never give by default; the write paths below already return 503.
+    let used_hit = match state.runtime.store.get(&used_key).await {
+        Ok(hit) => hit,
+        Err(err) => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"store_unavailable","detail":err.to_string()})),
+            );
+        }
+    };
+    if used_hit.is_some() {
         return (
             axum::http::StatusCode::UNAUTHORIZED,
             Json(json!({"error":"refresh_token_already_used"})),
@@ -489,15 +493,19 @@ async fn refresh_handler(
     }
 
     let revoked_key = format!("auth:revoked:{}", claims.jti);
-    if state
-        .runtime
-        .store
-        .get(&revoked_key)
-        .await
-        .ok()
-        .flatten()
-        .is_some()
-    {
+    // Fail closed. `.ok().flatten()` here turned a store outage into "not
+    // revoked", which is the one answer a replay or revocation check must
+    // never give by default; the write paths below already return 503.
+    let revoked_hit = match state.runtime.store.get(&revoked_key).await {
+        Ok(hit) => hit,
+        Err(err) => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"store_unavailable","detail":err.to_string()})),
+            );
+        }
+    };
+    if revoked_hit.is_some() {
         return (
             axum::http::StatusCode::UNAUTHORIZED,
             Json(json!({"error":"refresh_token_revoked"})),

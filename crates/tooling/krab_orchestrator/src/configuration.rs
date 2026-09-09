@@ -214,7 +214,22 @@ pub(super) fn validate_service_identity(config: &KrabConfig) -> anyhow::Result<(
     for key in names {
         let service = &config.services[key];
 
-        if let Some(port) = service.port {
+        // The port the service will actually bind. `resolved_env` lets an
+        // explicit `env.KRAB_PORT` entry win over the typed field, so the
+        // typed field alone is the wrong thing to validate: an override that
+        // lands on a sibling's port used to load, spawn, and race for the
+        // bind unseen. Validate what will be injected.
+        let effective_port = match service.env.get(PORT_ENV_KEY) {
+            Some(raw) => match raw.trim().parse::<u16>() {
+                Ok(port) => Some(port),
+                Err(_) => anyhow::bail!(
+                    "krab.toml: service '{key}' sets env.KRAB_PORT = '{raw}', which is not a port number in 1-65535. The orchestrator injects this value verbatim as KRAB_PORT; declare `port = N` instead, or fix the value."
+                ),
+            },
+            None => service.port,
+        };
+
+        if let Some(port) = effective_port {
             if port == 0 {
                 anyhow::bail!(
                     "krab.toml: service '{key}' declares port = 0. Port 0 asks the OS for an \
@@ -246,7 +261,7 @@ pub(super) fn validate_service_identity(config: &KrabConfig) -> anyhow::Result<(
         // proxy or a published container port. It is still nearly always a
         // typo, and silence here is what let the topology drift in the first
         // place.
-        if let (Some(port), Some(url)) = (service.port, service.effective_healthcheck_url()) {
+        if let (Some(port), Some(url)) = (effective_port, service.effective_healthcheck_url()) {
             if let Some(probe_port) = probe_url_port(url) {
                 if probe_port != port {
                     warn!(
@@ -636,6 +651,45 @@ service_name = "shared"
         assert!(message.contains("'shared'"), "unexpected error: {message}");
         assert!(message.contains("'auth'"), "unexpected error: {message}");
         assert!(message.contains("'users'"), "unexpected error: {message}");
+    }
+
+    #[test]
+    fn an_env_port_override_onto_a_siblings_port_is_rejected() {
+        // `env.KRAB_PORT` wins over the typed field at spawn, so this pair
+        // would both bind 3002. It used to load and spawn without a word.
+        let err = parse_krab_config(
+            r#"
+[services.auth]
+command = "cargo"
+env = { KRAB_PORT = "3002" }
+
+[services.users]
+command = "cargo"
+port = 3002
+"#,
+        )
+        .expect_err("an env override onto a sibling's port must be rejected");
+
+        let message = err.to_string();
+        assert!(message.contains("'auth'"), "unexpected error: {message}");
+        assert!(message.contains("'users'"), "unexpected error: {message}");
+        assert!(message.contains("3002"), "unexpected error: {message}");
+    }
+
+    #[test]
+    fn a_malformed_env_port_is_rejected_at_load() {
+        let err = parse_krab_config(
+            r#"
+[services.auth]
+command = "cargo"
+env = { KRAB_PORT = "three-thousand" }
+"#,
+        )
+        .expect_err("a KRAB_PORT that is not a port number must be rejected");
+
+        let message = err.to_string();
+        assert!(message.contains("KRAB_PORT"), "unexpected error: {message}");
+        assert!(message.contains("'auth'"), "unexpected error: {message}");
     }
 
     #[test]

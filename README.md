@@ -3,7 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/krab_core.svg)](https://crates.io/crates/krab_core)
 [![docs.rs](https://img.shields.io/docsrs/krab_core)](https://docs.rs/krab_core)
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
-![Rust: 1.75+](https://img.shields.io/badge/rust-1.75%2B-orange.svg)
+![Rust: 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange.svg)
 
 Krab is a full-stack Rust framework for server-side rendering, island hydration, service composition, and production-oriented operational controls.
 
@@ -52,11 +52,12 @@ All five crates are on [crates.io](https://crates.io/crates/krab_core). The
 current release is `0.5.0`; release channels and versioning policy are in
 [RELEASE_POLICY.md](RELEASE_POLICY.md).
 
-> **Upgrading to `0.5.0`?** Three breaking changes, all operator-visible:
+> **Upgrading to `0.5.0`?** Four breaking changes — three operator-visible, one for Rust callers matching on `ErrorCategory`:
 > `/metrics` and `/metrics/prometheus` now require auth unless
 > `KRAB_METRICS_PUBLIC=true`, the orchestrator owns each service's port and name
-> from `krab.toml`, and `krab_core::render_stream` is no longer compiled for
-> `wasm32`. The [migration guide](docs/guides/migration_guide.md) has the
+> from `krab.toml`, and `krab_core::render_stream`'s streaming writer is no longer
+> compiled for `wasm32` (its marker parser still is). The
+> [migration guide](docs/guides/migration_guide.md) has the
 > one-line fix for each.
 >
 > If you installed `0.2.0`, upgrade regardless. The `krab_client` published at
@@ -108,7 +109,7 @@ application, see the Installation section above.
 
 ### Prerequisites
 
-- **Rust** stable 1.75+ ([rustup.rs](https://rustup.rs/))
+- **Rust** stable 1.89+ ([rustup.rs](https://rustup.rs/)) — the floor is set by `async-graphql` and `time`, not by Krab itself
 - **PostgreSQL** 15+ (production backend) or **SQLite** (lightweight/dev)
 - **wasm-pack** (for WASM client builds): `cargo install wasm-pack`
 - **cargo-deny** (for dependency auditing): `cargo install cargo-deny`

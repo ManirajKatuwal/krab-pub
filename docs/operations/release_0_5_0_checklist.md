@@ -5,7 +5,7 @@ treat a phase's "done when" as the only thing that closes it.
 
 ## Why 0.5.0
 
-Three of the changes are breaking, and on `0.x` the **minor** field is the
+Four of the changes are breaking, and on `0.x` the **minor** field is the
 compatibility boundary — `^0.4` and `^0.5` do not unify. See
 [`RELEASE_POLICY.md`](../../RELEASE_POLICY.md#while-the-version-is-below-10).
 
@@ -28,12 +28,14 @@ Deprecated in this release and removed in `0.6.0`:
 ## What gates this release, and what does not
 
 **No GitHub Actions run has ever succeeded on either repository.** As of
-2026-09-09: `ManirajKatuwal/krab` has 166 runs and **0** successes,
-`ManirajKatuwal/krab-pub` has 111 runs and **0** successes. The cause is
-account-level (billing); runs fail at startup with zero jobs. Separately,
-`git ls-remote --tags origin` is **empty** — every `v*` tag lives only on the
-`public` mirror — so [`release-attestation.yaml`](../../.github/workflows/release-attestation.yaml),
-which triggers on `push: tags: v*`, has never fired either.
+2026-09-09: the private development repository has 175 runs and **0**
+successes, the public one 111 and **0**. The cause is account-level (billing);
+runs fail at startup with zero jobs, unattributed to any workflow. `v0.5.0` was
+the first `v*` tag ever pushed to the development remote (`v0.2.0`–`v0.4.0`
+exist only on the public mirror); it produced exactly such a run, so
+[`release-attestation.yaml`](../../.github/workflows/release-attestation.yaml)
+(`push: tags: v*`) is proven reachable and proven blocked, and has still never
+executed.
 
 So for this release:
 
@@ -498,9 +500,11 @@ git push origin v0.5.0
 git push public v0.5.0
 ```
 
-> `git ls-remote --tags origin` is currently **empty**: `v0.2.0`, `v0.3.0`, and
-> `v0.4.0` exist locally and on `public` only. That is why
-> `release-attestation.yaml` (`on: push: tags: 'v*'`) has never triggered.
+> Before this release `git ls-remote --tags origin` was **empty**: `v0.2.0`,
+> `v0.3.0` and `v0.4.0` existed locally and on `public` only, which is why
+> `release-attestation.yaml` (`on: push: tags: 'v*'`) had never even been
+> triggered. `v0.5.0` changed that — the trigger fired, and died at startup like
+> every other run.
 > Pushing to `origin` is still worth doing — the tag is the immutable source
 > snapshot `RELEASE_POLICY.md` requires — but do **not** expect an attestation
 > run to appear, and do not cite one.
