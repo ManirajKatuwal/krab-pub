@@ -833,6 +833,24 @@ pub async fn rollback_to_version(
     migrations: &[Migration],
     target_version: i64,
 ) -> Result<()> {
+    // The same serialization the forward path takes. Without it a rollback
+    // could interleave with another replica still migrating forward — or with a
+    // second rollback — and the two would race both the DDL and the
+    // `krab_migrations` bookkeeping. The forward path has held this lock since
+    // it was introduced; this one did not, which left exactly the rolling-deploy
+    // window the lock exists to close.
+    let lock_conn = acquire_migration_lock(pool).await?;
+    let result = rollback_to_version_locked(pool, migrations, target_version).await;
+    release_migration_lock(lock_conn).await;
+
+    result
+}
+
+async fn rollback_to_version_locked(
+    pool: &DbPool,
+    migrations: &[Migration],
+    target_version: i64,
+) -> Result<()> {
     let mut sorted: Vec<&Migration> = migrations.iter().collect();
     sorted.sort_by_key(|m| m.version);
     sorted.reverse();
@@ -941,6 +959,21 @@ pub async fn run_versioned_migrations(
     // with a single connection (`DB_MAX_CONNECTIONS=1`, or the test harness):
     // the lock held the only slot while every migration statement waited for
     // a second one, until `PoolTimedOut` after the acquire timeout.
+    let lock_conn = acquire_migration_lock(pool).await?;
+    let result = run_versioned_migrations_locked(pool, migrations, failure_policy).await;
+    release_migration_lock(lock_conn).await;
+
+    result
+}
+
+/// Take the session-level migration advisory lock on a dedicated connection.
+///
+/// The connection is opened outside the pool on purpose. Taking the lock on a
+/// pooled connection deadlocks any pool with a single slot
+/// (`DB_MAX_CONNECTIONS=1`, or the test harness): the lock holds the only
+/// connection while every migration statement waits for a second one, until the
+/// acquire timeout fires as `PoolTimedOut`.
+async fn acquire_migration_lock(pool: &DbPool) -> Result<sqlx::postgres::PgConnection> {
     let mut lock_conn = sqlx::postgres::PgConnection::connect_with(pool.connect_options().as_ref())
         .await
         .context("failed to open a dedicated connection for the migration advisory lock")?;
@@ -949,9 +982,11 @@ pub async fn run_versioned_migrations(
         .execute(&mut lock_conn)
         .await
         .context("failed to take the migration advisory lock")?;
+    Ok(lock_conn)
+}
 
-    let result = run_versioned_migrations_locked(pool, migrations, failure_policy).await;
-
+/// Release the migration advisory lock and close the session holding it.
+async fn release_migration_lock(mut lock_conn: sqlx::postgres::PgConnection) {
     let unlocked: std::result::Result<bool, sqlx::Error> =
         sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
             .bind(MIGRATION_ADVISORY_LOCK_KEY)
@@ -963,8 +998,6 @@ pub async fn run_versioned_migrations(
     // Close the dedicated session either way; advisory locks are
     // session-scoped, so a closed session cannot block future migrators.
     let _ = lock_conn.close().await;
-
-    result
 }
 
 async fn run_versioned_migrations_locked(

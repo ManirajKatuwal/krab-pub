@@ -85,6 +85,7 @@ variable marked **secret** has them.
 | `KRAB_AUTH_LOGIN_USERS_JSON` | No | — | **Secret.** JSON object of `username` → Argon2id PHC hash. Generate entries with `krab auth hash-password --username <name>` |
 | `KRAB_SERVICE_AUTH_SCOPE` | No | `service:internal` | Scope required for service-to-service calls |
 | `KRAB_FRONTEND_DOWNSTREAM_BEARER_TOKEN` | No | — | **Secret.** Downstream bearer token for frontend to authenticate calls to backend services |
+| `KRAB_FRONTEND_PKG_DIR` | No | `dist/pkg` | Directory holding the built `krab_client.js`. The frontend hashes that file to publish a real `integrity` digest and `?h=` cache buster in `/asset-manifest.json`; when it cannot be read, no integrity is published and the browser treats hydration as degraded |
 | `KRAB_AUTH_BASE_URL` | No | `http://127.0.0.1:3001` | Auth service base URL for inter-service calls. Overridden by runtime topology when set |
 | `KRAB_USERS_BASE_URL` | No | `http://127.0.0.1:3002` | Users service base URL for inter-service calls. Overridden by runtime topology when set |
 

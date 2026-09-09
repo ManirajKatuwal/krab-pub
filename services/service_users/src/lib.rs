@@ -255,7 +255,21 @@ fn env_non_empty(name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-fn configure_split_target_env(target: SplitUsersTarget) {
+/// Publish a split target's identity into the process environment.
+///
+/// **Call this from `fn main()`, before the Tokio runtime is built.**
+/// `std::env::set_var` mutates a process-global table that the C library reads
+/// without synchronisation, so it is only sound while the process is still
+/// single-threaded. A multi-threaded runtime spawns its workers when it is
+/// constructed, so calling this from inside an `async fn` — as the split
+/// binaries used to, via `run_split_target` — races every other thread that
+/// reads the environment. It is also why `set_var` is `unsafe` in edition 2024,
+/// which this workspace has yet to adopt.
+///
+/// The values are consumed downstream by `krab_core`'s config layer, which
+/// reads them from the environment, so they genuinely have to land there rather
+/// than being threaded through as a struct.
+pub fn configure_split_target_env(target: SplitUsersTarget) {
     let protocol = target.protocol().as_str();
     std::env::set_var("KRAB_PROTOCOL_EXPOSURE_MODE", "single");
     std::env::set_var("KRAB_PROTOCOL_ENABLED", protocol);
@@ -281,8 +295,14 @@ pub async fn run_default() -> Result<()> {
     service.start().await
 }
 
+/// Run one split target, assuming its environment is already configured.
+///
+/// The caller must have run [`configure_split_target_env`] **before building
+/// the runtime**; this function deliberately does not do it, because by the
+/// time an `async fn` is executing, the runtime's worker threads exist and
+/// `std::env::set_var` is no longer sound. See the three `src/bin/users_*.rs`
+/// entry points for the shape.
 pub async fn run_split_target(target: SplitUsersTarget) -> Result<()> {
-    configure_split_target_env(target);
     init_tracing(target.service_name());
     let service = bootstrap_users_service().await?;
     service.start().await

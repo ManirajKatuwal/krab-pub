@@ -144,6 +144,88 @@ impl ServerFnError {
         Self::with_code(message, 400, ServerFnErrorCode::Validation)
     }
 
+    /// Create a validation error from a deserialization failure, with any
+    /// caller-supplied values removed from the message.
+    ///
+    /// `#[server]` handlers use this rather than formatting the deserializer's
+    /// message directly. Serde's diagnostics mix two kinds of information:
+    ///
+    /// - **Schema facts**, which the caller needs and which are safe to return —
+    ///   `missing field \`excited\``, `expected one of \`a\`, \`b\``, the
+    ///   expected type, the line and column.
+    /// - **Submitted values**, which must not come back — `invalid type: string
+    ///   "hunter2"` and `unknown variant \`hunter2\`` both quote what the caller
+    ///   sent. A rejected body routinely carries the very credential that made
+    ///   it invalid, and error responses are among the most heavily logged
+    ///   objects in a stack, so returning one writes it to every log that
+    ///   touches the response.
+    ///
+    /// Returning nothing at all was the first attempt and it was too blunt: it
+    /// also discarded the field name, which is what makes the error actionable.
+    pub fn from_deserialization_error(function: &str, error: &serde_json::Error) -> Self {
+        Self::validation(format!(
+            "Validation failed for '{}': {}",
+            function,
+            redact_submitted_values(&error.to_string())
+        ))
+    }
+}
+
+/// Strip caller-supplied values out of a serde diagnostic, keeping schema facts.
+///
+/// Two shapes carry values, and each needs different handling:
+///
+/// - Double-quoted spans (`invalid type: string "hunter2"`) — the quoted text is
+///   always the submitted value.
+/// - `unknown variant \`x\`` / `unknown field \`x\`` — the first backticked token
+///   is submitted, while every later one (`expected one of ...`) is schema.
+///   `missing field \`x\`` is the opposite: that token is schema, and keeping it
+///   is the whole point.
+pub fn redact_submitted_values(message: &str) -> String {
+    const REDACTED: &str = "<redacted>";
+
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+
+    // Backticked token immediately after one of these prefixes is caller data.
+    for prefix in ["unknown variant `", "unknown field `"] {
+        if let Some(start) = rest.find(prefix) {
+            let after = start + prefix.len();
+            if let Some(end) = rest[after..].find('`') {
+                out.push_str(&rest[..after]);
+                out.push_str(REDACTED);
+                rest = &rest[after + end..];
+                break;
+            }
+        }
+    }
+
+    // Everything inside double quotes is a submitted value.
+    let mut in_quotes = false;
+    for ch in rest.chars() {
+        match ch {
+            '"' if in_quotes => {
+                out.push_str(REDACTED);
+                out.push('"');
+                in_quotes = false;
+            }
+            '"' => {
+                out.push('"');
+                in_quotes = true;
+            }
+            _ if in_quotes => {}
+            _ => out.push(ch),
+        }
+    }
+    if in_quotes {
+        // Unterminated quote: the remainder was a value, so it stays dropped.
+        out.push_str(REDACTED);
+    }
+
+    out
+}
+
+impl ServerFnError {
     /// Create an unauthorized error (HTTP 401).
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self::with_code(message, 401, ServerFnErrorCode::Unauthorized)
@@ -608,6 +690,59 @@ macro_rules! collect_server_fns {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redaction_keeps_the_field_name_a_caller_needs() {
+        // The whole reason this is not a blanket "return nothing": a missing
+        // field is named by the schema, not by the caller, and without it the
+        // error tells the caller only that something was wrong somewhere.
+        let message = redact_submitted_values("missing field `excited`");
+        assert_eq!(message, "missing field `excited`");
+    }
+
+    #[test]
+    fn redaction_removes_a_submitted_value_but_keeps_the_expected_type() {
+        let message = redact_submitted_values("invalid type: string \"hunter2\", expected u64");
+        assert!(!message.contains("hunter2"), "value leaked: {message}");
+        assert!(
+            message.contains("expected u64"),
+            "diagnostic lost: {message}"
+        );
+    }
+
+    #[test]
+    fn redaction_removes_an_unknown_variant_but_keeps_the_permitted_set() {
+        let message =
+            redact_submitted_values("unknown variant `hunter2`, expected one of `read`, `write`");
+        assert!(!message.contains("hunter2"), "value leaked: {message}");
+        assert!(message.contains("`read`"), "permitted set lost: {message}");
+        assert!(message.contains("`write`"), "permitted set lost: {message}");
+    }
+
+    #[test]
+    fn redaction_survives_an_unterminated_quote() {
+        // Malformed input must not produce a message that leaks the tail it
+        // failed to close.
+        let message = redact_submitted_values("invalid type: string \"secret");
+        assert!(!message.contains("secret"), "value leaked: {message}");
+    }
+
+    #[test]
+    fn deserialization_errors_name_the_function_and_drop_the_value() {
+        #[derive(serde::Deserialize, Debug)]
+        #[allow(dead_code)]
+        struct Args {
+            count: u64,
+        }
+
+        let error =
+            serde_json::from_value::<Args>(serde_json::json!({ "count": "hunter2" })).unwrap_err();
+        let err = ServerFnError::from_deserialization_error("greet", &error);
+
+        assert_eq!(err.status_code, 400);
+        assert!(err.message.contains("greet"), "function lost: {err}");
+        assert!(!err.message.contains("hunter2"), "value leaked: {err}");
+    }
 
     #[test]
     fn server_fn_error_display() {

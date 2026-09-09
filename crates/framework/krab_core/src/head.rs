@@ -99,6 +99,46 @@ pub struct ScriptTag {
     pub extra_attrs: HashMap<String, String>,
 }
 
+/// Escape a JSON document for embedding inside an HTML `<script>` block.
+///
+/// `<`, `>` and `&` are rewritten to their `\uXXXX` JSON escapes. A JSON parser
+/// reads those back as the original characters, so the document's meaning is
+/// untouched, while the HTML tokenizer can no longer see a `</script>` sequence
+/// to break out on. Without this, any user-supplied value reaching JSON-LD —
+/// a product name, an article title — is a stored-XSS vector, and JSON-LD
+/// exists precisely to carry that kind of dynamic data.
+fn escape_json_for_script(json: &str) -> String {
+    json.replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+}
+
+/// Neutralise `</script` sequences in inline script source.
+///
+/// Inline JavaScript cannot be HTML-escaped without changing what it means, so
+/// only the sequence that ends the block early is rewritten. `<\/script` is
+/// identical to `</script` inside a JavaScript string or regular expression,
+/// which is where that sequence legitimately appears. The match is
+/// case-insensitive because the HTML tokenizer's is.
+fn escape_inline_script(content: &str) -> String {
+    const NEEDLE: &str = "</script";
+    // ASCII lowercasing is byte-for-byte, so indices into `lower` are valid
+    // indices into `content`.
+    let lower = content.to_ascii_lowercase();
+    let mut out = String::with_capacity(content.len());
+    let mut cursor = 0;
+    while let Some(rel) = lower[cursor..].find(NEEDLE) {
+        let at = cursor + rel;
+        out.push_str(&content[cursor..at]);
+        out.push_str("<\\/");
+        // Preserve the original casing of "script".
+        out.push_str(&content[at + 2..at + NEEDLE.len()]);
+        cursor = at + NEEDLE.len();
+    }
+    out.push_str(&content[cursor..]);
+    out
+}
+
 impl ScriptTag {
     /// Render this script tag to an HTML string.
     pub fn render(&self) -> String {
@@ -116,10 +156,20 @@ impl ScriptTag {
             attrs.push_str(" defer");
         }
         for (key, value) in &self.extra_attrs {
+            // Escaping a name is not enough — `html_escape` leaves spaces and
+            // `=` intact, so an attacker-supplied key could still open a second
+            // attribute. Invalid names are dropped, as in `Element::render`.
+            if !crate::is_valid_attr_name(key) {
+                continue;
+            }
             attrs.push_str(&format!(" {}=\"{}\"", html_escape(key), html_escape(value)));
         }
         if let Some(ref content) = self.inline_content {
-            format!("<script{}>{}</script>", attrs, content)
+            format!(
+                "<script{}>{}</script>",
+                attrs,
+                escape_inline_script(content)
+            )
         } else {
             format!("<script{}></script>", attrs)
         }
@@ -457,7 +507,7 @@ impl HeadContext {
         if let Some(ref json_ld) = self.json_ld {
             parts.push(format!(
                 "<script type=\"application/ld+json\">{}</script>",
-                json_ld
+                escape_json_for_script(json_ld)
             ));
         }
 
@@ -633,5 +683,83 @@ mod tests {
         assert!(tags.contains("rel=\"preload\""));
         assert!(tags.contains("href=\"/fonts/inter.woff2\""));
         assert!(tags.contains("as=\"font\""));
+    }
+}
+
+#[cfg(test)]
+mod script_escaping_tests {
+    use super::*;
+
+    #[test]
+    fn json_ld_cannot_close_its_own_script_block() {
+        let hostile = r#"{"name":"</script><img src=x onerror=alert(1)>"}"#;
+
+        let html = HeadContext::new().json_ld(hostile).render_tags();
+
+        assert!(
+            !html.contains("</script><img"),
+            "JSON-LD broke out of its block: {html}"
+        );
+        assert!(html.contains(r"\u003c/script\u003e"));
+        // Exactly one closing tag: the one this renderer emitted.
+        assert_eq!(html.matches("</script>").count(), 1);
+    }
+
+    #[test]
+    fn json_ld_escaping_preserves_the_document() {
+        // `\uXXXX` is how JSON spells these characters, so a parser reads back
+        // precisely what the caller passed.
+        let escaped = escape_json_for_script(r#"{"a":"1 < 2 & 3 > 2"}"#);
+
+        let parsed: serde_json::Value = serde_json::from_str(&escaped).expect("still valid JSON");
+        assert_eq!(parsed["a"], "1 < 2 & 3 > 2");
+    }
+
+    #[test]
+    fn inline_script_cannot_close_its_own_block() {
+        let content = r#"const s = "</script><img src=x onerror=alert(1)>";"#;
+
+        let out = escape_inline_script(content);
+
+        assert!(!out.contains("</script>"), "breakout survived: {out}");
+        assert!(out.contains(r"<\/script>"));
+    }
+
+    #[test]
+    fn inline_script_escaping_is_case_insensitive_and_keeps_casing() {
+        let out = escape_inline_script("a </ScRiPt> b");
+
+        assert!(!out.to_ascii_lowercase().contains("</script"));
+        assert!(out.contains(r"<\/ScRiPt>"), "casing not preserved: {out}");
+    }
+
+    #[test]
+    fn inline_script_without_a_breakout_is_untouched() {
+        let content = "const x = a < b && c > d;";
+
+        assert_eq!(escape_inline_script(content), content);
+    }
+
+    #[test]
+    fn script_attribute_name_that_would_open_a_second_attribute_is_dropped() {
+        let mut extra = HashMap::new();
+        extra.insert("x onload=alert(1)".to_string(), "v".to_string());
+        extra.insert("data-ok".to_string(), "1".to_string());
+
+        let html = ScriptTag {
+            src: Some("/pkg/app.js".to_string()),
+            inline_content: None,
+            is_module: false,
+            is_async: false,
+            is_defer: false,
+            extra_attrs: extra,
+        }
+        .render();
+
+        assert!(
+            !html.contains("onload"),
+            "injected handler survived: {html}"
+        );
+        assert!(html.contains("data-ok=\"1\""));
     }
 }

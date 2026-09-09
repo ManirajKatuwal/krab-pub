@@ -18,6 +18,11 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ### Added
 
+- `KRAB_FRONTEND_PKG_DIR` (default: `dist/pkg`): the directory holding the built
+  `krab_client.js`. The frontend hashes that file to publish the asset manifest's
+  `integrity` digest and `?h=` cache buster; it links `/pkg/krab_client.js` without
+  serving it, so the location has to be told to it.
+
 - `[services.X].port` and `[services.X].service_name` in `krab.toml`: the orchestrator now
   owns each service's identity and injects it as `KRAB_PORT` / `KRAB_SERVICE_NAME` at
   spawn. Precedence, lowest first, is the inherited environment, then this injected
@@ -75,6 +80,11 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
   are generated automatically.
 
 ### Changed
+
+- `service_users::run_split_target` no longer configures the process environment; callers
+  must invoke the now-public `configure_split_target_env` before building the runtime, as
+  the three `users_*` binaries do. `service_users` is a workspace service, not a published
+  crate, so no framework API is affected.
 
 - **Breaking for downstream `krab.toml` consumers:** a service's identity now defaults to
   its manifest key. A `[services.api]` entry running a binary whose own default name is
@@ -142,6 +152,26 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 ### Security
 
+- SSR no longer lets caller-supplied data break out of an HTML context. JSON-LD is
+  escaped for embedding (`<`, `>` and `&` become their `\uXXXX` JSON escapes, which a
+  JSON parser reads back unchanged), inline `<script>` bodies have `</script` rewritten
+  to `<\/script`, and attribute *names* are validated against the HTML name grammar and
+  dropped when they fail. Escaping a name was never enough: the escaper leaves spaces
+  and `=` intact, so a name like `x onload=alert(1)` still opened an event handler.
+  `view!` builds names from literal tokens, so only callers constructing `Attribute` or
+  `ScriptTag.extra_attrs` with runtime-supplied names were exposed — but JSON-LD exists
+  precisely to carry dynamic data, which made that path a stored-XSS vector in any
+  application using the API as intended.
+- `#[server]` validation failures no longer echo the request payload back in the error
+  message. A rejected body routinely carries the very credential that made it invalid,
+  and error responses are among the most heavily logged objects in a stack. The
+  deserializer's own message is not returned either: serde embeds offending values in it
+  (`unknown variant `...``, `invalid type: string "..."`), so echoing it reopens the same
+  leak through a narrower pipe. What a caller gets is the rejecting function, the class of
+  failure (malformed JSON, unexpected end of input, or a body that does not match the
+  expected shape), and the line and column — actionable without returning any submitted
+  value. This also drops the clone of the request body that existed only to feed the echo.
+
 - `h2` bumped to 0.4.16 for [RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258)
   (unbounded queueing of empty DATA frames in the `hyper` stack). Lockfile only.
 
@@ -160,6 +190,58 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
   `ChunkedStreamWriter::write_suspense_marker` takes it.
 
 ### Fixed
+
+- The orchestrator no longer orphans the services it starts. `krab.toml` spawns services
+  as `cargo run --bin X`, so the direct child is cargo and the service is a grandchild;
+  cargo does not forward signals, so `SIGTERM` to the child's pid killed cargo and left
+  the service running with its port still bound. Children are now spawned into their own
+  process group and signalled with `killpg`. On Windows, which has neither process groups
+  nor signals, the forceful path uses `taskkill /T /F` to kill the tree instead of a
+  `Child::kill` that reached only cargo. Since `9f2e92b` the orchestrator owns ports, so
+  a leaked service also made the next `krab bootstrap` fail to bind. The forceful path
+  signals the group too, not just the graceful one — a service that outlived its shutdown
+  budget was still being killed by pid, which is the same leak at the one moment it matters
+  most. On Windows a `taskkill` that cannot run now falls back to `Child::kill`, and the
+  wait for the child to be reaped is bounded: previously that wait was unbounded with no
+  fallback behind it, so a `taskkill` failure hung shutdown instead of leaking.
+  `kill_on_drop` remains a partial backstop — it reaps cargo, not the service — so an
+  orchestrator panic or `SIGKILL` can still leak; normal shutdown does not.
+- ISR `ETag`s are derived with SHA-256 instead of `DefaultHasher`, whose output is
+  explicitly not stable across Rust releases. Two replicas built by different toolchains
+  derived different ETags from byte-identical HTML, so every cross-replica revalidation
+  missed. The rendered shape — `krab-` plus 16 hex characters — is unchanged.
+- `rollback_to_version` takes the migration advisory lock the forward path has always
+  taken. A rollback could otherwise interleave with another replica still migrating
+  forward, or with a second rollback, racing both the DDL and the `krab_migrations`
+  bookkeeping — exactly the rolling-deploy window the lock exists to close.
+- The split `service_users` binaries publish their target's identity to the environment
+  from `fn main()`, before the Tokio runtime is built, rather than from inside an
+  `async fn`. `std::env::set_var` mutates a process-global table that is read without
+  synchronisation, so it is only sound while the process is still single-threaded, and a
+  multi-threaded runtime has already spawned its workers. It is also why that call is
+  `unsafe` in edition 2024.
+- The frontend's hot-reload poller starts only in dev. It `stat`ed `dist/.hmr_signal`
+  every 100 ms forever, with no shutdown — roughly 864,000 syscalls a day in production
+  for a file only the dev workflow ever writes.
+- `/asset-manifest.json` publishes a real digest of the client bundle, or none at all. It
+  previously shipped a constant `sha256-demo-manifest-checksum` and `?h=6f2c1a` that
+  described no file ever built, while the browser checked only that the string began with
+  `sha256-`. When the bundle cannot be read the `integrity` field is now absent, which the
+  browser already reads as degraded. The digest is keyed on the bundle's modification time
+  and length rather than computed once per process, so a bundle rebuilt while the server
+  runs is re-hashed instead of advertising the digest of the bytes it replaced — a wrong
+  integrity value is worse than none, because the browser enforces it. When
+  `KRAB_FRONTEND_PKG_DIR` is unset the bundle is looked for next to the executable as well
+  as under `dist/pkg`. `build.rs` no longer writes the same invented digest into
+  `public/__ssg/asset-manifest.json`, which the original fix left behind.
+
+- The dev hot-reload endpoint no longer reloads the page in a loop. `/api/hmr` replayed the
+  watch channel's current value to every new subscriber and the client reloads on any
+  message, so a browser on localhost reconnected and reloaded indefinitely without a file
+  having changed. Only actual signals are sent now.
+- A void element given children no longer renders malformed markup: `<br>x</br>` is now
+  `<br/>x`, which is how a browser parses that source, instead of emitting a closing tag
+  for an element that cannot have one.
 
 - An exported `KRAB_PORT` no longer moves every service onto one port. The per-service
   default (`3000` frontend, `3001` auth, `3002` users, `3207` users-split) is a fallback

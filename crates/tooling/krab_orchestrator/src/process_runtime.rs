@@ -16,6 +16,11 @@ use crate::configuration::{
 
 const ORCHESTRATOR_ARTIFACT_ROOT: &str = "internal/audit/orchestrator";
 const PROBE_BODY_EXCERPT_LIMIT: usize = 160;
+/// How long to wait for a child to be reaped after the force-kill path has run.
+///
+/// Every kill there is best-effort, so this is the bound that keeps a child the
+/// system refused to kill from hanging the entire shutdown sequence.
+const FORCE_KILL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Default)]
 struct ProbeFailureDiagnostics {
@@ -425,15 +430,21 @@ pub(super) async fn terminate_child(
 
     #[cfg(unix)]
     {
-        use nix::sys::signal::{kill, Signal};
+        use nix::sys::signal::{killpg, Signal};
         use nix::unistd::Pid;
 
         if let Some(pid_u32) = child.id() {
-            let pid = Pid::from_raw(pid_u32 as i32);
-            if let Err(err) = kill(pid, Signal::SIGTERM) {
-                warn!(service = %name, pid = pid_u32, error = %err, "service_sigterm_failed");
+            // The group, not the pid. `krab.toml` spawns services as
+            // `cargo run --bin X`, so the direct child is cargo and the service
+            // is a grandchild; cargo does not forward signals, so signalling
+            // the pid alone killed cargo and left the service running with its
+            // port still bound. `spawn_service` makes the child its own group
+            // leader, so its pgid equals its pid and this reaches both.
+            let pgid = Pid::from_raw(pid_u32 as i32);
+            if let Err(err) = killpg(pgid, Signal::SIGTERM) {
+                warn!(service = %name, pgid = pid_u32, error = %err, "service_sigterm_failed");
             } else {
-                info!(service = %name, pid = pid_u32, "service_sigterm_sent");
+                info!(service = %name, pgid = pid_u32, "service_sigterm_sent");
             }
         }
     }
@@ -459,17 +470,102 @@ pub(super) async fn terminate_child(
         }
     }
 
-    if let Err(err) = child.kill().await {
-        warn!(service = %name, error = %err, "service_force_kill_failed");
-        return;
+    // Windows has neither process groups nor signals, and `Child::kill` reaches
+    // only the direct child — `cargo`, which does not pass the kill on to the
+    // service binary. The service would survive the orchestrator with its port
+    // still bound, and since `9f2e92b` the orchestrator owns ports, so the next
+    // run fails to bind. `taskkill /T` walks the tree instead.
+    #[cfg(windows)]
+    {
+        let mut tree_killed = false;
+
+        if let Some(pid) = child.id() {
+            match tokio::process::Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &pid.to_string()])
+                .output()
+                .await
+            {
+                Ok(out) if out.status.success() => {
+                    info!(service = %name, pid, "service_process_tree_killed");
+                    tree_killed = true;
+                }
+                Ok(out) => {
+                    warn!(
+                        service = %name,
+                        pid,
+                        code = ?out.status.code(),
+                        stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                        "service_process_tree_kill_reported_failure"
+                    );
+                }
+                Err(err) => {
+                    warn!(service = %name, pid, error = %err, "service_process_tree_kill_failed_to_run");
+                }
+            }
+        }
+
+        // `taskkill` is not guaranteed to be on PATH, and it reports failure for
+        // a tree it cannot open. Without this fallback the child stays live and
+        // the unbounded `wait` below never returns — shutdown hangs rather than
+        // leaking. `kill` reaches only `cargo`, so the grandchild can still
+        // survive; that is a leak, and a leak beats a hang.
+        if !tree_killed {
+            if let Err(err) = child.kill().await {
+                warn!(service = %name, error = %err, "service_force_kill_failed");
+            } else {
+                warn!(service = %name, "service_force_killed_direct_child_only_tree_may_survive");
+            }
+        }
     }
 
-    match child.wait().await {
-        Ok(status) => {
+    // The force path has the same problem the graceful path does: `Child::kill`
+    // signals `cargo`, not the service it spawned. Signal the group, exactly as
+    // the SIGTERM above does, or a service that outlived the shutdown budget is
+    // left running with its port bound — the leak this whole function exists to
+    // prevent, reappearing at the one moment it matters most.
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{killpg, Signal};
+        use nix::unistd::Pid;
+
+        if let Some(pid_u32) = child.id() {
+            let pgid = Pid::from_raw(pid_u32 as i32);
+            if let Err(err) = killpg(pgid, Signal::SIGKILL) {
+                warn!(service = %name, pgid = pid_u32, error = %err, "service_group_force_kill_failed");
+            } else {
+                info!(service = %name, pgid = pid_u32, "service_group_force_killed");
+            }
+        }
+
+        // The group signal does not reap the direct child; this does, so the
+        // `wait` below returns promptly instead of on the timeout.
+        if let Err(err) = child.kill().await {
+            warn!(service = %name, error = %err, "service_force_kill_failed");
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    if let Err(err) = child.kill().await {
+        warn!(service = %name, error = %err, "service_force_kill_failed");
+    }
+
+    // Bounded. Every kill above is best-effort — `taskkill` may be missing, the
+    // group may be gone, the child may be unkillable — and an unbounded wait on
+    // a live child hangs the whole shutdown, which is worse than reporting the
+    // service as unreaped and moving on to the next one.
+    match tokio::time::timeout(FORCE_KILL_REAP_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => {
             info!(service = %name, status = %status, code = ?status.code(), "service_stopped_forcefully");
         }
-        Err(err) => {
+        Ok(Err(err)) => {
             warn!(service = %name, error = %err, "service_wait_failed_after_force_kill");
+        }
+        Err(_) => {
+            warn!(
+                service = %name,
+                timeout_ms = FORCE_KILL_REAP_TIMEOUT.as_millis() as u64,
+                "service_still_running_after_force_kill_abandoning_wait"
+            );
         }
     }
 }
@@ -512,12 +608,32 @@ pub(super) async fn spawn_service(
     service: &ServiceDefinition,
 ) -> Result<tokio::process::Child> {
     let mut cmd = build_command(name, service);
+
+    // Give the child its own process group so shutdown can reach the whole
+    // tree: the direct child is usually `cargo run`, which spawns the service
+    // as a grandchild and does not forward signals to it. As group leader the
+    // child's pgid equals its pid, which is what `terminate_child` signals.
+    //
+    // The children no longer share the terminal's foreground group, so a
+    // Ctrl-C at the console reaches only the orchestrator. That is the correct
+    // arrangement here — `main` installs a `ctrl_c` handler and shuts the
+    // services down in dependency order — and it removes the race where the
+    // terminal and the orchestrator both signalled the same processes.
+    #[cfg(unix)]
+    cmd.process_group(0);
+
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // Backstop for the paths that never reach `shutdown_children`: if the
-        // orchestrator panics or is killed outright, the runtime still reaps
-        // its children instead of leaving every service running and its port
-        // bound.
+        // Partial backstop for the paths that never reach `shutdown_children`.
+        // Be precise about what it buys: `kill_on_drop` signals the direct
+        // child only, which is `cargo run`, and cargo does not pass it on. So a
+        // dropped handle reaps cargo and can leave the service itself running
+        // with its port bound — the same gap the group signalling in
+        // `terminate_child` exists to close, and one this cannot close because
+        // `Drop` is synchronous and the child map is not reachable from it.
+        //
+        // What that means in practice: an orchestrator panic or SIGKILL may
+        // leak services. `krab bootstrap` shutting down normally does not.
         .kill_on_drop(true);
 
     let mut child = cmd.spawn().with_context(|| {

@@ -40,6 +40,29 @@ KRAB_AUTH_MODE=static
 - A single bearer token (`KRAB_BEARER_TOKEN`) is accepted.
 - **Blocked in non-dev environments** — startup fails with a clear error message.
 
+### Unauthenticated routes
+
+`auth_middleware` skips a baseline list of open paths: `/`, `/health`, `/ready`,
+the `/api/v1/auth/*` endpoints a caller needs before it holds a token,
+`/api/status`, and the demo-app routes the workspace services serve
+(`/contact`, `/data/dashboard`, `/rpc/version`, `/rpc/now`,
+`/asset-manifest.json`, `/blog/*`, `/pkg/*`). Trailing `*` is a prefix match.
+
+- `KRAB_AUTH_OPEN_PATHS` **replaces** that baseline rather than extending it, so
+  a deployment can close defaults it does not serve. An explicitly empty value
+  closes every one of them.
+- **The metrics endpoints are not on the baseline list.** `/metrics` and
+  `/metrics/prometheus` require auth unless `KRAB_METRICS_PUBLIC=true`, which is
+  additive over `KRAB_AUTH_OPEN_PATHS` — reopening metrics does not mean
+  restating every other open path. They were open by default before `0.4.0`,
+  which handed anonymous callers a service's full route inventory, request
+  volumes, error counts and latency distributions; on a low-traffic service,
+  per-route timing is enough to infer individual user activity. Prefer
+  authenticating the scraper or binding metrics to a network only it can reach.
+- The baseline is framework-owned and still carries app-shaped entries from the
+  bundled services. Audit it against your own routes rather than assuming it
+  describes your application.
+
 ---
 
 ## Secret Management

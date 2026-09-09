@@ -2,8 +2,10 @@ use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::response::Html;
 use axum::{Json, Router};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use krab_client::components::{Counter, CounterProps, Likes, LikesProps, Toggle, ToggleProps};
-use krab_core::config::KrabConfig;
+use krab_core::config::{Environment, KrabConfig};
 use krab_core::error_boundary::ErrorBoundary;
 use krab_core::http::{apply_common_http_layers, HasRuntimeState, RuntimeState};
 use krab_core::i18n::{detect_locale_from_header, I18n, Locale, TranslationBundle};
@@ -17,12 +19,13 @@ use krab_macros::view;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::warn;
+use tracing::{info, warn};
 
 mod app_state;
 mod cache;
@@ -1008,11 +1011,157 @@ async fn dashboard_handler(State(state): State<AppState>) -> Json<serde_json::Va
     }))
 }
 
+/// Watch `dist/.hmr_signal` and publish each new signal value to `hmr_tx`.
+///
+/// Dev-only: see the call site. Kept as a named function so the spawn is
+/// conditional at one obvious place rather than buried in `main`.
+fn spawn_hmr_signal_poller(hmr_tx: tokio::sync::watch::Sender<u64>) {
+    tokio::spawn(async move {
+        let mut last_sig = 0;
+        let p = std::path::PathBuf::from("dist/.hmr_signal");
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Ok(content) = std::fs::read_to_string(&p) {
+                if let Ok(sig) = content.trim().parse::<u64>() {
+                    if sig != last_sig {
+                        last_sig = sig;
+                        let _ = hmr_tx.send(sig);
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Directory holding the built client bundle, for manifest digests.
+const DEFAULT_PKG_DIR: &str = "dist/pkg";
+/// The bundle file whose bytes back the published `integrity` value.
+const CLIENT_BUNDLE_FILE: &str = "krab_client.js";
+
+/// Content digest of the client bundle as `(cache_buster, integrity)`.
+///
+/// Computed once, from the bytes actually on disk. The manifest previously
+/// published `"integrity":"sha256-demo-manifest-checksum"` and `?h=6f2c1a` —
+/// constants that described no file ever built, while the browser checked only
+/// that the string began with `sha256-`. Either the value is derived from the
+/// bundle or it is not published at all.
+///
+/// This service links `/pkg/krab_client.js` but does not serve it, so the
+/// location is configurable via `KRAB_FRONTEND_PKG_DIR`. When that is unset the
+/// candidates below are tried in order, which covers running from the workspace
+/// root and running as an installed binary with the bundle beside it.
+///
+/// **Deployment note.** `Dockerfile.service` copies only the binary, and nothing
+/// in `docker-compose.yml` mounts a bundle, so a containerised frontend has no
+/// `krab_client.js` to hash — and none to serve either. The degraded banner the
+/// browser then shows is accurate rather than spurious: there genuinely is no
+/// client bundle in that image. Ship one and point `KRAB_FRONTEND_PKG_DIR` at
+/// it if you want hydration in a container.
+fn bundle_path_candidates() -> Vec<std::path::PathBuf> {
+    if let Some(dir) = krab_core::config::env_non_empty("KRAB_FRONTEND_PKG_DIR") {
+        // Explicit configuration is authoritative: if the operator named a
+        // directory and the bundle is not there, that is a fault to report, not
+        // a reason to silently hash some other file.
+        return vec![std::path::Path::new(&dir).join(CLIENT_BUNDLE_FILE)];
+    }
+
+    let mut candidates = vec![std::path::Path::new(DEFAULT_PKG_DIR).join(CLIENT_BUNDLE_FILE)];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            candidates.push(exe_dir.join("pkg").join(CLIENT_BUNDLE_FILE));
+            candidates.push(exe_dir.join(DEFAULT_PKG_DIR).join(CLIENT_BUNDLE_FILE));
+        }
+    }
+    candidates
+}
+
+/// Content digest of the client bundle as `(cache_buster, integrity)`.
+///
+/// Keyed on the bundle's `(mtime, len)` rather than computed once for the life
+/// of the process. Caching the first answer forever meant two things: a bundle
+/// built after the first request was never hashed — the endpoint kept reporting
+/// "unreadable" until restart — and a rebuilt bundle kept advertising the digest
+/// of the bytes it replaced, which is worse than publishing none.
+fn client_bundle_digest() -> Option<std::sync::Arc<(String, String)>> {
+    type Cached = (
+        (std::time::SystemTime, u64),
+        std::sync::Arc<(String, String)>,
+    );
+    static CACHE: std::sync::OnceLock<std::sync::RwLock<Option<Cached>>> =
+        std::sync::OnceLock::new();
+    static MISSING_LOGGED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    let cache = CACHE.get_or_init(|| std::sync::RwLock::new(None));
+
+    let stamped = bundle_path_candidates().into_iter().find_map(|path| {
+        let meta = std::fs::metadata(&path).ok()?;
+        let modified = meta.modified().ok()?;
+        Some((path, (modified, meta.len())))
+    });
+
+    let Some((path, stamp)) = stamped else {
+        // Once, not per request: a frontend with no bundle serves this endpoint
+        // on every page load, and the warning is about a steady state.
+        if !MISSING_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            warn!(
+                candidates = ?bundle_path_candidates(),
+                "asset_manifest_integrity_unavailable_bundle_not_found"
+            );
+        }
+        return None;
+    };
+
+    if let Ok(guard) = cache.read() {
+        if let Some((cached_stamp, digest)) = guard.as_ref() {
+            if *cached_stamp == stamp {
+                return Some(std::sync::Arc::clone(digest));
+            }
+        }
+    }
+
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let digest = Sha256::digest(&bytes);
+            let value = std::sync::Arc::new((
+                format!("{:x}", digest)[..8].to_string(),
+                format!("sha256-{}", BASE64_STANDARD.encode(digest)),
+            ));
+            if let Ok(mut guard) = cache.write() {
+                *guard = Some((stamp, std::sync::Arc::clone(&value)));
+            }
+            MISSING_LOGGED.store(false, std::sync::atomic::Ordering::Relaxed);
+            Some(value)
+        }
+        Err(err) => {
+            warn!(
+                path = %path.display(),
+                error = %err,
+                "asset_manifest_integrity_unavailable_bundle_unreadable"
+            );
+            None
+        }
+    }
+}
+
 fn asset_manifest_json() -> String {
-    format!(
-        "{{\"assets\":{{\"krab_client.js\":{{\"path\":\"/pkg/krab_client.js?h=6f2c1a\",\"integrity\":\"sha256-demo-manifest-checksum\",\"immutable\":true}}}},\"server_function_version\":\"{}\"}}",
-        SERVER_FUNCTION_VERSION
-    )
+    asset_manifest_json_with(client_bundle_digest().as_deref())
+}
+
+fn asset_manifest_json_with(digest: Option<&(String, String)>) -> String {
+    match digest {
+        Some((cache_buster, integrity)) => format!(
+            "{{\"assets\":{{\"krab_client.js\":{{\"path\":\"/pkg/krab_client.js?h={}\",\"integrity\":\"{}\",\"immutable\":true}}}},\"server_function_version\":\"{}\"}}",
+            cache_buster, integrity, SERVER_FUNCTION_VERSION
+        ),
+        // No readable bundle means no digest to publish. The browser treats a
+        // missing integrity as degraded, which is the correct reading: a bundle
+        // this process cannot read is one it cannot vouch for.
+        None => format!(
+            "{{\"assets\":{{\"krab_client.js\":{{\"path\":\"/pkg/krab_client.js\",\"immutable\":true}}}},\"server_function_version\":\"{}\"}}",
+            SERVER_FUNCTION_VERSION
+        ),
+    }
 }
 
 fn rpc_version_json() -> String {
@@ -1101,7 +1250,11 @@ async fn hmr_handler(
     use futures_util::StreamExt;
     use tokio_stream::wrappers::WatchStream;
 
-    let stream = WatchStream::new(state.hmr_rx)
+    // `from_changes`, not `new`: `WatchStream::new` yields the channel's current
+    // value immediately on subscribe, and the client reloads the page on any
+    // message it receives. That is a reload loop — connect, receive, reload,
+    // connect — with no file having changed. Only actual signals should reach it.
+    let stream = WatchStream::from_changes(state.hmr_rx)
         .map(|sig| Ok(axum::response::sse::Event::default().data(sig.to_string())));
 
     axum::response::Sse::new(stream)
@@ -1144,21 +1297,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     let (hmr_tx, hmr_rx) = tokio::sync::watch::channel(0);
 
-    tokio::spawn(async move {
-        let mut last_sig = 0;
-        let p = std::path::PathBuf::from("dist/.hmr_signal");
-        loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if let Ok(content) = std::fs::read_to_string(&p) {
-                if let Ok(sig) = content.trim().parse::<u64>() {
-                    if sig != last_sig {
-                        last_sig = sig;
-                        let _ = hmr_tx.send(sig);
-                    }
-                }
-            }
-        }
-    });
+    // Hot-module reload is a development affordance, and this poller is a
+    // `stat` of `dist/.hmr_signal` every 100 ms, forever, with no shutdown —
+    // roughly 864,000 syscalls a day in a production deployment for a file the
+    // dev workflow is the only thing that ever writes. Spawned only in dev.
+    if matches!(cfg.environment, Environment::Dev) {
+        spawn_hmr_signal_poller(hmr_tx);
+    } else {
+        info!(
+            environment = ?cfg.environment,
+            "hmr_signal_poller_not_started_outside_dev"
+        );
+    }
 
     let topology_runtime = TopologyRuntime::from_env_checked()?;
     let auth_base_url = resolve_service_base_url(
@@ -1232,19 +1382,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 #[allow(dead_code, unused_imports)]
 mod tests {
     use super::{
-        api_status_handler, asset_manifest_json, dashboard_handler, health_handler,
-        is_finalized_ssr_snapshot, normalize_public_base_url, normalize_service_base_url,
-        ready_handler, redact_email_for_log, redact_name_for_log, render_about_page,
-        render_blog_page, render_home_page, resolve_service_base_url, robots_txt_handler,
-        rpc_now_json, rpc_version_json, sitemap_xml_handler, stream_budget_bytes, AppState,
-        RuntimeState, SERVER_FUNCTION_VERSION,
+        api_status_handler, asset_manifest_json, asset_manifest_json_with, client_bundle_digest,
+        dashboard_handler, health_handler, is_finalized_ssr_snapshot, normalize_public_base_url,
+        normalize_service_base_url, ready_handler, redact_email_for_log, redact_name_for_log,
+        render_about_page, render_blog_page, render_home_page, resolve_service_base_url,
+        robots_txt_handler, rpc_now_json, rpc_version_json, sitemap_xml_handler,
+        stream_budget_bytes, AppState, RuntimeState, SERVER_FUNCTION_VERSION,
     };
+    use super::{Digest, Sha256, BASE64_STANDARD, CLIENT_BUNDLE_FILE};
     use crate::app_state::CachedHttpPayload;
     use crate::cache::{cache_authority, CacheAuthority};
     use crate::protocol_client::ProtocolAwareClient;
     use axum::extract::State;
     use axum::http::Method;
     use axum::Json;
+    use base64::Engine as _;
     use krab_core::http::HasRuntimeState;
     use krab_core::isr::IsrCache;
     use krab_core::service_contract::{ServiceEndpoint, ServiceTopology, TopologyRuntime};
@@ -1612,15 +1764,129 @@ mod tests {
 
     #[test]
     fn asset_manifest_contract_enforces_integrity_shape() {
-        let raw = asset_manifest_json();
+        // Fed an explicit digest rather than reading `client_bundle_digest()`,
+        // which depends on a built bundle being on disk — it is not in a test
+        // runner, and it was exactly that absence the old hardcoded
+        // `sha256-demo-manifest-checksum` papered over.
+        let digest = (
+            "0a1b2c3d".to_string(),
+            "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=".to_string(),
+        );
+
+        let raw = asset_manifest_json_with(Some(&digest));
+
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let entry = &json["assets"]["krab_client.js"];
-        assert!(entry["path"].as_str().is_some());
+        assert_eq!(
+            entry["path"].as_str(),
+            Some("/pkg/krab_client.js?h=0a1b2c3d")
+        );
         assert!(entry["integrity"]
             .as_str()
             .map(|v| v.starts_with("sha256-"))
             .unwrap_or(false));
         assert_eq!(entry["immutable"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn asset_manifest_publishes_no_integrity_when_the_bundle_is_unreadable() {
+        let raw = asset_manifest_json_with(None);
+
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let entry = &json["assets"]["krab_client.js"];
+        // Absent, not invented. The browser reads a missing integrity as
+        // degraded, which is the honest signal when there is no bundle to hash.
+        assert!(entry["integrity"].is_null());
+        assert_eq!(entry["path"].as_str(), Some("/pkg/krab_client.js"));
+        assert_eq!(
+            json["server_function_version"].as_str(),
+            Some(SERVER_FUNCTION_VERSION)
+        );
+    }
+
+    #[test]
+    fn asset_manifest_digest_is_derived_from_the_bundle_bytes() {
+        // The digest of empty content, cross-checked against `sha256sum` and
+        // `base64`: e3b0c442… is SHA-256 of "", and 47DEQpj8… is that digest
+        // base64-encoded. Pins that the manifest carries a real content hash.
+        let digest = Sha256::digest(b"");
+
+        assert_eq!(
+            format!("sha256-{}", BASE64_STANDARD.encode(digest)),
+            "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
+        );
+        assert_eq!(&format!("{:x}", digest)[..8], "e3b0c442");
+    }
+
+    #[test]
+    fn client_bundle_digest_rehashes_when_the_bundle_changes() {
+        // The digest used to be computed once per process. A bundle rebuilt
+        // while the server ran kept advertising the hash of the bytes it had
+        // replaced — a wrong integrity value, which is worse than none, because
+        // the browser enforces it. Keying the cache on (mtime, len) is what
+        // this pins.
+        let dir = std::env::temp_dir().join(format!(
+            "krab_digest_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let bundle = dir.join(CLIENT_BUNDLE_FILE);
+
+        std::fs::write(&bundle, b"first").expect("write bundle");
+        std::env::set_var("KRAB_FRONTEND_PKG_DIR", &dir);
+        let first = client_bundle_digest().expect("digest for the first bundle");
+        assert_eq!(
+            first.1,
+            format!(
+                "sha256-{}",
+                BASE64_STANDARD.encode(Sha256::digest(b"first"))
+            )
+        );
+
+        // Different length as well as different content, so the cache key
+        // differs even where the filesystem's mtime resolution is coarse.
+        std::fs::write(&bundle, b"second build").expect("rewrite bundle");
+        let second = client_bundle_digest().expect("digest for the rebuilt bundle");
+        assert_eq!(
+            second.1,
+            format!(
+                "sha256-{}",
+                BASE64_STANDARD.encode(Sha256::digest(b"second build"))
+            )
+        );
+        assert_ne!(first.1, second.1, "a rebuilt bundle must be re-hashed");
+
+        std::env::remove_var("KRAB_FRONTEND_PKG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn hmr_stream_does_not_replay_the_current_signal_on_connect() {
+        use futures_util::StreamExt;
+        use tokio_stream::wrappers::WatchStream;
+
+        // `WatchStream::new` emits the channel's current value on subscribe, and
+        // the browser reloads on any message — connect, receive, reload,
+        // connect, with no file having changed. Only real signals may be sent.
+        let (tx, rx) = tokio::sync::watch::channel(7u64);
+        let mut stream = WatchStream::from_changes(rx);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), stream.next())
+                .await
+                .is_err(),
+            "a fresh subscriber must not be handed the current signal"
+        );
+
+        tx.send(8).expect("send signal");
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("a real signal must be delivered");
+        assert_eq!(delivered, Some(8));
     }
 
     #[test]
