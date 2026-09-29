@@ -494,23 +494,60 @@ fail to resolve its sibling.
 
 ## Phase 7 — Tag and mirror
 
+The public repository is **not a fork or a mirror in git's sense**: its history
+shares no commit with the development repository (`git merge-base` between the
+two `main`s is empty). It is the development tree, squashed into one commit per
+release on top of the previous public commit. Verified for 0.4.0: the public
+`main` tree is byte-identical to the development tree at the 0.4.0 release
+commit, and nothing exists on the public side that is absent from the
+development side. This step had never been written down before 0.5.0.
+
+### 7.1 Tag the development repository
+
 ```sh
-git tag -a v0.5.0 -m "0.5.0"
+git tag -a v0.5.0 -m "Krab 0.5.0" -m "<one paragraph: the breaking changes, and where the migration notes are>"
 git push origin v0.5.0
+```
+
+If the tag has to move — fixes landing after it was cut, as happened for 0.5.0 —
+delete it on the remote and re-create it, **only while nothing has consumed
+it**: no crates.io publish, no mirror push. A tag the registry or the public
+repository has seen is immutable in practice.
+
+### 7.2 Build the public commit
+
+From the development checkout, with the `public` remote fetched:
+
+```sh
+TREE=$(git rev-parse v0.5.0^{tree})
+C=$(git commit-tree "$TREE" -p public/main      -m "Release 0.5.0 — <one line>"      -m "Tree of the development repository at tag v0.5.0, squashed onto the public history as every release before it."      -m "<the breaking changes, one paragraph>")
+git branch -f publish/0.5.0 "$C"
+git diff --stat v0.5.0 publish/0.5.0 | wc -l    # must print 0: the trees are identical
+```
+
+`commit-tree` needs no checkout and cannot drag in anything untracked — the
+tree object is exactly what the tag points at, so gitignored `internal/` and
+`target/` cannot leak. The `diff --stat` line is the proof; keep its output in
+the evidence bundle.
+
+### 7.3 Push, after crates.io
+
+Only after every crate is on the registry (Phase 6): the public repository's
+own commit messages say it tracks *published* crates, so it must not run ahead
+of them.
+
+```sh
+git push public publish/0.5.0:main
 git push public v0.5.0
 ```
 
-> Before this release `git ls-remote --tags origin` was **empty**: `v0.2.0`,
-> `v0.3.0` and `v0.4.0` existed locally and on `public` only, which is why
-> `release-attestation.yaml` (`on: push: tags: 'v*'`) had never even been
-> triggered. `v0.5.0` changed that — the trigger fired, and died at startup like
-> every other run.
-> Pushing to `origin` is still worth doing — the tag is the immutable source
-> snapshot `RELEASE_POLICY.md` requires — but do **not** expect an attestation
-> run to appear, and do not cite one.
+Then cut the GitHub release on the public repository from the tag, with the
+`[0.5.0]` changelog section as its body.
 
-**Done when** `git ls-remote --tags <remote>` shows `v0.5.0` on both remotes,
-and the GitHub release is cut on `krab-pub`.
+**Done when** `git ls-remote --tags` shows `v0.5.0` on both remotes,
+`git diff --stat v0.5.0 public/main` is empty, and the GitHub release exists.
+The tag push to `origin` will also create an Actions run that fails at startup
+like every other; do not cite it as attestation.
 
 ---
 
@@ -531,8 +568,15 @@ again — yank immediately and cut a patch.
 
 - [ ] `cargo install krab_cli` puts a binary named `krab` on `PATH`. The package
       cannot be named `krab`; the binary comes from an explicit `[[bin]]`.
-- [ ] `krab doctor --strict` passes in a fresh `krab new` project — the exact
-      path that was broken at `0.2.0`.
+- [ ] `krab doctor --strict` passes in a fresh `krab new` project **with the
+      environment exported**, e.g. `KRAB_AUTH_MODE=static krab doctor --strict`.
+      Verified 2026-09-09 that it does *not* pass bare, and did not at 0.4.0
+      either: `doctor` and `env-check` read process variables only and never
+      load the `.env` the scaffold's own "Next:" hint tells you to create, so an
+      unset `KRAB_AUTH_MODE` falls to the fail-closed default and demands OIDC
+      values the template does not set. Pre-existing; a bare failure here is not
+      a release defect, and this step used to claim otherwise. Follow-up: the
+      two commands should load the project `.env`.
 - [ ] `krab new` still builds for all five templates (`default`, `saas`,
       `edge-ssr`, `event-stream`, `fullstack`) against the *published* crates,
       not the workspace paths.
