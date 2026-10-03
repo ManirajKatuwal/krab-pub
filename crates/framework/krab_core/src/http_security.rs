@@ -1,3 +1,5 @@
+//! Client-IP extraction and CSRF protection for the HTTP stack.
+
 use axum::body::Body;
 use axum::extract::connect_info::ConnectInfo;
 use axum::extract::State;
@@ -32,6 +34,16 @@ fn trusted_proxy_hops() -> usize {
     }
 }
 
+/// The client IP used for rate limiting and auth-failure tracking.
+///
+/// With `trust_proxy_headers` false (the default, `KRAB_TRUST_PROXY_HEADERS`)
+/// forwarded headers are ignored and the socket peer address from axum's
+/// `ConnectInfo` is used. With it true, the entry `KRAB_TRUSTED_PROXY_HOPS`
+/// (default 1) from the right of `x-forwarded-for` is taken if it parses as
+/// an IP, then `x-real-ip`, then `ConnectInfo`. Returns `"unknown"` when none
+/// is available — which happens when the server was not started with
+/// `into_make_service_with_connect_info`, and puts every such client in one
+/// bucket.
 pub fn extract_client_ip(req: &Request<Body>, trust_proxy_headers: bool) -> String {
     if trust_proxy_headers {
         if let Some(value) = req
@@ -75,10 +87,15 @@ pub fn extract_client_ip(req: &Request<Body>, trust_proxy_headers: bool) -> Stri
     "unknown".to_string()
 }
 
+/// Whether [`csrf_protection_middleware`] enforces anything: true when
+/// `KRAB_CSRF_ENABLED` or `KRAB_AUTH_COOKIE_SESSION_ENABLED` is set true.
+/// Read from the environment on every call. Off by default.
 pub fn csrf_protection_enabled() -> bool {
     bool_env("KRAB_CSRF_ENABLED", false) || bool_env("KRAB_AUTH_COOKIE_SESSION_ENABLED", false)
 }
 
+/// The methods CSRF protection applies to: `POST`, `PUT`, `PATCH` and
+/// `DELETE`.
 pub fn is_unsafe_http_method(method: &Method) -> bool {
     matches!(
         *method,
@@ -86,6 +103,8 @@ pub fn is_unsafe_http_method(method: &Method) -> bool {
     )
 }
 
+/// The CSRF token from the request's [`crate::csrf::CSRF_COOKIE_NAME`]
+/// cookie, if present. Only the first `cookie` header is read.
 pub fn csrf_cookie_token(headers: &axum::http::HeaderMap) -> Option<String> {
     let raw = headers.get("cookie")?.to_str().ok()?;
     raw.split(';').map(str::trim).find_map(|pair| {
@@ -95,6 +114,8 @@ pub fn csrf_cookie_token(headers: &axum::http::HeaderMap) -> Option<String> {
     })
 }
 
+/// The CSRF token from the request's [`crate::csrf::CSRF_HEADER_NAME`]
+/// header, if present and valid UTF-8.
 pub fn csrf_header_token(headers: &axum::http::HeaderMap) -> Option<String> {
     headers
         .get(crate::csrf::CSRF_HEADER_NAME)
@@ -128,6 +149,13 @@ pub async fn csrf_token_endpoint() -> Response {
     response
 }
 
+/// Double-submit-cookie CSRF check.
+///
+/// Enforced only when [`csrf_protection_enabled`], only for
+/// [unsafe methods](is_unsafe_http_method), and only on requests that carry a
+/// `cookie` header — a request with no cookies has no ambient credentials to
+/// abuse. Such a request is rejected with `403` unless the cookie token and
+/// the header token are both present and equal (compared in constant time).
 pub async fn csrf_protection_middleware<S>(
     State(_state): State<S>,
     req: Request<Body>,

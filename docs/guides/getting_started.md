@@ -93,26 +93,104 @@ let app = Router::new()
 
 `cargo run`, then open `http://127.0.0.1:3000/page`.
 
-### Two things `view!` will not let you do
-
 **Text must be quoted.** `<h1>Hello</h1>` does not compile; `<h1>"Hello"</h1>`
 does. Bare words are parsed as Rust, not text.
 
-**Capitalised tags are a compile error.**
+### Composing components
+
+A component is a function taking one props struct and returning a `Node`. A
+capitalised tag calls it, building `{Name}Props` from the attributes:
 
 ```rust
-view! { <MyComponent/> }   // error
+use krab_core::Node;
+use krab_macros::view;
+
+pub struct CardProps {
+    pub title: String,
+    pub children: Node,
+}
+
+#[allow(non_snake_case)] // component functions are capitalised, like islands
+pub fn Card(props: CardProps) -> Node {
+    view! { <section class="card"><h2>{props.title}</h2>{props.children}</section> }
+}
+
+let page = view! {
+    <Card title="Inbox">
+        <p>"You have mail"</p>
+    </Card>
+};
+// renders: <section class="card"><h2>Inbox</h2><p>You have mail</p></section>
 ```
 
-`view!` has no component composition — a capitalised tag would be emitted as a
-literal `<MyComponent>` element that no browser renders, so it is rejected with
-a diagnostic instead. Compose by calling the function and interpolating:
+The rules, in full:
+
+- **Lowercase tags are HTML, capitalised tags are components.** A path works
+  too — `<ui::Card/>` calls `ui::Card` with a `ui::CardProps` — and the closing
+  tag repeats it: `</ui::Card>`. An unqualified `<Card/>` needs both `Card`
+  and `CardProps` in scope. `Show`, `For` and `Suspense` are reserved
+  ([control flow](../adr/0008-view-control-flow-tags.md),
+  [`<Suspense>`](../adr/0016-suspense-boundaries.md)).
+- **Attributes are fields.** `aria-label="x"` sets `aria_label`; `type="x"`
+  sets `r#type`. A misspelt attribute is rustc's "no field named ..." error,
+  pointing at the attribute.
+- **String literals convert, expressions do not.** `title="Inbox"` becomes
+  `Into::into("Inbox")`, so it fills a `String`. `title={name}` is passed as
+  written — `name` must already be the field's type.
+- **Content between the tags is `children`**, a single `Node`. Omit the field
+  from the props struct if the component takes none.
+- **Every field is required**, unless you end the attributes with `..`:
+  `<Button label="Save" ../>` fills the rest from `ButtonProps::default()`.
+  `Node` implements `Default` (an empty fragment), so a props struct with
+  `children` can `#[derive(Default)]`.
+- **No `on:` on components** — a component has no element of its own to listen
+  on. Pass the handler as a prop and attach it inside.
+
+An `#[island]` has exactly this signature, so islands are used the same way —
+`<Counter initial={0}/>` — and still render their hydration wrapper on the
+server. Calling the function directly, `{Card(CardProps { ... })}`, remains
+valid. See [ADR 0013](../adr/0013-view-component-tags.md).
+
+### Sharing values with context
+
+A value every component in a subtree needs — the session, the locale — does not
+have to be threaded through props:
 
 ```rust
-view! { <div>{my_component(props)}</div> }
+use krab_core::signal::{provide_context, use_context, with_owner};
+
+#[derive(Clone)]
+pub struct Locale(pub &'static str);
+
+pub struct GreetingProps {}
+
+#[allow(non_snake_case)]
+pub fn Greeting(_props: GreetingProps) -> Node {
+    let locale = use_context::<Locale>().map(|l| l.0).unwrap_or("en");
+    view! { <p>{if locale == "fr" { "Bonjour" } else { "Hello" }}</p> }
+}
+
+async fn page() -> Html<String> {
+    Html(with_owner(|| {
+        provide_context(Locale("fr"));
+        view! { <main><Greeting/></main> }.render()
+    }))
+}
 ```
 
-See [ADR 0006](../adr/0006-view-component-composition.md).
+`with_owner` opens a scope; `provide_context` stores a value in it by type;
+`use_context` finds the nearest one above. Every component tag and island runs
+in a scope of its own, so a component's `provide_context` reaches what it
+renders and not its siblings. Outside any scope `provide_context` does nothing
+(and logs `context_provided_without_owner`) — on a server, that is what stops
+one request's values reaching the next.
+
+Read contexts in the component body and move the value into closures; a
+`Node::Dynamic` closure or event handler runs later, outside the scope. Effects
+are the exception — they keep their scope across re-runs. Content passed
+between a component's tags is built *before* the component runs, so it does not
+see what that component provides. See
+[ADR 0014](../adr/0014-context-api-and-owners.md).
 
 ---
 
@@ -145,7 +223,7 @@ pub fn Counter(props: CounterProps) -> Node {
 }
 ```
 
-Interpolate it into a page like any other node: `view! { <div>{Counter(CounterProps { initial: 0 })}</div> }`.
+Use it in a page like any other component: `view! { <div><Counter initial={0}/></div> }`.
 
 Server-side, that renders a wrapper carrying the hydration markers the browser
 runtime looks for — `data-island`, `data-props`, `data-krab-boundary`,
@@ -163,8 +241,8 @@ The `default` template is server-only, so this part needs three additions.
    crate-type = ["cdylib", "rlib"]
 
    [target.'cfg(target_arch = "wasm32")'.dependencies]
-   krab_core   = { version = "0.5", features = ["web"] }
-   krab_client = { version = "0.5", features = ["web"] }
+   krab_core   = { version = "0.6", features = ["web"] }
+   krab_client = { version = "0.6", features = ["web"] }
    inventory   = "0.3"
    wasm-bindgen = "0.2"
 
@@ -178,8 +256,20 @@ The `default` template is server-only, so this part needs three additions.
    wasm-pack build --target web -- --features web
    ```
 
-3. Load it from your page: `<script type="module" src="/pkg/hello_krab.js"></script>`,
-   and serve `pkg/` as static files.
+3. Load it from your page. Importing the glue file does not hydrate anything —
+   call `init()` and then `hydrate()` from a small module of your own:
+
+   ```js
+   // /app.js, loaded with <script type="module" src="/app.js"></script>
+   import init, { hydrate } from '/pkg/hello_krab.js';
+   await init();
+   hydrate();
+   ```
+
+   Serve `pkg/` as static files, including its `snippets/` subdirectory (the
+   per-island panic isolation ships there). Keep the bootstrap in a file rather
+   than an inline `<script>`: Krab's security headers send
+   `script-src 'self' 'wasm-unsafe-eval'`, which blocks inline scripts.
 
 > **`--features web` is required, and only valid for `wasm32`.** `#[island]`
 > selects its browser half on that feature alone, but that half needs
@@ -250,11 +340,30 @@ view! {
 }
 ```
 
-> **Attribute values are not reactive.** `view!` evaluates an attribute value
-> once, when the element is built, and stringifies it — `disabled={ move || … }`
-> does not compile (a closure has no `Display`). Reflect reactive state through
-> `<Show>`, text interpolation, or by re-rendering the element inside a dynamic
-> block. Reactive attributes are an acknowledged gap, not a hidden feature.
+**Attributes can be reactive too.** An attribute whose value is a closure
+literal is re-evaluated whenever the signals it reads change, so the button can
+disable itself while the request is in flight:
+
+```rust
+view! {
+    <button
+        disabled={ move || add.pending().get() }
+        class={ move || if add.pending().get() { "btn busy" } else { "btn" } }
+        on:click={ move |_| add.dispatch("from the island".to_string()) }
+    >
+        "Add task"
+    </button>
+}
+```
+
+The closure may return a string, a number, a `bool` — `true` renders the
+attribute present and empty, `false` removes it — or an `Option`, where `None`
+removes it. The server renders the current value; in the browser an effect
+patches the attribute (and, for `value`, `checked` and `selected`, the form
+control's live property). Only a closure *literal* is reactive: any other
+expression is stringified once, when the element is built, and a closure held
+in a variable must be written `{ move || f() }`. See
+[ADR 0015](../adr/0015-reactive-attributes.md).
 
 `pending` is true from `dispatch` until the request settles, `value` holds the
 last success, and `error` holds the last failure. Two guarantees are worth
@@ -304,6 +413,16 @@ blank page. On the server a resource never polls its future: with an initial
 value it renders `Ready`, without one `Pending`. See
 [ADR 0009](../adr/0009-resource-ssr-semantics.md) for why data needed at first
 paint belongs in the route handler, not a blocking render.
+
+The alternative is to not block at all: wrap the slow part in
+`<Suspense fallback={…}>`, give its resource a server loader with
+`.with_server_loader(...)`, and render the page with
+`krab_core::render_stream::render_to_stream`. The shell flushes with the
+fallback and the resolved content streams in when the loader finishes, swapped
+into place by the external `/_krab/stream.js` runtime. This works at page level
+only, not inside an island. See [ADR 0016](../adr/0016-suspense-boundaries.md),
+[ADR 0017](../adr/0017-progressive-streaming-ssr.md), and the `/streaming` page
+of the reference frontend.
 
 > **Server functions are public HTTP endpoints.** They are not privileged
 > because they look like function calls. Validate input and check authorisation
@@ -358,8 +477,9 @@ tests it, and builds its WASM bundle on every change.
 | `web` | Browser bindings, for the wasm32 half |
 | `grpc-semantics` | gRPC status-code and timeout vocabulary for a gateway — **not a transport** |
 
-Deprecated aliases, removable no earlier than `0.3.0`: `db` → `db-postgres`,
-`grpc` → `grpc-semantics`.
+The deprecated aliases `db` and `grpc` (and the module alias `krab_core::grpc`)
+were removed in 0.6.0; use `db-postgres`, `grpc-semantics` and
+`krab_core::grpc_semantics`.
 
 A feature-set mismatch is the most common first build failure: `cargo test -p
 krab_core` with no features compiles a much smaller surface than CI runs.

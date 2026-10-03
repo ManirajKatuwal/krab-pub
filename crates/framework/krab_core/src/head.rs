@@ -65,11 +65,28 @@ impl MetaTag {
     }
 }
 
+/// Whether `name` may be rendered as an `extra_attrs` attribute on a
+/// [`LinkTag`] or [`ScriptTag`]: a valid HTML attribute name that is not an
+/// event handler. `on*` names (ASCII case-insensitive — `onload`, `ONERROR`)
+/// are dropped, because an escaped value is still executed as script there,
+/// so attacker-influenced key/value pairs would otherwise be an XSS vector.
+fn extra_attr_allowed(name: &str) -> bool {
+    crate::is_valid_attr_name(name)
+        && !name
+            .get(..2)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("on"))
+}
+
 /// A `<link>` tag.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinkTag {
+    /// The `rel` attribute, for example `stylesheet` or `canonical`.
     pub rel: String,
+    /// The `href` attribute.
     pub href: String,
+    /// Further attributes by name, rendered in unspecified order. Names that
+    /// are not valid HTML attribute names, and event-handler names starting
+    /// with `on` (any case), are dropped; values are escaped.
     pub extra_attrs: HashMap<String, String>,
 }
 
@@ -82,6 +99,12 @@ impl LinkTag {
             html_escape(&self.href)
         );
         for (key, value) in &self.extra_attrs {
+            // Same rule as `ScriptTag`: escaping a name leaves spaces and `=`
+            // intact, so an attacker-supplied key could open a second
+            // attribute (`x onload=alert(1) y`). Invalid names are dropped.
+            if !extra_attr_allowed(key) {
+                continue;
+            }
             attrs.push_str(&format!(" {}=\"{}\"", html_escape(key), html_escape(value)));
         }
         format!("<link {}/>", attrs)
@@ -91,11 +114,20 @@ impl LinkTag {
 /// A `<script>` tag.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScriptTag {
+    /// The `src` attribute, for an external script.
     pub src: Option<String>,
+    /// Inline script body. Rendered as-is except that `</script` sequences
+    /// are rewritten to `<\/script` so they cannot close the block early.
     pub inline_content: Option<String>,
+    /// Adds `type="module"`.
     pub is_module: bool,
+    /// Adds the `async` attribute.
     pub is_async: bool,
+    /// Adds the `defer` attribute.
     pub is_defer: bool,
+    /// Further attributes by name, rendered in unspecified order. Names that
+    /// are not valid HTML attribute names, and event-handler names starting
+    /// with `on` (any case), are dropped; values are escaped.
     pub extra_attrs: HashMap<String, String>,
 }
 
@@ -121,22 +153,9 @@ fn escape_json_for_script(json: &str) -> String {
 /// which is where that sequence legitimately appears. The match is
 /// case-insensitive because the HTML tokenizer's is.
 fn escape_inline_script(content: &str) -> String {
-    const NEEDLE: &str = "</script";
-    // ASCII lowercasing is byte-for-byte, so indices into `lower` are valid
-    // indices into `content`.
-    let lower = content.to_ascii_lowercase();
-    let mut out = String::with_capacity(content.len());
-    let mut cursor = 0;
-    while let Some(rel) = lower[cursor..].find(NEEDLE) {
-        let at = cursor + rel;
-        out.push_str(&content[cursor..at]);
-        out.push_str("<\\/");
-        // Preserve the original casing of "script".
-        out.push_str(&content[at + 2..at + NEEDLE.len()]);
-        cursor = at + NEEDLE.len();
-    }
-    out.push_str(&content[cursor..]);
-    out
+    // One implementation with `view!`'s own `<script>` rendering, so the two
+    // cannot disagree about what is a breakout.
+    crate::escape_raw_text("script", content)
 }
 
 impl ScriptTag {
@@ -159,7 +178,7 @@ impl ScriptTag {
             // Escaping a name is not enough — `html_escape` leaves spaces and
             // `=` intact, so an attacker-supplied key could still open a second
             // attribute. Invalid names are dropped, as in `Element::render`.
-            if !crate::is_valid_attr_name(key) {
+            if !extra_attr_allowed(key) {
                 continue;
             }
             attrs.push_str(&format!(" {}=\"{}\"", html_escape(key), html_escape(value)));
@@ -389,9 +408,16 @@ impl HeadContext {
             self.json_ld = child.json_ld.clone();
         }
 
-        // Meta tags: child keys overwrite, unique keys append
+        // Meta tags: a child tag replaces the parent tag with the same
+        // attribute *and* key; anything else appends. Keyed on the pair because
+        // `name="author"` and `property="author"` are different tags — keying
+        // on the key alone let one silently replace the other.
         for child_tag in &child.meta_tags {
-            if let Some(pos) = self.meta_tags.iter().position(|t| t.key == child_tag.key) {
+            if let Some(pos) = self
+                .meta_tags
+                .iter()
+                .position(|t| t.attr_type == child_tag.attr_type && t.key == child_tag.key)
+            {
                 self.meta_tags[pos] = child_tag.clone();
             } else {
                 self.meta_tags.push(child_tag.clone());
@@ -633,6 +659,38 @@ mod tests {
         assert!(tags.contains("name=\"keywords\" content=\"rust,web\""));
     }
 
+    /// A crafted attribute name cannot open a second attribute on `<link>`.
+    #[test]
+    fn link_extra_attrs_drop_invalid_names() {
+        let mut extra = HashMap::new();
+        extra.insert("x onload=alert(1) y".to_string(), "v".to_string());
+        extra.insert("crossorigin".to_string(), "anonymous".to_string());
+        let html = LinkTag {
+            rel: "preload".to_string(),
+            href: "/a.css".to_string(),
+            extra_attrs: extra,
+        }
+        .render();
+        assert!(!html.contains("onload"), "{html}");
+        assert!(html.contains(r#"crossorigin="anonymous""#), "{html}");
+    }
+
+    #[test]
+    fn merge_keeps_name_and_property_tags_with_the_same_key_apart() {
+        let parent = HeadContext::new().meta("author", "Name Author");
+        let child = HeadContext::new().meta_property("author", "Property Author");
+
+        let tags = parent.merge(&child).render_tags();
+        assert!(
+            tags.contains("name=\"author\" content=\"Name Author\""),
+            "{tags}"
+        );
+        assert!(
+            tags.contains("property=\"author\" content=\"Property Author\""),
+            "{tags}"
+        );
+    }
+
     #[test]
     fn merge_appends_links_and_scripts() {
         let parent = HeadContext::new().link_stylesheet("/css/parent.css");
@@ -761,5 +819,43 @@ mod script_escaping_tests {
             "injected handler survived: {html}"
         );
         assert!(html.contains("data-ok=\"1\""));
+    }
+
+    /// A well-formed event-handler name is still script: `on*` extra
+    /// attributes are dropped from `<link>` and `<script>`, in any case.
+    #[test]
+    fn event_handler_extra_attrs_are_dropped() {
+        let extra: HashMap<String, String> = [
+            ("onload", "alert(1)"),
+            ("ONERROR", "alert(2)"),
+            ("onClick", "alert(3)"),
+            ("data-on", "kept"),
+            ("nonce", "abc"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        let link = LinkTag {
+            rel: "preload".to_string(),
+            href: "/a.css".to_string(),
+            extra_attrs: extra.clone(),
+        }
+        .render();
+        let script = ScriptTag {
+            src: Some("/pkg/app.js".to_string()),
+            inline_content: None,
+            is_module: false,
+            is_async: false,
+            is_defer: false,
+            extra_attrs: extra,
+        }
+        .render();
+
+        for html in [&link, &script] {
+            assert!(!html.contains("alert"), "event handler survived: {html}");
+            assert!(html.contains(r#"data-on="kept""#), "{html}");
+            assert!(html.contains(r#"nonce="abc""#), "{html}");
+        }
     }
 }

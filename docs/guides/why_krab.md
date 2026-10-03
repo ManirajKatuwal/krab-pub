@@ -6,7 +6,7 @@ Krab is strongest when the application is both a web experience and a service sy
 
 - Rust-native full stack: handlers, server functions, rendering policy, and service contracts live in one Rust workspace.
 - Service-aware tooling: `krab.toml`, `krab bootstrap`, and the orchestrator model startup order, readiness, restarts, and logs as first-class concerns.
-- Operational defaults: generated projects include `/health`, `/ready`, CI gates, container probes, security defaults, `krab doctor`, and `krab release certify`.
+- Operational defaults: generated projects include `/health`, `/ready`, CI gates, container probes, and security defaults, and are checked by `krab doctor`, `krab topology doctor`, and `krab security dependency-gate`. (`krab release certify` and the other `contract`/`db`/`release` gates validate the framework's own reference services and run only in a Krab framework checkout.)
 - Explicit render policy: route behavior is represented as `RouteRenderPolicy` rather than hidden in scattered route code.
 - Hydration invariants: island SSR output carries stable boundary and node markers so hydration mismatches can be diagnosed.
 

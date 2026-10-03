@@ -1,3 +1,7 @@
+//! Response-header middleware: the fixed security-header set and CORS.
+//!
+//! Both are installed by [`crate::http::apply_common_http_layers`].
+
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::header::{
@@ -10,6 +14,15 @@ use axum::response::Response;
 
 use crate::http::{compute_cors_origin, HasRuntimeState};
 
+/// Adds Krab's fixed security headers to every response, overwriting any the
+/// handler set: HSTS (two years, `includeSubDomains`), `nosniff`,
+/// `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`,
+/// a CSP of `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'`, a
+/// `Permissions-Policy` denying geolocation, camera and microphone, the
+/// same-origin COOP/COEP/CORP trio, and
+/// `X-Permitted-Cross-Domain-Policies: none`.
+///
+/// None of these values is configurable.
 pub async fn security_headers_middleware(req: Request<Body>, next: Next) -> Response {
     let mut response = next.run(req).await;
     let headers = response.headers_mut();
@@ -52,10 +65,14 @@ pub async fn security_headers_middleware(req: Request<Body>, next: Next) -> Resp
     response
 }
 
+/// The `Access-Control-Allow-Methods` value sent to allowed origins:
+/// `GET,POST,OPTIONS`.
 pub fn cors_allow_methods_value() -> &'static str {
     "GET,POST,OPTIONS"
 }
 
+/// The `Access-Control-Allow-Headers` value sent to allowed origins:
+/// `authorization`, `content-type`, `x-request-id` and `x-trace-id`.
 pub fn cors_allow_headers_value() -> &'static str {
     "authorization,content-type,x-request-id,x-trace-id"
 }
@@ -109,6 +126,15 @@ fn append_cors_headers(resp: &mut Response, origin: &str) -> bool {
     true
 }
 
+/// CORS handling driven by [`crate::http::RuntimeState`]'s origin list
+/// (`KRAB_CORS_ORIGINS`) and allow-any flag (dev only).
+///
+/// An `OPTIONS` request that carries an `Origin` header is treated as a
+/// preflight and answered here, without reaching the router: `204` with the
+/// allow headers when the origin is allowed, `403` when it is not. Any other
+/// request passes through, and the allow headers are added to its response
+/// only when the origin is allowed. Responses whose CORS decision depended on
+/// the origin carry `Vary: origin`.
 pub async fn cors_middleware<S>(State(state): State<S>, req: Request<Body>, next: Next) -> Response
 where
     S: Clone + Send + Sync + 'static + HasRuntimeState,

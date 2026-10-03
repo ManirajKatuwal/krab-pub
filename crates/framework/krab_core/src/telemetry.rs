@@ -1,3 +1,10 @@
+//! Structured-logging setup: JSON `tracing` output and the canonical
+//! `service_started` event.
+//!
+//! Call [`init_tracing_with_version`] once at startup. The per-request types
+//! further down (`RequestTelemetry`, `RedMetrics`, `EndpointMetrics`) are
+//! deprecated and unused; request metrics live on the HTTP runtime state.
+
 use tracing_subscriber::EnvFilter;
 
 /// Standard fields emitted on every service startup log event.
@@ -5,8 +12,11 @@ use tracing_subscriber::EnvFilter;
 /// and dashboards can rely on stable field names.
 #[derive(Debug, Clone)]
 pub struct TelemetryConfig {
+    /// Service name: `KRAB_SERVICE_NAME`, else the name the caller passes.
     pub service: String,
+    /// The service's version, as passed by the caller.
     pub version: String,
+    /// `KRAB_ENVIRONMENT`, verbatim (default `dev`).
     pub environment: String,
     /// Stable per-process identifier (hostname + PID by default).
     pub instance_id: String,
@@ -34,11 +44,30 @@ impl TelemetryConfig {
 /// Initialise JSON structured tracing and emit a canonical `service_started`
 /// event with the standardised field set.
 ///
-/// All services **must** call this before emitting any other log events so that
-/// the `service`, `version`, `environment`, and `instance_id` fields appear in
-/// every structured log line.
+/// All services **must** call this (or [`init_tracing_with_version`]) before
+/// emitting any other log events so that the `service`, `version`,
+/// `environment`, and `instance_id` fields appear in every structured log line.
+///
+/// **Reports the wrong version.** `version` here is `krab_core`'s own crate
+/// version: `env!("CARGO_PKG_VERSION")` is expanded inside this crate, not the
+/// caller's, so every service logged the framework's version as its own.
+#[deprecated(
+    since = "0.6.0",
+    note = "logs krab_core's version as the service version; call \
+            `init_tracing_with_version(name, env!(\"CARGO_PKG_VERSION\"))` so the \
+            version is expanded in your crate"
+)]
 pub fn init_tracing(service_name: &str) {
-    let cfg = TelemetryConfig::from_env(service_name, env!("CARGO_PKG_VERSION"));
+    init_tracing_with_version(service_name, env!("CARGO_PKG_VERSION"));
+}
+
+/// Initialise JSON structured tracing for a service at `version`.
+///
+/// Pass `env!("CARGO_PKG_VERSION")` from the service's own crate — the macro
+/// must expand there to name the service's version rather than the
+/// framework's. The framework version is logged separately as `krab.version`.
+pub fn init_tracing_with_version(service_name: &str, version: &str) {
+    let cfg = TelemetryConfig::from_env(service_name, version);
     init_tracing_with_config(&cfg);
 }
 
@@ -68,6 +97,7 @@ pub fn init_tracing_with_config(cfg: &TelemetryConfig) {
         version = %cfg.version,
         environment = %cfg.environment,
         instance_id = %cfg.instance_id,
+        krab.version = env!("CARGO_PKG_VERSION"),
         "service_started"
     );
 }
@@ -82,6 +112,10 @@ pub fn init_tracing_with_config(cfg: &TelemetryConfig) {
 /// these fields so that log aggregation, distributed tracing, and RED dashboards
 /// share a single correlation model.
 #[derive(Debug, Clone)]
+#[deprecated(
+    since = "0.6.0",
+    note = "nothing in Krab populates or reads this per-request telemetry struct; request ids and route labels are attached by the HTTP layers, and metrics live on RuntimeState and /metrics/prometheus. Removed in 0.7.0"
+)]
 pub struct RequestTelemetry {
     /// W3C `traceparent` trace-id (128-bit hex).
     pub trace_id: String,
@@ -99,6 +133,7 @@ pub struct RequestTelemetry {
     pub user_id: Option<String>,
 }
 
+#[allow(deprecated)]
 impl RequestTelemetry {
     /// Create a new telemetry context for a request.
     pub fn new(
@@ -125,6 +160,10 @@ impl RequestTelemetry {
 /// - **Errors**: failed request count.
 /// - **Duration**: latency distribution.
 #[derive(Debug, Clone, Default)]
+#[deprecated(
+    since = "0.6.0",
+    note = "nothing in Krab populates or reads this RED metrics snapshot; request ids and route labels are attached by the HTTP layers, and metrics live on RuntimeState and /metrics/prometheus. Removed in 0.7.0"
+)]
 pub struct RedMetrics {
     /// Total request count observed.
     pub total_requests: u64,
@@ -138,13 +177,21 @@ pub struct RedMetrics {
 
 /// Associates a route pattern with its RED metrics for per-endpoint tracking.
 #[derive(Debug, Clone)]
+#[deprecated(
+    since = "0.6.0",
+    note = "nothing in Krab populates or reads this per-endpoint RED tracker; request ids and route labels are attached by the HTTP layers, and metrics live on RuntimeState and /metrics/prometheus. Removed in 0.7.0"
+)]
+#[allow(deprecated)]
 pub struct EndpointMetrics {
     /// Route pattern (e.g. `GET /api/v1/users/:id`).
     pub route_pattern: String,
+    /// The endpoint's accumulated counters.
     pub red: RedMetrics,
 }
 
+#[allow(deprecated)]
 impl EndpointMetrics {
+    /// A tracker for `route_pattern` with zeroed counters.
     pub fn new(route_pattern: impl Into<String>) -> Self {
         Self {
             route_pattern: route_pattern.into(),
@@ -166,6 +213,7 @@ impl EndpointMetrics {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use serial_test::serial;

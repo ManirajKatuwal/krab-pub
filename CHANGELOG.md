@@ -18,6 +18,471 @@ Release requirements are defined in [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
 Nothing yet.
 
+## [0.6.0] — 2026-10-03
+
+The removals-and-hardening release. It removes everything that carried a
+removal version (`krab_client`'s `demo-islands`, `run_migrations`,
+`SuspenseMarker`, the `db`/`grpc` aliases, `KrabConfig::from_env`,
+`WsRoom::connect/disconnect`) and changes behaviour in places a deployment can
+notice: `krab db lifecycle|rollback|drift` now fail without Postgres, the
+framework-only governance commands refuse outside a Krab checkout, tooling
+output defaults to `.krab/`, the latency histogram is renamed (old name still
+emitted), the auth-failure limiter answers 503 during a store outage, and
+`Attribute`/`Node`/`RuntimeState`/`JwtProviderConfig` gained fields or
+variants. See [the migration guide](docs/guides/migration_guide.md#050--060)
+before upgrading.
+
+New: remote JWKS with scheduled key retirement and per-reason auth metrics;
+component tags, reactive attributes, a context API, `<Suspense>` and
+progressive streaming SSR in `view!`; per-island panic isolation in
+`krab_client`.
+
+**Breaking-change policy.** The seven removals each carried a deprecation and a
+removal version, as `RELEASE_POLICY.md` requires. Five behaviour changes did
+not, and are recorded here rather than quietly taken: the `db` commands that
+passed without a database and the governance commands that failed confusingly
+outside the framework were defects, not APIs; the limiter's 429-for-an-outage,
+`MemoryStore::incr` overwriting data, and the missing latency `_sum`/`_count`
+were defects whose fixes change observable behaviour; and the new public fields
+and variants fix defects or carry the new features. Each has a one-line fix in
+the migration guide.
+
+### Added
+
+- The reference frontend serves `/metrics` and `/metrics/prometheus` like every
+  other service (auth required unless `KRAB_METRICS_PUBLIC=true`). It mounted
+  none, so `GET /metrics` fell through to `/{locale}` and the `krab_frontend`
+  scrape job in `monitoring/prometheus.yml` collected nothing.
+- **Reactive attributes in `view!`**
+  ([ADR 0015](docs/adr/0015-reactive-attributes.md)): an attribute whose value
+  is a closure literal (`disabled={move || busy.get()}`) re-evaluates in the
+  browser and patches the attribute; `bool` means presence, `Option` means
+  optional, and `value`/`checked`/`selected` also update the live DOM property.
+  SSR renders the current value; hydration adopts a matching attribute without
+  rewriting it. New `Attribute::dynamic`, `Attribute::is_dynamic`,
+  `Attribute::current_value`, `DynamicAttributeValue`, `IntoAttributeValue`.
+- **`<Suspense fallback={…}>`** in `view!`
+  ([ADR 0016](docs/adr/0016-suspense-boundaries.md)), with
+  `krab_core::suspense::{suspense, use_suspense, SuspenseContext}`. Resources
+  created inside register with the nearest boundary; SSR renders the children
+  (with initial data) or the fallback between `krab:suspense` markers; the
+  browser swaps reactively. A refetch or an error does not bring the fallback
+  back — that would destroy loaded DOM.
+- **Progressive (out-of-order) streaming SSR**
+  ([ADR 0017](docs/adr/0017-progressive-streaming-ssr.md), superseding ADR
+  0009's "streaming deferred" clause):
+  `krab_core::render_stream::{render_to_stream, render_to_stream_with,
+  StreamOptions, RenderStream, STREAM_SWAP_SCRIPT}` and
+  `Resource::with_server_loader`. The shell flushes with fallbacks, server
+  loaders run, and each resolved boundary streams as a `<template>` that an
+  external swap runtime (`/_krab/stream.js`, CSP-compatible) moves into place;
+  `krab_client` unmounts islands in the outgoing fallback on
+  `krab:suspense-resolving` and hydrates streamed-in islands on
+  `krab:suspense-resolved`. Demo at
+  `/streaming` in the reference frontend. Page-level only: a deferred boundary
+  inside an island is not supported.
+- `krab_core::Node::Comment` — comments that take part in hydration (used by
+  `<Suspense>` markers).
+- **Component tags in `view!`** ([ADR 0013](docs/adr/0013-view-component-tags.md),
+  superseding ADR 0006): `<Card title="x" count={n}>…</Card>` calls
+  `Card(CardProps { .. })`. Path tags (`<ui::Card/>`), content between the tags as
+  `children: Node`, and a bare `..` to fill omitted props from `Default`.
+  `#[island]` components work as tags. A capitalised tag used to be a compile
+  error, so no existing code changes meaning.
+- **Context API** in `krab_core::signal`
+  ([ADR 0014](docs/adr/0014-context-api-and-owners.md)): `provide_context`,
+  `use_context`, `with_owner`, and `Owner` (`new`, `current`, `with`,
+  `dispose`). Works in SSR and in the browser; effects and memos keep their scope
+  across re-runs. Component tags and every `#[island]` body run in their own
+  scope. `provide_context` outside any scope is a no-op that logs
+  `context_provided_without_owner` — there is no thread-wide fallback, which on a
+  server would leak one request's values into the next.
+- `impl Default for krab_core::Node` (an empty fragment), so props holding
+  `children` can derive `Default`.
+- **Per-island panic isolation in `krab_client`.** On `wasm32` a panicking island
+  is stamped `data-krab-boundary-state="error"`, gets a `role="alert"` fallback
+  and an `island_panic` diagnostic carrying the panic message, and hydration
+  continues with the next island. A trap used to strand every later island at
+  `ssr`, silently. On by default for `hydrate()`, `hydrate_within()` and the new
+  exports. The isolation ships as a JS snippet under the bundle's `snippets/`
+  directory, which must be served beside the glue file. Recovery after a trap is
+  best-effort (see `docs/architecture/hydration.md`).
+- `krab_client` exports `hydrate_within_selector(selector) -> u32` (failed
+  boundaries) and `hydrate_island(element) -> Option<String>` (terminal state);
+  `hydrate_within` and `unmount` are now exported to JavaScript too.
+- The reference frontend has a shared nav and a `data-krab-router-outlet` on
+  every page, and starts the client router after the first hydration pass.
+- The reference frontend serves authenticated `GET /api/users/{id}` and
+  `POST /api/users` through its users-contract adapter. The adapter — in-process
+  or remote REST, chosen by the topology — was built at startup but only its
+  `kind` was ever read, so the split-topology selection had no observable
+  effect.
+- **Remote JWKS for OIDC providers.** A provider's `jwks_url` (the default
+  provider's `KRAB_OIDC_JWKS_URL`) verifies tokens against the keys the identity
+  provider publishes: fetched and cached off the request path, refreshed in the
+  background (`KRAB_OIDC_JWKS_REFRESH_SECS`, default 300), and refetched once when
+  a token names an unknown `kid` — rate-limited by
+  `KRAB_OIDC_JWKS_MIN_REFETCH_SECS` (default 30). `https://` is required outside
+  dev; symmetric keys in a published set are ignored; a set that never loaded
+  answers 503. Keys were static environment maps only.
+- **Scheduled key retirement.** `KRAB_JWT_KEY_NOT_AFTER_JSON` (or a provider's
+  `key_not_after`) maps a `kid` to the time it stops verifying. "Grace" for a
+  rotated-out key previously meant leaving it in the map until the next deploy.
+- **Auth failure reasons.** `krab_auth_failures_by_reason_total{reason}` counts
+  every rejection by cause (`expired`, `invalid_signature`, `unknown_key`,
+  `key_retired`, `revoked`, `provider_unavailable`, …); the reasons were only in
+  logs. `krab_core::http_auth::{AuthFailure, AuthFailureReason}`.
+- `krab_core::http_auth::AuthPolicy` and `RuntimeState::{auth_policy,
+  auth_open_paths, auth_open_paths_explicit, auth_failure_reasons}`: the claim
+  policy and open-path list are resolved once per `RuntimeState`.
+- `RuntimeState::with_public_paths` — how a service declares its public routes
+  in code. `service_auth` and `service_frontend` now do.
+- `DistributedStore::incr_with_ttl`, an atomic increment-with-expiry (a Redis
+  script; one lock section in `MemoryStore`). A provided method, so external
+  implementations keep compiling.
+- `KRAB_ARTIFACT_DIR` sets the root directory for generated artifacts:
+  `krab db rehearsal` and `krab release certify` evidence when `--out` is
+  omitted, and the orchestrator's per-service logs (`<root>/orchestrator/`).
+- `krab doctor` and `krab env-check` load `./.env` before evaluating the
+  environment policy. Variables already set in the process environment always
+  win; the loaded file and variable count are reported on stderr. A fresh
+  `krab new` project now passes `krab doctor --strict` after
+  `cp .env.example .env` — it never did before.
+- `krab gen service --path-deps <krab checkout>` points the generated service's
+  `krab_core` dependency at a local checkout, like `krab new --path-deps`.
+- On Windows the orchestrator places every service in a kill-on-close Job
+  Object, so services started through `cargo run` are terminated even if the
+  orchestrator crashes or is killed.
+- The `generated-project` CI workflow builds, tests, lints and format-checks
+  `krab gen service` output (single and multi mode).
+- `#[server(stream)]` functions have a browser half. On `wasm32` the call now
+  returns `krab_core::server_fn::ServerEventStream`, which POSTs the arguments
+  like any server function and yields parsed `ServerEvent`s (`event`, `data`,
+  `id`) as the response body arrives. `krab_core::server_fn::SseParser` is the
+  target-independent parser behind it. Previously every `#[server(stream)]`
+  function failed to compile for `wasm32`: the generated client stub called
+  `call_server_fn`, whose `T: DeserializeOwned` bound an SSE stream cannot meet.
+- `krab_core::telemetry::init_tracing_with_version(name, version)`. Pass
+  `env!("CARGO_PKG_VERSION")` from your own crate; the `service_started` event
+  also carries the framework version as `krab.version`.
+- `krab_http_request_duration_seconds_sum` and `_count` in the Prometheus
+  exposition, backed by a new `RuntimeState::latency_sum_micros` counter.
+
+### Changed
+
+- `KRAB_ENVIRONMENT=local` is an alias of `dev` in `krab_core` (case-insensitive).
+  It parsed as an unrecognised environment and got prod rules, while `krab
+  env-check`, `krab doctor`, `service_auth` and the migration promotion ladder
+  treated it as dev. Any other unrecognised value still fails closed.
+- **Breaking:** `krab_core::Attribute` has a new public field, `dynamic`;
+  struct literals need `dynamic: None` (or use `Attribute::new`). `krab_core::Node`
+  has a new variant, `Comment`; exhaustive matches need an arm. `Suspense` is a
+  reserved tag name in `view!`.
+- `<script>` and `<style>` children rendered by `view!` are raw text: not
+  entity-escaped, with `</script`, `</style` and (in scripts) `<!--` neutralised
+  so the content cannot end the element early. `ScriptTag` inline content gains
+  the `<!--` rule.
+- `KrabConfig::validate` (outside dev) rejects a JWKS URL combined with an
+  HMAC-only `KRAB_JWT_ALLOWED_ALGS` — including the `HS256` default — which
+  validated and then rejected every token as `algorithm_rejected`.
+- Only 401-class failures count against the auth-failure limiter; provider
+  outages (503) and misconfiguration (500) no longer spend a client's budget.
+- `KRAB_OIDC_JWKS_MIN_REFETCH_SECS` is floored at 1 second (0 disabled the
+  refetch rate limit), and on-demand refetches are single-flight.
+- `RuntimeState::public_paths` holds only `KRAB_AUTH_PUBLIC_PATHS`; paths a
+  service declares in code are in the new `code_public_paths`, checked through
+  `RuntimeState::is_public_path`.
+- `UsersServiceContract` gains `get_user_on_behalf_of(id, authorization)`,
+  defaulting to `get_user`.
+- The reference frontend stages hydration with `hydrate_within_selector`
+  (critical islands first, deferred ones on idle) instead of hiding islands by
+  renaming `data-island`; failed islands report `KRAB-HYDRATE-510`.
+- `krab_client/src/lib.rs` and `krab_macros/src/lib.rs` are split into internal
+  modules (`hydration`, `reconcile`, `resources`, `isolation`; `server`,
+  `island`, `view`). No public API change.
+- The default artifact root is `.krab/` instead of `internal/audit/`: `krab db
+  rehearsal` writes `<root>/evidence/rollback-rehearsal-evidence.txt`, `krab
+  release certify` `<root>/release-certify/local`, and orchestrator logs go to
+  `<root>/orchestrator/`. `krab new` adds `.krab/` to the generated
+  `.gitignore`.
+- `krab contract check|protocol-check`, `krab db lifecycle|rollback|drift|rehearsal`
+  and `krab release check|certify` refuse to run outside a Krab framework
+  checkout (one whose `Cargo.toml` lists `crates/framework/krab_core` as a
+  workspace member), with one message pointing at `cargo test`, `krab doctor
+  --strict`, `krab topology doctor` and `krab security dependency-gate`. They
+  validate the framework's own reference services and failed confusingly in a
+  generated project.
+- `krab new --path-deps` and `krab gen service --path-deps` reject a directory
+  that is not a Krab checkout.
+- `krab topology split` picks the first split-service port (3200–3499) not
+  already assigned in `krab.toml`, and errors if the range is exhausted.
+- The rate limiters increment and set expiry atomically. As two calls, a failure
+  between them left a counter with no expiry, limiting that client forever. The
+  global limiter's log field now says `global_per_ip_fixed_window`; it was
+  logged as a token bucket, which it never was.
+- The auth-failure limiter answers **503** when its store is unreachable. It
+  answered 429, telling clients and dashboards they were rate limited during an
+  outage.
+- A JWT without a `kid` is tried against every configured key (default first).
+  It was tried against one, so during a rotation a valid kid-less token signed
+  with the other key was rejected.
+- `MemoryStore::incr` on a non-numeric value returns an error and leaves the
+  value alone, as Redis does. It overwrote the value.
+- Inbound `x-request-id` values longer than 128 bytes or outside
+  `[A-Za-z0-9._:-]` are replaced with a fresh id instead of being echoed into
+  responses, logs and downstream calls.
+- GraphQL introspection blocking parses the query and matches `__schema` /
+  `__type` field selections (aliases and fragments included). It was a substring
+  match, which refused ordinary queries mentioning `__type` in a string or
+  comment. The engine's own `disable_introspection` is set as well.
+- `service_auth` loads its signing config and key ring once at startup; every
+  login, refresh, revoke, `/jwks` and `/status` request re-read them, key files
+  included.
+- The Prometheus latency histogram is now `krab_http_request_duration_seconds`
+  — the name `monitoring/alert_rules.yml`, the Grafana dashboard and the on-call
+  playbook have always queried. It was emitted as `krab_request_duration_seconds`
+  with no `_sum` or `_count`, so `HighP99Latency`, `LatencyBurnRateFast` and
+  `LatencyBurnRateSlow` evaluated to nothing on every deployment. The old name is
+  still emitted (buckets only) and is removed in 0.7.0.
+- The `+Inf` latency bucket counts completed requests, including those over 2 s.
+  It was set to `krab_requests_total`, which counts requests as they start —
+  in-flight ones included — and the >2 s bucket was written but never read.
+- `krab db lifecycle`, `db rollback` and `db drift` now fail when no Postgres is
+  reachable. They ran their suites without `KRAB_REQUIRE_DB_TESTS=1`, so each
+  suite printed "executed NOTHING" and the command reported success on any
+  machine without a database. Only `db rehearsal` set it before.
+- `StreamTelemetry::first_visible_chunk_ms` is the first flush containing text a
+  browser would paint; `ttfb_ms` stays the first flush of any kind. They were
+  computed from the same instant and always equal.
+- `krab topology doctor` accepts the flat `healthcheck_url` / `restart_on_exit`
+  keys the orchestrator has always accepted, validating that the URL targets
+  `/ready`. It rejected them, failing configs the orchestrator ran.
+- The `service_frontend` response cache buffers a body only up to
+  `KRAB_CACHE_MAX_BODY_BYTES`; past it the response streams through uncached. It
+  used to buffer the entire body first and check the cap afterwards, which undid
+  streaming on `/`.
+
+### Deprecated
+
+- `krab_core::image` (`optimized_image`, `ImageProps`). Nothing generates the
+  image variants it references, and by default it emits AVIF and WebP
+  `<source>`s, so as documented it produced broken images: a browser that picks
+  a 404ing `<source>` does not fall back to the `<img>`. Write the `<picture>`
+  with `view!` against variants your pipeline produces. Removed in 0.7.0.
+- `krab_core::style_scope`. Not wired into `view!`, and its scope ids come from
+  `DefaultHasher`, which is not stable across Rust releases. Removed in 0.7.0.
+- `krab_core::telemetry::{RequestTelemetry, RedMetrics, EndpointMetrics}`.
+  Nothing populates or reads them; request ids and route labels are attached by
+  the HTTP layers and metrics live on `RuntimeState`. Removed in 0.7.0.
+- Writing tooling artifacts under `internal/audit/` because that directory
+  exists. Still works in 0.6.0 with a warning; removed in 0.7.0. Set
+  `KRAB_ARTIFACT_DIR=internal/audit` to keep the old location.
+- **The application routes on the default open-path list.** `/`, `/contact`,
+  `/api/contact`, `/api/status`, `/data/dashboard`, `/rpc/version`, `/rpc/now`,
+  `/asset-manifest.json`, `/blog/*`, `/pkg/*` and the `/api/v1/auth/*` token
+  endpoints are unauthenticated in every Krab service only because the
+  framework's default list names them. They leave the default in 0.7.0; a
+  startup warning lists them until then. Declare your public routes with
+  `KRAB_AUTH_PUBLIC_PATHS` or `RuntimeState::with_public_paths`, then set
+  `KRAB_AUTH_LEGACY_OPEN_PATHS=false` to adopt the 0.7.0 default now.
+- `krab_core::telemetry::init_tracing(name)`. It logs `krab_core`'s own version
+  as the service's (`env!` expands in the crate that writes it). Use
+  `init_tracing_with_version(name, env!("CARGO_PKG_VERSION"))`. Removed in 0.7.0.
+- The `krab_request_duration_seconds` Prometheus histogram name; see Changed.
+
+### Removed
+
+- The reference frontend's hand-written deferred-hydration JS
+  (`classifyIslandsForDeferredHydration`, `freezeCriticalIslandsAfterHydration`,
+  `activateDeferredIslands`) and the `data-island-deferred`,
+  `data-island-hydrated` and `data-krab-priority` attributes it wrote.
+
+Every item below was deprecated for at least one minor release. See
+[the migration guide](docs/guides/migration_guide.md#050--060) for the
+replacement of each.
+
+- **`krab_client` feature `demo-islands`** and the `krab_client::components`
+  module (`Counter`, `Toggle`, `Likes`), deprecated in 0.4.0. Every `#[island]`
+  registers under its plain name, so shipping islands from the framework claimed
+  those three names in every consumer's hydration registry. `krab_client`'s
+  default features are now just `web`; its release bundle, which no longer
+  carries the three islands, is ~165 KB. The reference frontend's islands moved to a new
+  `services/service_frontend_islands` crate, which is also its browser bundle:
+  `service_frontend` now loads `/pkg/service_frontend_islands.js` (manifest key
+  `service_frontend_islands.js`), and `krab.toml`'s `client_package` points at it.
+- **`krab_core::db::postgres::run_migrations`**, deprecated in 0.5.0. Use
+  `run_versioned_migrations` with your own `&[Migration]` slice.
+- **`krab_core::render_stream::SuspenseMarker`**, deprecated in 0.5.0. Use
+  `is_finalized_ssr_snapshot`; the marker parser is now private.
+- **`krab_core` feature aliases `db` and `grpc`**, and the module alias
+  `krab_core::grpc`, deprecated in 0.2.0. Use `db-postgres`, `grpc-semantics`
+  and `krab_core::grpc_semantics`.
+- **`KrabConfig::from_env`**, deprecated in 0.3.0. It panicked on an invalid
+  `KRAB_PORT`; use `from_env_checked` and handle the error.
+- **`WsRoom::connect` / `WsRoom::disconnect`**, deprecated in 0.3.0. Use
+  `WsRoom::join`, whose guard decrements the count on drop.
+
+### Fixed
+
+- The reference frontend's `/contact` form never posted: its handler was an
+  inline `<script>` and an `onsubmit=` attribute, both blocked by Krab's CSP. It
+  is served as `/_krab/contact.js` and attached with `addEventListener`, and the
+  inline-script test now covers `/contact` and rejects inline `on*=` handlers on
+  every page.
+- `/robots.txt` and `/sitemap.xml` on the reference frontend required a bearer
+  token, so every crawler got 401. They are public; `/about`, `/greet` and
+  `/{locale}` stay authenticated.
+- The `HighP99Latency` alert labelled its value (seconds) as milliseconds.
+- `krab.toml` carried flat `healthcheck_url = ".../health"` keys that the
+  `[services.X.healthcheck]` tables shadow, so the file said `/health` while the
+  orchestrator probed `/ready`. Removed, and a test rejects flat keys a table
+  shadows.
+- `view!` HTML-escaped the contents of `<script>` and `<style>`, so a script
+  containing `=>` or `&&` reached the browser as `=&gt;` / `&amp;&amp;` and did
+  not parse.
+- After an island panics in the browser, the next island no longer inherits the
+  dead island's contexts, and an abandoned `batch` no longer freezes signal
+  delivery: the reactive state is snapshotted before each island and restored
+  after a trap. A panic during the failed island's cleanup is contained too.
+- One unsupported key in a published JWKS (ES512, ES256K, X25519,
+  RSA-OAEP-*, …) or an encryption key made the whole set fail to parse and every
+  JWT request answer 503 until the identity provider changed its set. Keys are
+  parsed one at a time and unsupported ones skipped.
+- Without a Tokio runtime there was no background JWKS refresh, so a key the
+  identity provider removed kept verifying for the life of the process. Key sets
+  are now refreshed on the request path once `KRAB_OIDC_JWKS_REFRESH_SECS` has
+  elapsed, with a warning.
+- `key_not_after` rejects impossible dates (`2026-02-30` rolled into March).
+- `krab doctor` / `krab topology doctor` reported
+  `service_frontend`'s import of `service_frontend_islands` as a cross-service
+  boundary violation. A `service_*` crate is a boundary only if it builds a
+  binary; a library under `services/` is shared code.
+- `krab db rehearsal` evidence and the `release certify` bundle record the local
+  `git rev-parse HEAD` when `GITHUB_SHA` is unset; they recorded `local`.
+- The reference frontend's home page never hydrated: its module script was
+  rendered through `view!` as text, so `=>` reached the browser as `=&gt;` and
+  the script failed to parse. (`view!` now emits `<script>`/`<style>` content as
+  raw text; the home runtime itself moved to `/_krab/home.js` — see Security.)
+- `krab gen service --exposure-mode multi` declared none of the
+  `capabilities`, `domain` and `adapters` modules it generated, so that code was
+  never compiled. They are now declared and reachable from `main`.
+- `krab gen service` no longer tells you to add the crate to workspace members
+  when there is no enclosing `[workspace]`.
+- `krab topology split --register` corrupted `Cargo.toml` when the `[workspace]
+  members` array had no trailing comma. Registration handles single- and
+  multi-line arrays, trailing commas, comments and CRLF, and is idempotent.
+- Asset fingerprinting (`krab build`, `krab dev --watch`) no longer accumulates
+  stale `<stem>.<hash>.<ext>` copies in `dist/`.
+- `docs/guides/why_krab.md` no longer claims generated projects include
+  `krab release certify`.
+- `docs/reference/environment.md` said `KRAB_JWT_LEEWAY_SECS` defaults to no
+  leeway (the code has always used 30 s) and that older `kid`s stay valid "for
+  the rotation grace window" (no such window existed until
+  `KRAB_JWT_KEY_NOT_AFTER_JSON`).
+- `monitoring/alert_rules.yml`'s `ServiceNotReady` queried `krab_dependency_up`,
+  which no service emits, so it could never fire. It now alerts on
+  `krab_readiness_status == 0`. A test now fails if the alert rules or the
+  dashboard query a metric the exposition does not contain.
+- The client router intercepted in-page `#fragment` links and never scrolled to
+  the target, and navigating to `/page#section` always landed at the top. Both
+  now scroll to the element named by the fragment (by `id`, then anchor
+  `name`, trying the raw and percent-decoded forms); `#` and `#top` scroll to
+  the top.
+- A dynamic region whose anchor comment failed to insert (`insertBefore`
+  throwing) was treated as anchored, leaving later updates aimed at a node
+  outside the document. The failure is now detected and logged.
+- `HeadContext::merge` treated `<meta name="author">` and
+  `<meta property="author">` as the same tag, so one silently replaced the
+  other. Tags now merge by attribute *and* key.
+- `krab dev` waited a fixed `settle_ms` after the first change and never
+  restarted the timer, so a save burst longer than that (a formatter, a branch
+  switch) rebuilt mid-burst. It is a real debounce now.
+- The orchestrator's watch mode (the `[watch]` table in `krab.toml`) restarted
+  every watched service on editor swap and
+  backup files (`.swp`, `~`, `.#*`, vim's `4913`, JetBrains `___jb_*`) and on
+  writes under `target/`, `.git/` and `node_modules/`. Those are ignored in both
+  the event and the polling watcher.
+- The `view!` rustdoc linked ADR 0008 at a path that does not exist.
+- The `wasm-size` CI gate checked the bundle for the string `Hydrating island`,
+  which is compiled only under `krab_client`'s `debug` feature, so it failed
+  against every correct release build. It now checks for
+  `data-krab-boundary-state`, which the runtime always contains and the no-`web`
+  stub never does. `docs/architecture/hydration.md` gave the same wrong check.
+- `docs/operations/db_rollback_runbook.md` named the migration ledger
+  `_krab_migrations` (the table the removed `run_migrations` created) and
+  pointed at a `db.rs` that no longer exists. The ledger is `krab_migrations`,
+  in `krab_core/src/db/postgres.rs`.
+
+### Security
+
+- `KRAB_REDIS_URL` is read through `read_env_or_file`. The startup policy treats
+  it as a secret and rejects the inline form in prod, but the store builder read
+  only the plain variable, so `KRAB_REDIS_URL_FILE` passed the policy and was
+  then ignored: the service ran on a per-process store and rate limits and token
+  revocation silently stopped being shared across replicas. A source that is set
+  but unreadable now fails startup outside dev.
+- `chacha20` 0.10.1 (yanked) → 0.10.2. Lockfile only; reached through
+  `quinn-proto`, not in the resolved feature graph.
+- `rustls` 0.23.37 → 0.23.45 (and `rustls-webpki` 0.103.15) for
+  [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285): TLS 1.3
+  handshake messages were accepted across encryption-level boundaries. Reached
+  through `reqwest` and `sqlx`. Lockfile only.
+
+- An explicit `KRAB_AUTH_OPEN_PATHS` is the complete unauthenticated list again:
+  paths a service declares in code with `RuntimeState::with_public_paths` (the
+  reference frontend's and auth service's routes) no longer reopen routes it
+  omits, and a warning, `auth_code_public_paths_ignored`, names them.
+  `KRAB_AUTH_PUBLIC_PATHS` stays additive. (Found in pre-release review: without
+  this, a 0.5.0 deployment that closed `/` or `/rpc/*` would have had them
+  reopened.)
+- The reference frontend's `GET /api/users/{id}`, in a distributed topology,
+  forwards the caller's `Authorization` to the users service instead of the
+  frontend's own `KRAB_FRONTEND_DOWNSTREAM_BEARER_TOKEN` — a confused deputy that
+  answered `/api/users/me` with the service account's record. Upstream errors no
+  longer echo internal URLs to clients.
+- The JWKS fetch does not follow redirects (an https URL redirecting to http
+  would have bypassed the https-only rule), caps documents at 1 MiB, and fails
+  the provider closed if its HTTP client cannot be built instead of panicking.
+- A token without a `kid` is tried against at most 8 keys
+  (`MAX_KIDLESS_KEY_TRIALS`), and one from an address already over its
+  auth-failure budget is answered 429 before any verification. Tokens that name
+  a `kid` cost one verification and are never pre-rejected, so other callers'
+  failures on a shared address cannot lock out valid tokens.
+- `LinkTag`/`ScriptTag` `extra_attrs` also drop `on*` event-handler names.
+- `LinkTag::extra_attrs` drops attribute names that are not valid HTML
+  attribute names, as `ScriptTag` and `Element` already did. Names were only
+  HTML-escaped, which leaves spaces and `=` intact, so a crafted key could open
+  a second attribute (`x onload=… y`).
+- `KRAB_BEARER_TOKEN` is read through `read_env_or_file`, so its `_FILE` form
+  works; it was silently ignored. (`_VAULT_REF` is refused with a clear error, as
+  for every secret — there is no runtime vault resolver.)
+- `Environment::Unknown` (a mistyped `KRAB_ENVIRONMENT`) now requires explicit
+  `KRAB_CORS_ORIGINS` like staging and prod. It got prod secret rules but was
+  exempt from the CORS check, so a typo shipped wildcard CORS.
+- The reference frontend pins its client bundle's integrity: the server puts the
+  bundle's `sha256` digest on the `modulepreload`, so the browser refuses a
+  bundle whose bytes do not match, and the page compares the manifest's digest
+  with the one it was rendered with. The page's own check only tested that the
+  manifest's integrity *began with* `sha256-`, and the module was imported
+  unverified.
+- The reference frontend's home page runs under Krab's own CSP
+  (`script-src 'self' 'wasm-unsafe-eval'`). Its hydration runtime was an inline
+  module script, which that CSP blocks — so under the framework's security
+  headers the page never hydrated at all. The runtime is now served from
+  `/_krab/home.js` and configured by a `<script type="application/json">` data
+  block, and a test fails if a rendered page carries an inline executable script.
+
+### Governance
+
+- Every public item in `krab_core` is documented, and `#![warn(missing_docs)]`
+  (an error under CI's `clippy -D warnings`) keeps it that way. 521 items were
+  undocumented.
+- `RedisStore` has tests against a real server (`KRAB_TEST_REDIS_URL`; they
+  skip loudly without one and fail under `KRAB_REQUIRE_REDIS_TESTS=1`), covering
+  TTL semantics, the atomic `incr_with_ttl` script, `PERSIST` on a zero TTL,
+  `SET NX` leases and literal glob characters in `keys_with_prefix`. It had
+  none.
+
 ## [0.5.0] — 2026-09-09
 
 Security and correctness release. Four changes are breaking: metrics are no

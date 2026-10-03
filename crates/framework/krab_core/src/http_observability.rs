@@ -14,17 +14,83 @@ use crate::http_protocol::{
 };
 use crate::http_runtime::HasRuntimeState;
 
+/// Longest inbound `x-request-id` accepted as-is.
+const MAX_INBOUND_REQUEST_ID_LEN: usize = 128;
+
+/// Whether an inbound request id is safe to propagate.
+///
+/// The value is echoed in the response, copied into every log line of the
+/// request and into error envelopes, and forwarded downstream. An unbounded,
+/// arbitrary-byte value let any client inflate every log line it caused, or
+/// inject characters that confuse log parsers. Accepted ids are 1–128 bytes of
+/// `[A-Za-z0-9._:-]`, which covers UUIDs, ULIDs and W3C trace ids; anything
+/// else is replaced with a fresh id.
+fn is_acceptable_request_id(value: &HeaderValue) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_INBOUND_REQUEST_ID_LEN
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+}
+
 pub(crate) fn request_id_value_from_headers(
     headers: &axum::http::HeaderMap,
 ) -> (HeaderValue, &'static str) {
-    match headers.get("x-request-id").cloned() {
-        Some(existing) => (existing, "inbound"),
-        None => {
+    match headers.get("x-request-id") {
+        Some(existing) if is_acceptable_request_id(existing) => (existing.clone(), "inbound"),
+        rejected => {
             let generated = uuid::Uuid::new_v4().to_string();
             let value = HeaderValue::from_str(&generated)
                 .unwrap_or_else(|_| HeaderValue::from_static("request-id-invalid"));
-            (value, "uuid_v4")
+            let strategy = if rejected.is_some() {
+                "uuid_v4_replaced_invalid_inbound"
+            } else {
+                "uuid_v4"
+            };
+            (value, strategy)
         }
+    }
+}
+
+#[cfg(test)]
+mod request_id_tests {
+    use super::request_id_value_from_headers;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    fn with(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_str(value).unwrap());
+        headers
+    }
+
+    #[test]
+    fn well_formed_inbound_ids_are_kept() {
+        for id in [
+            "4bf92f3577b34da6a3ce929d0e0e4736",
+            "01HZX3Y5Q1ABCDEF",
+            "req-1.2:3_4",
+        ] {
+            let (value, strategy) = request_id_value_from_headers(&with(id));
+            assert_eq!(value.to_str().unwrap(), id);
+            assert_eq!(strategy, "inbound");
+        }
+    }
+
+    #[test]
+    fn oversized_or_unsafe_inbound_ids_are_replaced() {
+        for id in [
+            "x".repeat(129),
+            "has space".to_string(),
+            "a\"b".to_string(),
+            "{json}".into(),
+        ] {
+            let (value, strategy) = request_id_value_from_headers(&with(&id));
+            assert_ne!(value.to_str().unwrap(), id);
+            assert_eq!(strategy, "uuid_v4_replaced_invalid_inbound");
+        }
+        let (_, strategy) = request_id_value_from_headers(&HeaderMap::new());
+        assert_eq!(strategy, "uuid_v4");
     }
 }
 
@@ -155,7 +221,12 @@ where
     let elapsed = start.elapsed();
     let elapsed_ms = elapsed.as_millis();
 
-    let buckets = &state.runtime_state().latency_buckets;
+    let runtime = state.runtime_state();
+    runtime.latency_sum_micros.fetch_add(
+        u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    let buckets = &runtime.latency_buckets;
     if elapsed_ms <= 10 {
         buckets[0].fetch_add(1, Ordering::Relaxed);
     } else if elapsed_ms <= 50 {
@@ -220,14 +291,22 @@ where
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct PropagationHeaders {
+    /// The inbound `x-request-id` value, if present and valid UTF-8.
     pub request_id: Option<String>,
+    /// The inbound `x-trace-id` value, if present and valid UTF-8.
     pub trace_id: Option<String>,
 }
 
 impl PropagationHeaders {
+    /// Header name carrying the request id: `x-request-id`.
     pub const REQUEST_ID_HEADER: &'static str = "x-request-id";
+    /// Header name carrying the trace id: `x-trace-id`.
     pub const TRACE_ID_HEADER: &'static str = "x-trace-id";
 
+    /// Captures the request and trace ids from inbound headers. Values are
+    /// taken as-is. Behind [`crate::http::apply_common_http_layers`], the
+    /// request-id middleware has already replaced a missing or unacceptable
+    /// inbound `x-request-id` with a fresh UUID by the time a handler runs.
     pub fn from_request_headers(headers: &axum::http::HeaderMap) -> Self {
         Self {
             request_id: headers
@@ -241,6 +320,8 @@ impl PropagationHeaders {
         }
     }
 
+    /// `(header name, value)` pairs for the ids that are present, for
+    /// builder-style HTTP clients.
     pub fn as_header_pairs(&self) -> Vec<(&'static str, &str)> {
         let mut pairs = Vec::new();
         if let Some(id) = &self.request_id {
@@ -252,6 +333,8 @@ impl PropagationHeaders {
         pairs
     }
 
+    /// Inserts the ids that are present into `headers`, replacing existing
+    /// values. An id that is not a valid header value is skipped silently.
     pub fn inject_into_headers(&self, headers: &mut axum::http::HeaderMap) {
         if let Some(id) = &self.request_id {
             if let Ok(v) = axum::http::HeaderValue::from_str(id) {

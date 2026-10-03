@@ -20,6 +20,9 @@ use web_sys::Element;
 
 #[path = "support/mod.rs"]
 mod support;
+// `Counter` and `Toggle`, which `krab_client` itself shipped until 0.6.0.
+#[path = "support/islands.rs"]
+mod islands;
 use support::document;
 
 wasm_bindgen_test_configure!(run_in_browser);

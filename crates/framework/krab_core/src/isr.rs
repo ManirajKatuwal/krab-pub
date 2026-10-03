@@ -61,7 +61,10 @@ pub enum IsrPolicy {
     /// Page is static forever until explicitly invalidated.
     Static,
     /// Page is revalidated after the given duration (stale-while-revalidate).
-    Revalidate { max_age: Duration },
+    Revalidate {
+        /// Age after which the entry is stale and is regenerated.
+        max_age: Duration,
+    },
     /// Page is revalidated on every request (effectively SSR with caching).
     OnDemand,
 }

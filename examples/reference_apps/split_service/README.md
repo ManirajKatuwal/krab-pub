@@ -13,14 +13,14 @@ krab bootstrap
 
 ## What To Inspect
 
-- generated domain crate
-- generated protocol adapter crates
+- the generated split-service crate, `services/service_<domain>_split`
+- its `src/domain/` module and its per-protocol `src/adapters/` module
 - `krab.toml` service registration
 - orchestrator startup dependencies and health checks
 
 ## Extension Points
 
-- Move shared request/response types into the domain crate.
+- Move shared request/response types into the domain module.
 - Keep transport adapters thin.
 - Use topology checks to prevent cross-service imports.
 - Swap local adapters for remote service calls once contracts are stable.

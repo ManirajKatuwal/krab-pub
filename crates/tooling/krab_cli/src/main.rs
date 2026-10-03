@@ -3,9 +3,11 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use std::path::PathBuf;
 
+mod artifacts;
 mod auth_ops;
 mod dev_workflow;
 mod doctor;
+mod dotenv;
 mod env_policy;
 mod generator;
 mod governance;
@@ -217,12 +219,13 @@ enum DbAction {
     Drift,
     /// Run rollback rehearsal and capture evidence
     Rehearsal {
-        /// Path for evidence output
-        #[arg(
-            long,
-            default_value = "internal/audit/evidence/rollback-rehearsal-evidence.txt"
-        )]
-        out: PathBuf,
+        /// Path for evidence output [default: $KRAB_ARTIFACT_DIR (or .krab)/evidence/rollback-rehearsal-evidence.txt]
+        //
+        // Resolved at run time, not by clap: the artifact root depends on
+        // `KRAB_ARTIFACT_DIR` and on what exists in the working directory. See
+        // `artifacts.rs`.
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -257,16 +260,16 @@ enum ReleaseAction {
     Check,
     /// Run certification gates and write an evidence bundle
     Certify {
-        /// Output directory for the evidence bundle
+        /// Output directory for the evidence bundle [default: $KRAB_ARTIFACT_DIR (or .krab)/release-certify/local]
         //
-        // Defaults under `internal/audit/release-certify/`, the gitignored
-        // evidence tree CLAUDE.md documents this command as writing to, and the
-        // same parent CI targets (`ops-hardening.yaml` passes
-        // `--out internal/audit/release-certify/run-<run_id>`). The previous
-        // default, `release-evidence`, created an untracked directory in the
-        // repository root that no `.gitignore` rule covered.
-        #[arg(long, default_value = "internal/audit/release-certify/local")]
-        out: PathBuf,
+        // The artifact root is `KRAB_ARTIFACT_DIR`, else `internal/audit/`
+        // while that directory exists (deprecated, removed in 0.7.0), else
+        // `.krab/` — see `artifacts.rs`. The default used to be the literal
+        // `internal/audit/release-certify/local`, which created a Krab-internal
+        // tree in every project that ran this. CI is unaffected: it always
+        // passes `--out` explicitly (`ops-hardening.yaml`).
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -308,6 +311,14 @@ enum GenResource {
         /// Deployment topology for generated services
         #[arg(long, value_enum, default_value_t = Topology::SingleService)]
         topology: Topology,
+        /// Depend on a local Krab checkout instead of crates.io.
+        ///
+        /// Same meaning as `krab new --path-deps`: point this at the root of
+        /// the krab repository and the generated manifests take `krab_core`
+        /// by path. Used by the `generated-project` CI gate to build a
+        /// generated service against the change under review.
+        #[arg(long, value_name = "KRAB_REPO_ROOT")]
+        path_deps: Option<PathBuf>,
     },
     /// Generate a new component
     Component {
@@ -407,6 +418,9 @@ fn dispatch_command(command: &Commands, diagnostics: bool, json: bool) -> Result
             bootstrap_local_stack(*release, *skip_build)?;
         }
         Commands::EnvCheck { strict } => {
+            // The policy reads the process environment; `./.env` fills in
+            // what the shell did not export. See `dotenv.rs`.
+            dotenv::load_project_dotenv();
             validate_environment(*strict, json)?;
         }
         Commands::Contract { action } => dispatch_contract_action(action, diagnostics, json)?,
@@ -414,7 +428,10 @@ fn dispatch_command(command: &Commands, diagnostics: bool, json: bool) -> Result
         Commands::Security { action } => dispatch_security_action(action, diagnostics, json)?,
         Commands::Auth { action } => dispatch_auth_action(action)?,
         Commands::Release { action } => dispatch_release_action(action, diagnostics, json)?,
-        Commands::Doctor { strict } => dispatch_doctor_command(diagnostics, *strict, json)?,
+        Commands::Doctor { strict } => {
+            dotenv::load_project_dotenv();
+            dispatch_doctor_command(diagnostics, *strict, json)?
+        }
         Commands::Topology { action } => dispatch_topology_action(action, diagnostics, json)?,
         Commands::Gen { resource } => dispatch_gen_resource(resource)?,
         Commands::New {
@@ -511,8 +528,8 @@ mod tests {
             Commands::Db {
                 action: DbAction::Rehearsal { out },
             } => assert_eq!(
-                out.to_string_lossy(),
-                "internal/audit/evidence/rollback-rehearsal-evidence.txt"
+                out.as_deref().map(|p| p.to_string_lossy().into_owned()),
+                Some("internal/audit/evidence/rollback-rehearsal-evidence.txt".to_string())
             ),
             _ => panic!("expected db rehearsal"),
         }
@@ -533,8 +550,8 @@ mod tests {
             Commands::Release {
                 action: ReleaseAction::Certify { out },
             } => assert_eq!(
-                out.to_string_lossy(),
-                "internal/audit/release-certify/run-42"
+                out.as_deref().map(|p| p.to_string_lossy().into_owned()),
+                Some("internal/audit/release-certify/run-42".to_string())
             ),
             _ => panic!("expected release certify"),
         }
@@ -559,6 +576,22 @@ mod tests {
 
         let cli = Cli::try_parse_from(["krab", "db", "rehearsal"]).expect("db rehearsal");
         assert!(!cli.diagnostics);
+        // No static default any more: the path is resolved from the artifact
+        // root at run time, so clap must leave it unset.
+        assert!(matches!(
+            cli.command,
+            Commands::Db {
+                action: DbAction::Rehearsal { out: None }
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["krab", "release", "certify"]).expect("release certify");
+        assert!(matches!(
+            cli.command,
+            Commands::Release {
+                action: ReleaseAction::Certify { out: None }
+            }
+        ));
     }
 
     /// The point of `global = true`: the flag is now accepted before the

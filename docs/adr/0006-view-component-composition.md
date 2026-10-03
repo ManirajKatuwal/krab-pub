@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted
+Superseded by [ADR 0013](0013-view-component-tags.md) (2026-09-30). Accepted
+until then; the text below is unchanged and describes `view!` before `0.6.0`.
 
 ## Context
 

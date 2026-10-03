@@ -16,13 +16,26 @@
 use crate::{Attribute, Element, Node, Render};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+/// What went wrong inside an [`ErrorBoundary`] that fell back.
 #[derive(Debug, Clone)]
 pub struct BoundaryDiagnostic {
+    /// The boundary's id, as passed to [`ErrorBoundary::new`].
     pub boundary_id: String,
+    /// Where the panic happened; currently always `"ssr"`.
     pub phase: &'static str,
+    /// The panic message, or `component panicked` for a non-string payload.
     pub message: String,
 }
 
+/// Renders a child node, and if rendering it panics, renders a fallback
+/// instead of letting the panic escape. Server-side only in effect — see the
+/// module docs.
+///
+/// The fallback is wrapped in
+/// `<div data-krab-boundary="{id}" data-krab-boundary-state="error">`. If the
+/// fallback panics too, that wrapper is rendered empty. Rendering it via
+/// [`Render`] discards the diagnostic; use
+/// [`render_with_diagnostics`](Self::render_with_diagnostics) to keep it.
 #[derive(Clone)]
 pub struct ErrorBoundary {
     boundary_id: String,
@@ -31,6 +44,8 @@ pub struct ErrorBoundary {
 }
 
 impl ErrorBoundary {
+    /// A boundary named `boundary_id` around `child`, rendering `fallback` if
+    /// `child` panics.
     pub fn new(boundary_id: impl Into<String>, child: Node, fallback: Node) -> Self {
         Self {
             boundary_id: boundary_id.into(),
@@ -39,6 +54,9 @@ impl ErrorBoundary {
         }
     }
 
+    /// Renders the child, or the wrapped fallback if it panics. The
+    /// diagnostic is `Some` exactly when the fallback was used. The panic is
+    /// still reported by the process panic hook as usual.
     pub fn render_with_diagnostics(&self) -> (String, Option<BoundaryDiagnostic>) {
         let result = catch_unwind(AssertUnwindSafe(|| self.child.render()));
         match result {

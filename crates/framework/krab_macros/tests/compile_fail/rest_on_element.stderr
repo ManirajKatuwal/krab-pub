@@ -1,0 +1,6 @@
+error: `..` fills omitted props from `Default`, and <div> is an HTML element,
+         not a component. Only a capitalised tag takes props.
+ --> tests/compile_fail/rest_on_element.rs:7:36
+  |
+7 |     let _ = view! { <div class="a" ../> }.render();
+  |                                    ^

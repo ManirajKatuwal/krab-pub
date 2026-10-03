@@ -19,6 +19,23 @@ pub(crate) fn register_frontend_routes(app: Router<AppState>) -> Router<AppState
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))
         .route("/api/status", get(api_status_handler))
+        // Telemetry, the same handlers every other service mounts. Not on the
+        // public-path list: anonymous only with `KRAB_METRICS_PUBLIC=true`.
+        // Before these existed, `GET /metrics` fell through to `/{locale}`.
+        .route("/metrics", get(krab_core::http::metrics::<AppState>))
+        .route(
+            "/metrics/prometheus",
+            get(krab_core::http::metrics_prometheus::<AppState>),
+        )
+        // Authenticated: not on the public-path list.
+        .route(
+            "/api/users/{id}",
+            get(crate::users_contract::get_user_handler),
+        )
+        .route(
+            "/api/users",
+            axum::routing::post(crate::users_contract::create_user_handler),
+        )
         // Application routes
         .route("/", get(home_handler))
         .route("/{locale}", get(localized_home_handler))
@@ -54,7 +71,83 @@ pub(crate) fn register_frontend_routes(app: Router<AppState>) -> Router<AppState
         .route("/api/ws/publish", post(ws_publish_handler))
         .route("/api/contact", post(submit_contact_handler))
         .route("/api/hmr", get(hmr_handler))
+        // Progressive streaming SSR demo (ADR 0017) and its swap runtime.
+        .route("/streaming", get(crate::streaming::streaming_handler))
+        .route(
+            "/_krab/stream.js",
+            get(crate::streaming::stream_script_handler),
+        )
+        // The home page's hydration runtime, external so the CSP's
+        // `script-src 'self'` allows it.
+        .route(
+            "/_krab/home.js",
+            get(|| async {
+                (
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/javascript; charset=utf-8",
+                    )],
+                    crate::home_runtime_js(),
+                )
+            }),
+        )
+        // The contact form's submit handler, external for the same reason.
+        .route(
+            "/_krab/contact.js",
+            get(|| async {
+                (
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/javascript; charset=utf-8",
+                    )],
+                    CONTACT_SCRIPT,
+                )
+            }),
+        )
 }
+
+/// The `/contact` page's submit handler, served as `/_krab/contact.js`.
+///
+/// It used to be an inline `<script>` wired up with `onsubmit=`, both of
+/// which Krab's CSP (`script-src 'self' 'wasm-unsafe-eval'`) blocks. Fields
+/// are read by id: `form.name` is the form's own `name` attribute, not the
+/// input called `name`.
+pub(crate) const CONTACT_SCRIPT: &str = r#"const form = document.getElementById('contact-form');
+const result = document.getElementById('contact-result');
+
+async function submitContact(event) {
+    event.preventDefault();
+    const payload = {
+        name: document.getElementById('name').value,
+        email: document.getElementById('email').value,
+        message: document.getElementById('message').value,
+    };
+
+    try {
+        const response = await fetch('/api/contact', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (response.ok) {
+            result.textContent = 'Message queued successfully.';
+            result.dataset.state = 'success';
+        } else {
+            result.textContent = data.message || 'Submission failed.';
+            result.dataset.state = 'error';
+        }
+    } catch (err) {
+        result.textContent = 'Submission failed due to network error.';
+        result.dataset.state = 'error';
+        console.error('contact submission failed', err);
+    }
+}
+
+if (form && result) {
+    form.addEventListener('submit', submitContact);
+}
+"#;
 
 /// Run a render on the blocking pool and map a failed join to a 500.
 ///

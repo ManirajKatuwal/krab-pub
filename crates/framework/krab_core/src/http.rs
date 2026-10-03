@@ -1,3 +1,12 @@
+//! The HTTP surface of `krab_core` (feature `rest`), in one import path.
+//!
+//! [`apply_common_http_layers`] installs the standard middleware stack; this
+//! module also re-exports the pieces it is built from — authentication
+//! ([`AuthContext`], [`JwtProviderConfig`], ...), the [`ApiError`] envelope,
+//! CORS and security headers, CSRF, protocol resolution, request-id
+//! propagation ([`PropagationHeaders`]) and the health, readiness and metrics
+//! handlers backed by [`RuntimeState`].
+
 use std::time::Duration;
 
 use axum::body::Body;
@@ -114,6 +123,25 @@ pub(crate) fn overload_mode_from_env() -> OverloadMode {
     }
 }
 
+/// Wraps `router` in Krab's standard middleware stack.
+///
+/// From outermost to innermost: metrics, request id (`x-request-id`, a fresh
+/// UUID when missing or malformed), tracing, CORS, the per-client-IP rate
+/// limit, authentication, protocol resolution, CSRF, internal-service scope
+/// checks (`/internal`, `/api/internal`), a 2 MiB request-body limit,
+/// response compression, the `x-krab-api-version` header and the security
+/// headers; then the request timeout and concurrency limit around the
+/// handlers themselves.
+///
+/// Read from the environment when this is called:
+/// `KRAB_HTTP_REQUEST_TIMEOUT_SECS` (default 30; `0` disables, and a timed-out
+/// request is answered `408`), `KRAB_HTTP_MAX_CONCURRENCY` (default 1024; `0`
+/// disables) and `KRAB_HTTP_OVERLOAD_MODE` (`queue`, the default, waits for a
+/// permit; `shed` answers `503 SERVICE_OVERLOADED` immediately). Malformed
+/// values log a warning and use the default. The other layers take their
+/// settings from `state`'s [`RuntimeState`], except CSRF, which reads its
+/// switches from the environment per request (see
+/// [`csrf_protection_enabled`]).
 pub fn apply_common_http_layers<S>(router: Router<S>, state: S) -> Router<S>
 where
     S: Clone + Send + Sync + 'static + HasRuntimeState,
@@ -258,17 +286,13 @@ where
     let window_epoch = current_window_epoch(window_secs);
     let key = format!("rate:ip:{}:{}", client_ip, window_epoch);
 
-    let allowed = match state.runtime_state().store.incr(&key, 1).await {
-        Ok(count) => {
-            if count == 1 {
-                let _ = state
-                    .runtime_state()
-                    .store
-                    .expire(&key, Duration::from_secs(window_secs + 2))
-                    .await;
-            }
-            (count as f64) <= capacity
-        }
+    let allowed = match state
+        .runtime_state()
+        .store
+        .incr_with_ttl(&key, 1, Duration::from_secs(window_secs + 2))
+        .await
+    {
+        Ok(count) => (count as f64) <= capacity,
         Err(err) => {
             if fail_open {
                 warn!(error = %err, key = %key, mode = "open", "rate_limit_store_error_policy_applied");
@@ -285,7 +309,11 @@ where
             client_ip = %client_ip,
             capacity,
             refill_per_second,
-            limiter = "global_per_ip_token_bucket",
+            // A fixed-window counter per client IP: `capacity` requests per
+            // `capacity / refill_per_second` seconds. It was logged as a
+            // token bucket, which it has never been — bursts at a window
+            // boundary can reach twice `capacity`.
+            limiter = "global_per_ip_fixed_window",
             "global_ip_rate_limiter_triggered"
         );
         return ApiError::new(

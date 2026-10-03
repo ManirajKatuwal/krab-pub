@@ -24,8 +24,73 @@ impl UsersAdapterKind {
 
 pub struct UsersAdapterBundle {
     pub kind: UsersAdapterKind,
-    #[allow(dead_code)]
     pub adapter: Arc<dyn UsersServiceContract>,
+}
+
+/// The in-process adapter, for tests.
+#[cfg(test)]
+pub(crate) fn local_users_adapter() -> Arc<dyn UsersServiceContract> {
+    Arc::new(LocalUsersAdapter)
+}
+
+/// HTTP status for a users-contract failure.
+fn status_for(kind: DomainErrorKind) -> axum::http::StatusCode {
+    use axum::http::StatusCode;
+    match kind {
+        DomainErrorKind::Validation => StatusCode::BAD_REQUEST,
+        DomainErrorKind::Unauthorized => StatusCode::UNAUTHORIZED,
+        DomainErrorKind::Forbidden => StatusCode::FORBIDDEN,
+        DomainErrorKind::NotFound => StatusCode::NOT_FOUND,
+        DomainErrorKind::Conflict => StatusCode::CONFLICT,
+        DomainErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        DomainErrorKind::UpstreamUnavailable => StatusCode::BAD_GATEWAY,
+        DomainErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn domain_error_response(err: DomainError) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        status_for(err.kind),
+        axum::Json(serde_json::json!({ "code": err.code, "message": err.message })),
+    )
+        .into_response()
+}
+
+/// `GET /api/users/{id}` through whichever adapter the topology selected —
+/// in-process in a single topology, the users service over REST in a
+/// distributed one. The adapter was built at startup but only its `kind` was
+/// ever read, so the topology selection it encodes had no observable effect.
+///
+/// The lookup is made on behalf of the caller: their `Authorization` header
+/// is what the users service sees, never the frontend's own service token —
+/// otherwise every caller would be answered with what the service account
+/// may read (`/api/users/me` returned the service account's record).
+pub(crate) async fn get_user_handler(
+    axum::extract::State(state): axum::extract::State<crate::app_state::AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let authorization = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    match state.users.get_user_on_behalf_of(&id, authorization).await {
+        Ok(user) => axum::Json(user).into_response(),
+        Err(err) => domain_error_response(err),
+    }
+}
+
+/// `POST /api/users` through the selected adapter.
+pub(crate) async fn create_user_handler(
+    axum::extract::State(state): axum::extract::State<crate::app_state::AppState>,
+    axum::Json(request): axum::Json<NewUserRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match state.users.create_user(request).await {
+        Ok(user) => (axum::http::StatusCode::CREATED, axum::Json(user)).into_response(),
+        Err(err) => domain_error_response(err),
+    }
 }
 
 pub fn build_users_adapter(
@@ -118,11 +183,20 @@ impl RemoteUsersRestAdapter {
         }
     }
 
+    /// The client-facing error for a failed request. Deliberately generic:
+    /// reqwest's error text names the internal users URL, which is logged
+    /// here rather than returned to the caller.
     fn request_failed_error(err: &reqwest::Error) -> DomainError {
+        tracing::warn!(
+            event = "users_remote_request_failed",
+            error = %err,
+            timeout = err.is_timeout(),
+            connect = err.is_connect(),
+        );
         DomainError::new(
             DomainErrorKind::UpstreamUnavailable,
             "users.remote.request_failed",
-            format!("users REST request failed: {}", err),
+            "users service request failed",
         )
     }
 
@@ -141,13 +215,27 @@ impl RemoteUsersRestAdapter {
         err.is_timeout() || err.is_connect() || err.is_request()
     }
 
-    async fn send_get_with_retry(&self, url: &str) -> Result<reqwest::Response, DomainError> {
+    async fn send_get_with_retry(
+        &self,
+        url: &str,
+        credential: Credential<'_>,
+    ) -> Result<reqwest::Response, DomainError> {
         let max_attempts = usize::from(self.max_retries) + 1;
 
         for attempt in 0..max_attempts {
             let mut request = self.http_client.get(url);
-            if let Some(token) = &self.downstream_bearer_token {
-                request = request.bearer_auth(token);
+            match credential {
+                Credential::ServiceAccount => {
+                    if let Some(token) = &self.downstream_bearer_token {
+                        request = request.bearer_auth(token);
+                    }
+                }
+                // On behalf of a caller: their credential or none, never the
+                // service token.
+                Credential::Caller(Some(authorization)) => {
+                    request = request.header(reqwest::header::AUTHORIZATION, authorization);
+                }
+                Credential::Caller(None) => {}
             }
 
             match request.send().await {
@@ -173,9 +261,22 @@ impl RemoteUsersRestAdapter {
     }
 }
 
-#[async_trait::async_trait]
-impl UsersServiceContract for RemoteUsersRestAdapter {
-    async fn get_user(&self, id: &str) -> Result<UserRecord, DomainError> {
+/// Whose identity a remote users call carries.
+#[derive(Clone, Copy)]
+enum Credential<'a> {
+    /// The frontend's own service token (`KRAB_FRONTEND_DOWNSTREAM_BEARER_TOKEN`),
+    /// for calls not made on behalf of a user.
+    ServiceAccount,
+    /// The end caller's `Authorization` header value, forwarded as-is.
+    Caller(Option<&'a str>),
+}
+
+impl RemoteUsersRestAdapter {
+    async fn fetch_user(
+        &self,
+        id: &str,
+        credential: Credential<'_>,
+    ) -> Result<UserRecord, DomainError> {
         if id != "me" {
             return Err(DomainError::new(
                 DomainErrorKind::Validation,
@@ -185,7 +286,7 @@ impl UsersServiceContract for RemoteUsersRestAdapter {
         }
 
         let url = format!("{}/api/v1/users/me", self.base_url);
-        let response = self.send_get_with_retry(&url).await?;
+        let response = self.send_get_with_retry(&url, credential).await?;
 
         match response.status() {
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
@@ -213,10 +314,11 @@ impl UsersServiceContract for RemoteUsersRestAdapter {
         }
 
         let payload: Value = response.json().await.map_err(|err| {
+            tracing::warn!(event = "users_remote_payload_invalid", error = %err);
             DomainError::new(
                 DomainErrorKind::Internal,
                 "users.remote.invalid_payload",
-                format!("failed to decode users payload: {}", err),
+                "users service returned an unreadable payload",
             )
         })?;
 
@@ -244,6 +346,21 @@ impl UsersServiceContract for RemoteUsersRestAdapter {
             email,
             display_name,
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl UsersServiceContract for RemoteUsersRestAdapter {
+    async fn get_user(&self, id: &str) -> Result<UserRecord, DomainError> {
+        self.fetch_user(id, Credential::ServiceAccount).await
+    }
+
+    async fn get_user_on_behalf_of(
+        &self,
+        id: &str,
+        authorization: Option<&str>,
+    ) -> Result<UserRecord, DomainError> {
+        self.fetch_user(id, Credential::Caller(authorization)).await
     }
 
     async fn create_user(&self, _request: NewUserRequest) -> Result<UserRecord, DomainError> {

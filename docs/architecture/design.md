@@ -5,15 +5,15 @@ Krab follows a "Server-First, Client-Opt-In" architecture. By default, pages are
 
 ## 2. Core Components
 
-### A. The Server Runtime (Krab Server)
-- **Foundation**: Built on top of `hyper` (HTTP) and `tokio` (Async Runtime).
-- **Router**: A trie-based router that maps URLs to file-system paths.
-- **SSR Engine**: Executes Rust components on the server to produce HTML strings.
-- **Data Loader**: Handles `async` data fetching on the server before rendering. Data is serialized (e.g., via `serde_json` or `rkyv`) and embedded in the HTML for hydration.
+### A. The Server Runtime
+- **Foundation**: Axum, on `hyper` (HTTP) and `tokio` (async runtime). The separate `krab_server` crate was removed ([ADR 0005](../adr/0005-krab-server-disposition.md)).
+- **Router**: Axum routes. `service_frontend/build.rs` registers each `src/routes/<stem>.rs` module at `/<stem>` (see below).
+- **SSR Engine**: Executes Rust components on the server to produce HTML strings — as one string, or progressively with `render_to_stream`, which flushes the shell with `<Suspense>` fallbacks and streams resolved boundaries in ([ADR 0017](../adr/0017-progressive-streaming-ssr.md)).
+- **Data Loader**: `async` data fetching happens in the route handler, before rendering (or in a resource's server loader under `render_to_stream`). Island props reach the browser as JSON in the island's `data-props` attribute.
 
 ### B. The Client Runtime (Krab Client)
 - **Target**: `wasm32-unknown-unknown`.
-- **Reactivity System**: Fine-grained reactivity using Signals (similar to SolidJS/Leptos). No Virtual DOM diffing; updates are direct DOM manipulations.
+- **Reactivity System**: Fine-grained reactivity using Signals (similar to SolidJS/Leptos). A signal change re-renders only the affected dynamic region (`Node::Dynamic`) or reactive attribute, and the reconciler patches the DOM for that region (keyed for `<For>`); there is no whole-tree diff.
 - **Hydration**: The client runtime only "wakes up" specific interactive components (Islands). Static HTML remains untouched.
 
 ### C. The Build System (Krab CLI)
@@ -22,25 +22,23 @@ Krab follows a "Server-First, Client-Opt-In" architecture. By default, pages are
     1.  Compiles the App for the Server (Native binary).
     2.  Compiles the "Islands" for the Client (WASM module).
 - **Asset Pipeline**:
-    - **CSS**: Processed by `lightningcss` (Rust-based) for minification, prefixing, and syntax lowering.
-    - **Images**: Optimized via the `image` crate (WebP conversion).
-    - **Assets**: Fingerprinted and served statically.
+    - **Assets**: Fingerprinted (`krab build`, `krab dev --watch`) and served statically. There is no CSS or image processing step.
 
 ## 3. Detailed Subsystems
 
 ### File-System Routing
-Directory structure determines the URL paths.
+In `service_frontend`, file names determine the URL paths (`build.rs`).
 ```rust
 src/
   routes/
     index.rs          // -> /
     about.rs          // -> /about
-    blog/
-      index.rs        // -> /blog
-      [slug].rs       // -> /blog/:slug (Dynamic Route)
-    api/
-      users.rs        // -> /api/users (API Endpoint)
+  api/
+    users.rs          // -> /api/users (its `get` / `post` / … fns)
 ```
+
+Discovery is flat: nested directories and `[param]` segments are not supported.
+A dynamic route is an Axum route with a path parameter, declared in code.
 
 ### Islands Architecture Implementation
 Components are standard Rust functions. To make a component interactive on the client, it must be marked.
@@ -77,7 +75,7 @@ registration and a serialisable payload per boundary.
 
 - **Server behavior**: Calls `Counter(CounterProps { initial })`, renders an HTML
   string wrapped in `data-island` / `data-krab-boundary` markers.
-- **Client behavior**: Downloads `counter.wasm` (or a chunk), attaches event listeners to the existing HTML.
+- **Client behavior**: Loads the application's single WASM bundle (the crate that defines the islands), then attaches event listeners to the existing HTML.
 
 ### Data Loading Pattern
 
@@ -115,8 +113,17 @@ pub async fn handler() -> Html<String> {
 
 ## 4. State Management
 - **Local State**: Signals (`create_signal`).
-- **Global Client State**: Context API (dependency injection for deep trees).
-- **Server State**: Request-scoped context (for Headers, User Session).
+- **Shared State**: Context API — `krab_core::signal::provide_context` /
+  `use_context`, looked up by type through a tree of owners. Every component
+  called through a `view!` tag, every `#[island]`, and every effect and memo
+  runs in an owner of its own, so an inner provide shadows an outer one for
+  its subtree only, and an effect sees its creator's contexts on every re-run.
+  Works the same in SSR and in the browser; owners are thread-local and
+  `!Send`, like signals. See [ADR 0014](../adr/0014-context-api-and-owners.md).
+- **Server State**: Request-scoped context. An SSR handler opens the request's
+  scope with `with_owner(|| { provide_context(session); ... })`; there is no
+  thread-wide fallback scope, so one request's values cannot reach the next
+  request rendered on the same thread.
 
 ## 5. Security
 - **CSRF Protection**: Built-in middleware.

@@ -11,9 +11,11 @@ every push.
 
 | Feature | Where | What to look at |
 |---|---|---|
-| `view!` for all markup | [`src/lib.rs`](src/lib.rs) `page()` | The whole document, including `data-*` and `aria-*` attributes |
+| `view!` for all markup | [`src/lib.rs`](src/lib.rs) `page_for()` | The whole document, including `data-*` and `aria-*` attributes |
 | `#[island]` | `TaskCounter`, `TaskFilter` | Two components with different props structs |
 | `#[server]` | `add_task` | Mounted at `/api/rpc/add_task`, called from `TaskCounter`'s click handler |
+| `#[server(stream)]` | `task_countdown` | Mounted at `POST /api/rpc/task_countdown`; server-sent events on the server, a `ServerEventStream` in the browser |
+| Client router | `/` and `/about` | `<main data-krab-router-outlet>` is swapped on navigation; the nav and boot script sit outside it |
 | Shared source | `src/lib.rs` | The same file builds the server and the browser bundle |
 
 ## Run it
@@ -40,7 +42,7 @@ server-rendering code path and nothing hydrates.
 cargo test -p reference_app_islands_rpc
 ```
 
-Ten tests, covering the three things this example exists to prove:
+Fourteen tests, covering what this example exists to prove:
 
 - The SSR response carries the hydration markers the client runtime queries on
   (`data-island`, `data-krab-boundary`, `data-krab-boundary-id`,
@@ -48,7 +50,10 @@ Ten tests, covering the three things this example exists to prove:
 - `view!` emits hyphenated and namespaced attribute names — the page would
   silently lose its ARIA labels and test hooks if that regressed.
 - The `#[server]` endpoint returns the expected payload for a valid request and
-  rejects both malformed arguments and invalid values.
+  rejects both malformed arguments and invalid values; the `#[server(stream)]`
+  endpoint answers with server-sent events.
+- Both routes serve a router outlet, differ only inside it, and keep the nav
+  and boot script outside it.
 
 ## How the two halves are selected
 
@@ -67,5 +72,11 @@ wasm-pack build ... --features web   -> browser: hydration + fetch to /api/rpc
 - The server keeps no state. `add_task` validates and echoes, so the tests
   assert a contract rather than a database. Adding persistence is the natural
   next step for anyone using this as a starting point.
+- The page boots the bundle from an **inline** `<script type="module">`. The
+  example's server does not apply `krab_core::http::apply_common_http_layers`,
+  so no CSP is sent and it runs. Krab's CSP (`script-src 'self'
+  'wasm-unsafe-eval'`) blocks inline scripts: if you add those layers, serve the
+  bootstrap as a same-origin module file, as the reference frontend does with
+  `/_krab/home.js`.
 - Port `3100` is deliberately outside the `3000`–`3002` range the reference
   services use, so this runs alongside them.

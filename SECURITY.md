@@ -15,8 +15,8 @@ acknowledgement within a week.
 
 | Version | Supported |
 | --- | --- |
-| 0.2.x | Yes — current release line |
-| < 0.2 | No |
+| 0.6.x | Yes — current release line |
+| < 0.6 | No |
 
 Pre-1.0, only the latest minor release line receives security fixes.
 

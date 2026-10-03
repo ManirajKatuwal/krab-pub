@@ -373,11 +373,47 @@ pub async fn cache_middleware(State(state): State<AppState>, req: Request, next:
     // Extract body and cache it
     let (parts, body) = res.into_parts();
 
-    // We need to buffer the body to store it.
-    // Limit size to avoid memory issues (e.g. 10MB)
-    let bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(err) => {
+    // Buffered only up to the cache cap. Past it the response cannot be
+    // stored anyway, so the buffered prefix and the rest of the body are
+    // streamed straight through. This used to collect the *whole* body before
+    // looking at the cap, so a route rendered with streaming enabled was
+    // silently turned into a fully buffered one, however large it was.
+    let max_cache_body_bytes = cache_max_body_bytes();
+    let bytes = match buffer_up_to(body, max_cache_body_bytes).await {
+        Buffered::Complete(bytes) => bytes,
+        Buffered::Overflow { prefix_bytes, body } => {
+            tracing::warn!(
+                event = "cache_body_too_large_skip_store",
+                path = %path,
+                cache_key = %cache_key,
+                body_bytes_at_least = prefix_bytes,
+                max_cache_body_bytes,
+                "skipping cache store for oversized response body; streaming it through"
+            );
+            if isr_lease_held {
+                let _ = state.isr_cache.release_lease(&cache_key).await;
+            }
+            let mut res = Response::from_parts(parts, body);
+            let headers = res.headers_mut();
+            headers.insert(
+                axum::http::header::HeaderName::from_static("x-cache"),
+                axum::http::HeaderValue::from_static("MISS"),
+            );
+            if distributed_eligible {
+                headers.insert(
+                    axum::http::header::HeaderName::from_static("x-cache-store"),
+                    axum::http::HeaderValue::from_static("SKIP_OVERSIZE"),
+                );
+            }
+            if isr_eligible {
+                headers.insert(
+                    axum::http::header::HeaderName::from_static("x-isr-state"),
+                    axum::http::HeaderValue::from_static("skip-oversize"),
+                );
+            }
+            return res;
+        }
+        Buffered::Failed(err) => {
             tracing::error!("failed to read response body for caching: {}", err);
             if isr_lease_held {
                 let _ = state.isr_cache.release_lease(&cache_key).await;
@@ -393,22 +429,11 @@ pub async fn cache_middleware(State(state): State<AppState>, req: Request, next:
         .unwrap_or("text/html")
         .to_string();
 
-    let max_cache_body_bytes = cache_max_body_bytes();
-    let cacheable_body = bytes.len() <= max_cache_body_bytes;
-    if !cacheable_body {
-        tracing::warn!(
-            event = "cache_body_too_large_skip_store",
-            path = %path,
-            cache_key = %cache_key,
-            body_bytes = bytes.len(),
-            max_cache_body_bytes,
-            "skipping cache store for oversized response body"
-        );
-    }
-
+    // Past this point the body is complete and within the cache cap:
+    // `buffer_up_to` returned early for anything larger.
     let html_for_isr = String::from_utf8(bytes.to_vec()).ok();
 
-    let distributed_payload = if distributed_eligible && cacheable_body {
+    let distributed_payload = if distributed_eligible {
         distributed_key.as_deref().zip(html_for_isr.clone())
     } else {
         None
@@ -439,21 +464,10 @@ pub async fn cache_middleware(State(state): State<AppState>, req: Request, next:
             axum::http::HeaderValue::from_str(&distributed_cache_ttl().as_secs().to_string())
                 .unwrap_or(axum::http::HeaderValue::from_static("60")),
         );
-        if !cacheable_body {
-            res.headers_mut().insert(
-                axum::http::header::HeaderName::from_static("x-cache-store"),
-                axum::http::HeaderValue::from_static("SKIP_OVERSIZE"),
-            );
-        }
     }
 
     if isr_eligible {
-        if !cacheable_body {
-            res.headers_mut().insert(
-                axum::http::header::HeaderName::from_static("x-isr-state"),
-                axum::http::HeaderValue::from_static("skip-oversize"),
-            );
-        } else if let Some(html) = html_for_isr {
+        if let Some(html) = html_for_isr {
             if is_finalized_ssr_snapshot(&html) {
                 // A failed write means the next request re-renders — worse for
                 // latency, correct for content. Never fail the response over it.
@@ -507,6 +521,88 @@ pub async fn cache_middleware(State(state): State<AppState>, req: Request, next:
     }
 
     res
+}
+
+/// Outcome of reading a response body with a size cap.
+enum Buffered {
+    /// The whole body, within the cap.
+    Complete(bytes::Bytes),
+    /// The body exceeded the cap. `body` replays the bytes already read and
+    /// then streams the remainder, unbuffered.
+    Overflow { prefix_bytes: usize, body: Body },
+    /// Reading the body failed before the cap was reached.
+    Failed(axum::Error),
+}
+
+/// Read `body` into memory only while it stays within `cap` bytes.
+async fn buffer_up_to(mut body: Body, cap: usize) -> Buffered {
+    let mut buffered = bytes::BytesMut::new();
+    loop {
+        match body.frame().await {
+            None => return Buffered::Complete(buffered.freeze()),
+            Some(Err(err)) => return Buffered::Failed(err),
+            Some(Ok(frame)) => {
+                // Trailers carry no cacheable content; only data counts.
+                let Ok(data) = frame.into_data() else {
+                    continue;
+                };
+                buffered.extend_from_slice(&data);
+                if buffered.len() > cap {
+                    let prefix_bytes = buffered.len();
+                    let prefix = futures_util::stream::once(std::future::ready(Ok::<
+                        bytes::Bytes,
+                        axum::Error,
+                    >(
+                        buffered.freeze(),
+                    )));
+                    let rest = body.into_data_stream();
+                    return Buffered::Overflow {
+                        prefix_bytes,
+                        body: Body::from_stream(futures_util::StreamExt::chain(prefix, rest)),
+                    };
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod buffer_tests {
+    use super::{buffer_up_to, Buffered};
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+
+    fn chunked(parts: &[&'static str]) -> Body {
+        let stream = futures_util::stream::iter(
+            parts
+                .iter()
+                .map(|p| Ok::<_, std::io::Error>(bytes::Bytes::from_static(p.as_bytes())))
+                .collect::<Vec<_>>(),
+        );
+        Body::from_stream(stream)
+    }
+
+    #[tokio::test]
+    async fn a_body_within_the_cap_is_returned_whole() {
+        match buffer_up_to(chunked(&["<p>", "hello", "</p>"]), 1024).await {
+            Buffered::Complete(bytes) => assert_eq!(&bytes[..], b"<p>hello</p>"),
+            _ => panic!("expected a complete body"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oversized_body_streams_through_intact_without_full_buffering() {
+        let parts = ["aaaa", "bbbb", "cccc", "dddd"];
+        match buffer_up_to(chunked(&parts), 6).await {
+            Buffered::Overflow { prefix_bytes, body } => {
+                // Stopped reading as soon as the cap was crossed: two chunks.
+                assert_eq!(prefix_bytes, 8);
+                let all = body.collect().await.expect("replayed body").to_bytes();
+                assert_eq!(&all[..], b"aaaabbbbccccdddd", "no byte lost or reordered");
+            }
+            _ => panic!("expected overflow"),
+        }
+    }
 }
 
 // Serial: these tests mutate FRONTEND_ISR_QUERY_ALLOWLIST, shared process env.

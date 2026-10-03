@@ -20,6 +20,7 @@
 //! The compile-time enforcement is verified by the `signals_are_not_send_sync`
 //! test in this module.
 
+use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
@@ -138,6 +139,252 @@ impl Drop for SubscriberGuard {
     }
 }
 
+// ── Owners and context ──────────────────────────────────────────────────────
+//
+// See ADR 0014. An owner is a node in a tree of *context scopes*. It is
+// deliberately separate from effect ownership (`EffectState::children`), which
+// decides what is disposed when: the context tree only answers "what has been
+// provided above me?". Every effect and memo has an owner of its own, parented
+// to whichever owner was current when it was created, so an effect re-running
+// long after its creator returned still looks contexts up along the same
+// chain.
+
+thread_local! {
+    /// The owner whose contexts `provide_context` writes to and
+    /// `use_context` starts searching from.
+    static CURRENT_OWNER: RefCell<Option<Rc<OwnerState>>> = const { RefCell::new(None) };
+}
+
+struct OwnerState {
+    /// Strong, so a child that outlives its creator's stack frame — an effect
+    /// that re-runs later — can still reach the contexts provided above it.
+    /// Nothing points back down the tree, so this cannot form a cycle.
+    parent: Option<Rc<OwnerState>>,
+    /// Keyed by type. A `Vec` rather than a map: an owner holds a handful of
+    /// contexts at most, usually none, and a scan beats hashing at that size.
+    /// Values are `Rc` so a lookup can clone the handle out and release the
+    /// borrow before running `T::clone`, which is user code.
+    contexts: RefCell<Vec<(TypeId, Rc<dyn Any>)>>,
+    disposed: Cell<bool>,
+}
+
+impl OwnerState {
+    /// A new owner parented to the current one, or a root if there is none.
+    fn child_of_current() -> Rc<Self> {
+        Rc::new(Self {
+            parent: CURRENT_OWNER.with(|current| current.borrow().clone()),
+            contexts: RefCell::new(Vec::new()),
+            disposed: Cell::new(false),
+        })
+    }
+
+    /// Drop what this owner's current run provided. Called before an effect or
+    /// memo re-runs, which provides afresh, and on disposal.
+    ///
+    /// Moved out before dropping: a context value's `Drop` is user code, and
+    /// it must not find the `RefCell` borrowed.
+    fn clear_contexts(&self) {
+        let contexts = std::mem::take(&mut *self.contexts.borrow_mut());
+        drop(contexts);
+    }
+
+    fn dispose(&self) {
+        self.disposed.set(true);
+        self.clear_contexts();
+    }
+}
+
+/// Restores [`CURRENT_OWNER`] on scope exit, including by unwinding — the same
+/// reasoning as [`SubscriberGuard`]: a caught panic must not leave a later
+/// render providing into, or reading from, a scope that has already ended.
+struct OwnerGuard {
+    previous: Option<Rc<OwnerState>>,
+}
+
+impl OwnerGuard {
+    fn swap_in(next: Rc<OwnerState>) -> Self {
+        Self {
+            previous: CURRENT_OWNER.with(|current| current.replace(Some(next))),
+        }
+    }
+}
+
+impl Drop for OwnerGuard {
+    fn drop(&mut self) {
+        CURRENT_OWNER.with(|current| {
+            current.replace(self.previous.take());
+        });
+    }
+}
+
+/// A context scope: the unit [`provide_context`] writes to and
+/// [`use_context`] searches from.
+///
+/// Owners form a tree. A lookup starts at the current owner and walks up
+/// through its parents, so a value provided in an outer scope is visible in
+/// every scope created inside it, and a value provided in an inner scope
+/// shadows an outer one of the same type for that subtree only.
+///
+/// Most code never touches an `Owner` directly:
+///
+/// - every component called through a `view!` tag (`<Card/>`) and every
+///   `#[island]` runs in an owner of its own, created by the macro;
+/// - every effect and memo has an owner, parented to the scope it was created
+///   in, and runs under it each time it runs;
+/// - [`with_owner`] opens a scope for a closure, which is what an SSR entry
+///   point uses to give a request its contexts.
+///
+/// Like signals, owners are thread-local and `!Send`. Contexts provided while
+/// rendering one request are visible only to code running inside that
+/// request's scope on the same thread.
+#[derive(Clone)]
+pub struct Owner {
+    state: Rc<OwnerState>,
+}
+
+impl Owner {
+    /// A new owner, parented to the current one if there is one.
+    ///
+    /// It is not made current; run code under it with [`with`](Self::with).
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self {
+            state: OwnerState::child_of_current(),
+        }
+    }
+
+    /// The owner code is currently running under, if any.
+    pub fn current() -> Option<Self> {
+        CURRENT_OWNER.with(|current| current.borrow().clone().map(|state| Self { state }))
+    }
+
+    /// Run `f` with this owner current, restoring the previous owner
+    /// afterwards, even if `f` panics.
+    ///
+    /// Useful for re-entering a scope from a callback that runs outside it —
+    /// capture `Owner::current()` while inside, call `with` later.
+    pub fn with<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _guard = OwnerGuard::swap_in(self.state.clone());
+        f()
+    }
+
+    /// Drop every context this owner holds. Later `provide_context` calls
+    /// under it are ignored and later lookups skip it, continuing to its
+    /// parent. Idempotent.
+    ///
+    /// An owner is also released simply by dropping every handle to it; this
+    /// is for releasing its contexts *before* that, while an effect created
+    /// in the scope still holds it.
+    pub fn dispose(&self) {
+        self.state.dispose();
+    }
+}
+
+/// Run `f` in a new context scope, parented to the current one.
+///
+/// Contexts `f` provides are visible to everything it calls, and to effects
+/// and memos it creates for as long as they live; they are not visible to the
+/// caller. This is the SSR entry point for contexts:
+///
+/// ```
+/// use krab_core::signal::{provide_context, use_context, with_owner};
+///
+/// #[derive(Clone)]
+/// struct Locale(&'static str);
+///
+/// fn greeting() -> String {
+///     match use_context::<Locale>() {
+///         Some(Locale("fr")) => "Bonjour".to_string(),
+///         _ => "Hello".to_string(),
+///     }
+/// }
+///
+/// let html = with_owner(|| {
+///     provide_context(Locale("fr"));
+///     greeting()
+/// });
+/// assert_eq!(html, "Bonjour");
+/// // The scope has ended: nothing is provided out here.
+/// assert!(use_context::<Locale>().is_none());
+/// ```
+///
+/// `view!` wraps every component tag in `with_owner`, so a component's
+/// `provide_context` reaches the components *it* renders without leaking to
+/// its siblings.
+pub fn with_owner<T>(f: impl FnOnce() -> T) -> T {
+    Owner::new().with(f)
+}
+
+/// Make `value` available to [`use_context::<T>()`](use_context) in the
+/// current scope and every scope created inside it.
+///
+/// Providing a second value of the same type in the same scope replaces the
+/// first. Providing one in an inner scope shadows the outer value for that
+/// scope only.
+///
+/// Outside any scope this does nothing except emit a
+/// `context_provided_without_owner` warning. There is deliberately no
+/// thread-wide fallback scope: on a server, one thread renders many requests
+/// in turn, and a value provided for one request must never be visible to the
+/// next. Open a scope with [`with_owner`] first.
+pub fn provide_context<T: Clone + 'static>(value: T) {
+    let Some(owner) = CURRENT_OWNER.with(|current| current.borrow().clone()) else {
+        tracing::warn!(
+            krab.context_type = std::any::type_name::<T>(),
+            "context_provided_without_owner"
+        );
+        return;
+    };
+    if owner.disposed.get() {
+        return;
+    }
+
+    let value: Rc<dyn Any> = Rc::new(value);
+    let id = TypeId::of::<T>();
+    // The replaced value, if any, is dropped after the borrow ends, for the
+    // same reason `clear_contexts` moves values out before dropping them.
+    let replaced = {
+        let mut contexts = owner.contexts.borrow_mut();
+        match contexts.iter_mut().find(|(existing, _)| *existing == id) {
+            Some(slot) => Some(std::mem::replace(&mut slot.1, value)),
+            None => {
+                contexts.push((id, value));
+                None
+            }
+        }
+    };
+    drop(replaced);
+}
+
+/// The nearest value of type `T` provided in the current scope or any scope
+/// enclosing it, or `None` if there is none.
+///
+/// Call it in a component's body, while the component runs, and move the
+/// result into any closures that need it. A closure that runs later — a
+/// `Node::Dynamic` rendered after the component returned, an event handler —
+/// runs outside the scope unless it re-enters one with [`Owner::with`]. An
+/// effect created in the body is the exception: it keeps its scope, and sees
+/// the same contexts every time it runs.
+pub fn use_context<T: Clone + 'static>() -> Option<T> {
+    let id = TypeId::of::<T>();
+    let mut owner = CURRENT_OWNER.with(|current| current.borrow().clone());
+    while let Some(state) = owner {
+        let found = state
+            .contexts
+            .borrow()
+            .iter()
+            .find(|(existing, _)| *existing == id)
+            .map(|(_, value)| value.clone());
+        if let Some(value) = found {
+            // The borrow is released before `clone`, which is user code and
+            // may itself call `use_context` or `provide_context`.
+            return value.downcast_ref::<T>().cloned();
+        }
+        owner = state.parent.clone();
+    }
+    None
+}
+
 /// A cached derived value.
 ///
 /// Type-erased: the computed value lives in an `Rc<RefCell<Option<T>>>` closed
@@ -162,6 +409,10 @@ struct MemoState {
     recompute: RefCell<Option<Box<dyn Fn()>>>,
     subscribers: RefCell<Vec<Subscriber>>,
     disposed: Cell<bool>,
+    /// The context scope the computation runs under, parented to the scope
+    /// the memo was created in — so a recomputation triggered from anywhere
+    /// still sees the contexts its creator saw.
+    owner: Rc<OwnerState>,
 }
 
 impl MemoState {
@@ -181,6 +432,10 @@ impl MemoState {
         self.computing.set(true);
 
         let _subscriber = SubscriberGuard::swap_in(Some(Subscriber::Memo(Rc::downgrade(self))));
+        // Anything the previous computation provided is stale; this one
+        // provides afresh.
+        self.owner.clear_contexts();
+        let _owner = OwnerGuard::swap_in(self.owner.clone());
 
         // The closure is taken out for the call: it may read other memos, whose
         // recomputation would otherwise need a second borrow of this RefCell.
@@ -249,6 +504,11 @@ struct EffectState {
     owned_memos: RefCell<Vec<Rc<MemoState>>>,
     /// Callbacks registered by [`on_cleanup`] during the last run.
     cleanups: RefCell<Vec<Box<dyn FnOnce()>>>,
+    /// The context scope the body runs under, parented to the scope the
+    /// effect was created in. This is what lets a re-run — triggered by a
+    /// signal write from anywhere, long after the creating component returned
+    /// — see the contexts that were provided around it.
+    owner: Rc<OwnerState>,
 }
 
 impl EffectState {
@@ -270,18 +530,24 @@ impl EffectState {
         let memos = std::mem::take(&mut *self.owned_memos.borrow_mut());
         for memo in memos {
             memo.disposed.set(true);
+            memo.owner.dispose();
         }
 
         let children = std::mem::take(&mut *self.children.borrow_mut());
         for child in children {
             child.dispose();
         }
+
+        // Last, so cleanups above could still have read them. What the body
+        // provided belongs to the run that provided it.
+        self.owner.clear_contexts();
     }
 
     /// Tear this effect down permanently, and everything it owns.
     fn dispose(&self) {
         self.disposed.set(true);
         self.dispose_children();
+        self.owner.dispose();
     }
 }
 
@@ -302,6 +568,10 @@ impl<T> Clone for SignalInner<T> {
     }
 }
 
+/// Creates a signal holding `value`, returning its read and write halves.
+///
+/// Both halves are cheap to clone and share the same value. Single-threaded
+/// (see the module docs).
 pub fn create_signal<T>(value: T) -> (ReadSignal<T>, WriteSignal<T>) {
     let inner = SignalInner {
         state: Rc::new(RefCell::new(SignalState {
@@ -318,6 +588,8 @@ pub fn create_signal<T>(value: T) -> (ReadSignal<T>, WriteSignal<T>) {
     )
 }
 
+/// The read half of a signal, from [`create_signal`]. Reading it inside an
+/// effect or memo subscribes that effect or memo to later writes.
 pub struct ReadSignal<T> {
     inner: SignalInner<T>,
 }
@@ -331,6 +603,8 @@ impl<T> Clone for ReadSignal<T> {
 }
 
 impl<T: Clone> ReadSignal<T> {
+    /// A clone of the current value, subscribing the running effect or memo,
+    /// if any.
     pub fn get(&self) -> T {
         // Track dependency
         CURRENT_SUBSCRIBER.with(|current| {
@@ -344,6 +618,10 @@ impl<T: Clone> ReadSignal<T> {
 }
 
 impl<T> ReadSignal<T> {
+    /// Calls `f` with a reference to the current value, without cloning it,
+    /// and subscribes the running effect or memo like [`ReadSignal::get`].
+    /// Writing to the same signal from inside `f` panics (the value is
+    /// borrowed).
     pub fn with<U, F>(&self, f: F) -> U
     where
         F: FnOnce(&T) -> U,
@@ -359,6 +637,12 @@ impl<T> ReadSignal<T> {
     }
 }
 
+/// The write half of a signal, from [`create_signal`].
+///
+/// Every write notifies the signal's subscribers, whether or not the value
+/// changed. Natively the affected effects run before the write returns; in
+/// the browser (feature `web` on `wasm32`) they run in a microtask; inside a
+/// [`batch`] they run when the batch ends.
 pub struct WriteSignal<T> {
     inner: SignalInner<T>,
 }
@@ -372,6 +656,7 @@ impl<T> Clone for WriteSignal<T> {
 }
 
 impl<T> WriteSignal<T> {
+    /// Replaces the value and notifies subscribers.
     pub fn set(&self, new_value: T) {
         {
             let mut state = self.inner.state.borrow_mut();
@@ -381,6 +666,9 @@ impl<T> WriteSignal<T> {
         self.notify();
     }
 
+    /// Mutates the value in place with `f`, then notifies subscribers.
+    /// Reading the same signal from inside `f` panics (the value is
+    /// borrowed mutably).
     pub fn update<F>(&self, f: F)
     where
         F: FnOnce(&mut T),
@@ -901,6 +1189,7 @@ where
         recompute: RefCell::new(None),
         subscribers: RefCell::new(Vec::new()),
         disposed: Cell::new(false),
+        owner: OwnerState::child_of_current(),
     });
 
     {
@@ -939,6 +1228,7 @@ fn new_effect_state(f: impl Fn() + 'static) -> Rc<EffectState> {
         children: RefCell::new(Vec::new()),
         owned_memos: RefCell::new(Vec::new()),
         cleanups: RefCell::new(Vec::new()),
+        owner: OwnerState::child_of_current(),
     })
 }
 
@@ -1065,6 +1355,7 @@ where
             children: RefCell::new(Vec::new()),
             owned_memos: RefCell::new(Vec::new()),
             cleanups: RefCell::new(Vec::new()),
+            owner: OwnerState::child_of_current(),
         }),
     }
 }
@@ -1088,6 +1379,108 @@ where
             }
         });
     }
+}
+
+// ── Recovery from an abandoned run ──────────────────────────────────────────
+
+/// The reactive runtime's per-thread "where am I" state: the current
+/// subscriber and owner, and the batch and flush depths.
+///
+/// Every one of these is restored by a drop guard when its scope exits,
+/// including by unwinding. On `wasm32-unknown-unknown` a panic does not unwind
+/// — it traps — and `krab_client` contains the trap in JavaScript, one island
+/// at a time. The Rust frames that trapped are discarded without running a
+/// single destructor, so the guards never run, and the state is left as the
+/// dead island had it: its owner current (so the next island's `with_owner`
+/// is parented to it and `use_context` finds the dead island's values), its
+/// effect the current subscriber, a `batch` depth that never returns to zero
+/// (deferring every later signal write on the page).
+///
+/// `krab_client` takes a snapshot before each isolated call and restores it
+/// after a trap. Not for application code.
+#[doc(hidden)]
+pub struct ReactiveSnapshot {
+    subscriber: Option<Subscriber>,
+    owner: Option<Rc<OwnerState>>,
+    batch_depth: u32,
+    #[cfg(any(not(feature = "web"), not(target_arch = "wasm32")))]
+    flush_depth: u32,
+    #[cfg(all(feature = "web", target_arch = "wasm32"))]
+    drain_chain_depth: u32,
+}
+
+/// Capture the state [`restore_reactive_state`] puts back. See
+/// [`ReactiveSnapshot`].
+///
+/// Tolerant of a cell a previous trap left borrowed: the value is then taken
+/// as empty rather than panicking.
+#[doc(hidden)]
+pub fn snapshot_reactive_state() -> ReactiveSnapshot {
+    ReactiveSnapshot {
+        subscriber: CURRENT_SUBSCRIBER
+            .try_with(|current| current.try_borrow().ok().and_then(|s| s.clone()))
+            .ok()
+            .flatten(),
+        owner: CURRENT_OWNER
+            .try_with(|current| current.try_borrow().ok().and_then(|o| o.clone()))
+            .ok()
+            .flatten(),
+        batch_depth: BATCH_DEPTH.try_with(Cell::get).unwrap_or(0),
+        #[cfg(any(not(feature = "web"), not(target_arch = "wasm32")))]
+        flush_depth: FLUSH_DEPTH.try_with(Cell::get).unwrap_or(0),
+        #[cfg(all(feature = "web", target_arch = "wasm32"))]
+        drain_chain_depth: DRAIN_CHAIN_DEPTH.try_with(Cell::get).unwrap_or(0),
+    }
+}
+
+/// Put back the state captured by [`snapshot_reactive_state`], after a run
+/// was abandoned without its guards running (a wasm trap). Runs no user code.
+///
+/// Returns `false` if a cell was still borrowed — the trap happened while the
+/// runtime held it — and so could not be restored. A borrow flag stuck by a
+/// trap cannot be cleared from safe code; the caller should report it, since
+/// the next access to that cell will panic.
+///
+/// Effects an abandoned `batch` had deferred stay queued and run when the next
+/// batch on the page closes; they are live effects subscribed to signals that
+/// really were written, so dropping them would leave their DOM stale.
+#[doc(hidden)]
+pub fn restore_reactive_state(snapshot: ReactiveSnapshot) -> bool {
+    let ReactiveSnapshot {
+        subscriber,
+        owner,
+        batch_depth,
+        #[cfg(any(not(feature = "web"), not(target_arch = "wasm32")))]
+        flush_depth,
+        #[cfg(all(feature = "web", target_arch = "wasm32"))]
+        drain_chain_depth,
+    } = snapshot;
+
+    let subscriber_restored = CURRENT_SUBSCRIBER
+        .try_with(|current| match current.try_borrow_mut() {
+            Ok(mut slot) => {
+                *slot = subscriber;
+                true
+            }
+            Err(_) => false,
+        })
+        .unwrap_or(false);
+    let owner_restored = CURRENT_OWNER
+        .try_with(|current| match current.try_borrow_mut() {
+            Ok(mut slot) => {
+                *slot = owner;
+                true
+            }
+            Err(_) => false,
+        })
+        .unwrap_or(false);
+    let _ = BATCH_DEPTH.try_with(|depth| depth.set(batch_depth));
+    #[cfg(any(not(feature = "web"), not(target_arch = "wasm32")))]
+    let _ = FLUSH_DEPTH.try_with(|depth| depth.set(flush_depth));
+    #[cfg(all(feature = "web", target_arch = "wasm32"))]
+    let _ = DRAIN_CHAIN_DEPTH.try_with(|depth| depth.set(drain_chain_depth));
+
+    subscriber_restored && owner_restored
 }
 
 /// Ceiling on consecutive owed re-runs of one effect, and on nested
@@ -1156,6 +1549,7 @@ fn run_effect(effect: Rc<EffectState>) {
             // effect and then mass-disposed them on its next run.
             let _subscriber =
                 SubscriberGuard::swap_in(Some(Subscriber::Effect(Rc::downgrade(&effect))));
+            let _owner = OwnerGuard::swap_in(effect.owner.clone());
             effect.run();
         }
 
@@ -1171,6 +1565,64 @@ fn run_effect(effect: Rc<EffectState>) {
             effect.rerun_requested.set(false);
             break;
         }
+    }
+}
+
+/// A wasm trap discards the island's frames without running their guards.
+/// `std::mem::forget` on each guard reproduces exactly that, natively.
+#[cfg(test)]
+mod abandoned_run_tests {
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Leaked(u32);
+
+    /// Island A enters an owner, provides a context, opens a batch and is
+    /// mid-effect when it "traps". Without a restore, island B inherits all of
+    /// it; with one, B starts clean and reactivity works.
+    #[test]
+    fn restoring_a_snapshot_undoes_an_abandoned_run() {
+        let snapshot = snapshot_reactive_state();
+
+        let dead_owner = OwnerState::child_of_current();
+        std::mem::forget(OwnerGuard::swap_in(dead_owner));
+        provide_context(Leaked(7));
+        std::mem::forget(BatchGuard::enter());
+        let dead_effect = new_effect_state(|| {});
+        std::mem::forget(SubscriberGuard::swap_in(Some(Subscriber::Effect(
+            Rc::downgrade(&dead_effect),
+        ))));
+        FLUSH_DEPTH.with(|depth| depth.set(depth.get() + 3));
+
+        // The leak the snapshot exists to undo: a fresh scope for the next
+        // island is parented to the dead one.
+        assert_eq!(with_owner(use_context::<Leaked>), Some(Leaked(7)));
+
+        assert!(restore_reactive_state(snapshot));
+
+        assert_eq!(with_owner(use_context::<Leaked>), None);
+        assert!(Owner::current().is_none());
+        assert!(CURRENT_SUBSCRIBER.with(|current| current.borrow().is_none()));
+        assert_eq!(BATCH_DEPTH.with(Cell::get), 0);
+        assert_eq!(FLUSH_DEPTH.with(Cell::get), 0);
+
+        // Writes deliver again: a stuck batch depth would defer this forever.
+        let (value, set_value) = create_signal(0);
+        let seen = Rc::new(Cell::new(-1));
+        let sink = seen.clone();
+        create_effect(move || sink.set(value.get()));
+        set_value.set(5);
+        assert_eq!(seen.get(), 5);
+    }
+
+    #[test]
+    fn a_cell_left_borrowed_is_reported_not_panicked_on() {
+        let snapshot = snapshot_reactive_state();
+        let restored = CURRENT_OWNER.with(|current| {
+            let _held = current.borrow();
+            restore_reactive_state(snapshot)
+        });
+        assert!(!restored);
     }
 }
 
@@ -2257,5 +2709,221 @@ mod cycle_guard_tests {
         assert_eq!(cleanups.get(), 0);
         handle.dispose();
         assert_eq!(cleanups.get(), 1, "dispose must run the registered cleanup");
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+    use std::cell::Cell as StdCell;
+    use std::rc::Rc as StdRc;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Theme(&'static str);
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct User(&'static str);
+
+    /// SSR shape: components are plain function calls made while the parent
+    /// runs, each in its own scope, as `view!` component tags produce.
+    fn child_component() -> Option<Theme> {
+        use_context::<Theme>()
+    }
+
+    fn parent_component() -> (Option<Theme>, Option<Theme>, Option<Theme>) {
+        provide_context(Theme("dark"));
+        let first = with_owner(child_component);
+        let shadowed = with_owner(|| {
+            provide_context(Theme("light"));
+            with_owner(child_component)
+        });
+        // A sibling rendered after the shadowing one sees the parent's value:
+        // the inner provide was confined to its own scope.
+        let sibling = with_owner(child_component);
+        (first, shadowed, sibling)
+    }
+
+    #[test]
+    fn a_context_reaches_nested_calls_and_inner_provides_shadow_outer_ones() {
+        let (first, shadowed, sibling) = with_owner(parent_component);
+        assert_eq!(first, Some(Theme("dark")));
+        assert_eq!(shadowed, Some(Theme("light")));
+        assert_eq!(sibling, Some(Theme("dark")));
+    }
+
+    #[test]
+    fn contexts_of_different_types_are_independent() {
+        with_owner(|| {
+            provide_context(Theme("dark"));
+            with_owner(|| {
+                provide_context(User("ada"));
+                assert_eq!(use_context::<Theme>(), Some(Theme("dark")));
+                assert_eq!(use_context::<User>(), Some(User("ada")));
+            });
+            assert_eq!(use_context::<User>(), None);
+        });
+    }
+
+    #[test]
+    fn providing_twice_in_one_scope_replaces_the_value() {
+        with_owner(|| {
+            provide_context(Theme("dark"));
+            provide_context(Theme("light"));
+            assert_eq!(use_context::<Theme>(), Some(Theme("light")));
+        });
+    }
+
+    #[test]
+    fn an_absent_context_is_none() {
+        assert_eq!(use_context::<Theme>(), None);
+        with_owner(|| assert_eq!(use_context::<Theme>(), None));
+    }
+
+    /// No thread-wide fallback: on a server the next request on this thread
+    /// must not see what an earlier one provided.
+    #[test]
+    fn providing_outside_any_scope_is_not_visible_anywhere() {
+        provide_context(Theme("leaked"));
+        assert_eq!(use_context::<Theme>(), None);
+        with_owner(|| assert_eq!(use_context::<Theme>(), None));
+    }
+
+    #[test]
+    fn a_scope_ends_with_its_closure() {
+        with_owner(|| provide_context(Theme("dark")));
+        assert_eq!(use_context::<Theme>(), None);
+        assert!(Owner::current().is_none());
+    }
+
+    #[test]
+    fn a_panicking_scope_restores_the_previous_owner() {
+        with_owner(|| {
+            provide_context(Theme("outer"));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_owner(|| {
+                    provide_context(Theme("inner"));
+                    panic!("render failed");
+                })
+            }));
+            assert!(result.is_err());
+            assert_eq!(use_context::<Theme>(), Some(Theme("outer")));
+        });
+    }
+
+    #[test]
+    fn an_effect_sees_its_scope_on_every_run() {
+        let (count, set_count) = create_signal(0);
+        let seen = StdRc::new(RefCell::new(Vec::new()));
+
+        let handle = with_owner(|| {
+            provide_context(Theme("dark"));
+            let seen = seen.clone();
+            create_effect_scoped(move || {
+                count.get();
+                seen.borrow_mut().push(use_context::<Theme>());
+            })
+        });
+
+        // The scope's closure has returned; the writes below re-run the
+        // effect from outside it.
+        assert!(Owner::current().is_none());
+        set_count.set(1);
+        set_count.set(2);
+
+        assert_eq!(
+            *seen.borrow(),
+            vec![Some(Theme("dark")); 3],
+            "every run, including re-runs after the scope returned, must see the context"
+        );
+        handle.dispose();
+    }
+
+    #[test]
+    fn a_context_provided_in_an_effect_reaches_its_child_effects() {
+        let seen = StdRc::new(RefCell::new(None));
+        let handle = with_owner(|| {
+            let seen = seen.clone();
+            create_effect_scoped(move || {
+                provide_context(User("from-effect"));
+                let seen = seen.clone();
+                create_effect(move || {
+                    *seen.borrow_mut() = use_context::<User>();
+                });
+            })
+        });
+        assert_eq!(*seen.borrow(), Some(User("from-effect")));
+        handle.dispose();
+    }
+
+    #[test]
+    fn a_memo_recomputes_under_the_scope_it_was_created_in() {
+        let (count, set_count) = create_signal(1);
+        let memo = with_owner(|| {
+            provide_context(Theme("dark"));
+            create_memo(move || (count.get(), use_context::<Theme>()))
+        });
+        set_count.set(2);
+        assert_eq!(memo.get(), (2, Some(Theme("dark"))));
+    }
+
+    /// Disposal drops the value, observable through a context whose `Drop`
+    /// is counted.
+    #[test]
+    fn disposing_an_effect_drops_the_contexts_it_provided() {
+        #[derive(Clone)]
+        struct Tracked(StdRc<StdCell<u32>>);
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let drops = StdRc::new(StdCell::new(0));
+        let handle = {
+            let drops = drops.clone();
+            create_effect_scoped(move || provide_context(Tracked(drops.clone())))
+        };
+        let before = drops.get();
+        handle.dispose();
+        assert_eq!(
+            drops.get(),
+            before + 1,
+            "dispose must drop the provided value"
+        );
+    }
+
+    #[test]
+    fn a_disposed_owner_is_skipped_by_lookups() {
+        with_owner(|| {
+            provide_context(Theme("outer"));
+            let inner = Owner::new();
+            inner.with(|| provide_context(Theme("inner")));
+            inner.with(|| assert_eq!(use_context::<Theme>(), Some(Theme("inner"))));
+
+            inner.dispose();
+            inner.with(|| {
+                assert_eq!(use_context::<Theme>(), Some(Theme("outer")));
+                provide_context(Theme("ignored"));
+                assert_eq!(use_context::<Theme>(), Some(Theme("outer")));
+            });
+        });
+    }
+
+    #[test]
+    fn a_re_run_forgets_what_the_previous_run_provided() {
+        let (provide, set_provide) = create_signal(true);
+        let seen = StdRc::new(RefCell::new(Vec::new()));
+        let handle = {
+            let seen = seen.clone();
+            create_effect_scoped(move || {
+                if provide.get() {
+                    provide_context(User("first-run"));
+                }
+                seen.borrow_mut().push(use_context::<User>());
+            })
+        };
+        set_provide.set(false);
+        assert_eq!(*seen.borrow(), vec![Some(User("first-run")), None]);
+        handle.dispose();
     }
 }

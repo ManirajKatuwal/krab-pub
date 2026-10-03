@@ -1,14 +1,32 @@
+// The module is deprecated (see its declaration in lib.rs); its own items and
+// tests keep using each other until it is removed in 0.7.0.
+#![allow(deprecated)]
+
 use crate::{Attribute, Element, Node};
 
+/// Input to [`optimized_image`]. Deprecated with the module.
 pub struct ImageProps {
+    /// The fallback `<img>` source. Its path minus the extension is also the
+    /// base the `<source>` variants are derived from.
     pub src: String,
+    /// The `alt` text.
     pub alt: String,
+    /// The `width` attribute, if any.
     pub width: Option<u32>,
+    /// The `height` attribute, if any.
     pub height: Option<u32>,
+    /// The `class` attribute, if any.
     pub class: Option<String>,
+    /// The `loading` attribute (`lazy` or `eager`), if any.
     pub loading: Option<String>,
+    /// Emit an `image/avif` `<source>` (default true). Nothing generates the
+    /// file it points at.
     pub generate_avif: bool,
+    /// Emit an `image/webp` `<source>` (default true). Nothing generates the
+    /// file it points at.
     pub generate_webp: bool,
+    /// Widths for the `<source>` `srcset`s, as `{base}-{w}w.{ext} {w}w`
+    /// entries; empty means a single `{base}.{ext}`.
     pub srcset_widths: Vec<u32>,
 }
 
@@ -28,6 +46,9 @@ impl Default for ImageProps {
     }
 }
 
+/// Builds a `<picture>` with the requested AVIF/WebP `<source>`s and an
+/// `<img>` fallback. Deprecated with the module: the variant files it
+/// references are not produced by anything in Krab.
 pub fn optimized_image(props: ImageProps) -> Node {
     let mut picture_children = Vec::new();
 

@@ -27,6 +27,18 @@
 //! hydration. Data needed for first paint belongs in the async route handler,
 //! passed down as island props and into [`create_resource_with_initial`] — the
 //! client then hydrates `Ready` and does **not** refetch on mount.
+//!
+//! # Suspense and streaming
+//!
+//! A resource created while building the children of a `<Suspense>` boundary
+//! registers with it (see [`crate::suspense`]): the boundary shows its fallback
+//! until the resource has produced a first value. Under
+//! [`render_to_stream`](crate::render_stream) a resource can also declare a
+//! **server loader** with [`Resource::with_server_loader`]; the streaming
+//! renderer runs it after flushing the page shell and streams the boundary's
+//! resolved content when it completes (ADR 0017). Outside a streaming render
+//! the loader is never called, so the non-blocking contract above holds
+//! unchanged.
 
 use crate::action::{flatten_display_errors, run_guarded, GuardedFuture};
 use crate::signal::{create_effect, create_signal, untrack, ReadSignal, WriteSignal};
@@ -83,6 +95,10 @@ pub struct Resource<S, T: 'static> {
     /// faster later one — the same discard-superseded-responses rule as
     /// [`Action`](crate::action::Action).
     generation: Rc<Cell<u64>>,
+    /// The registration with the enclosing `<Suspense>` boundary, if the
+    /// resource was created inside one. Kept so a server loader can tell the
+    /// boundary it can be resolved by a streaming render.
+    suspense: Option<crate::suspense::SourceHandle>,
 }
 
 impl<S, T: 'static> Clone for Resource<S, T> {
@@ -95,6 +111,7 @@ impl<S, T: 'static> Clone for Resource<S, T> {
             source: self.source.clone(),
             fetcher: self.fetcher.clone(),
             generation: self.generation.clone(),
+            suspense: self.suspense.clone(),
         }
     }
 }
@@ -154,6 +171,71 @@ where
                 Err(message) => set_state.set(ResourceState::Error(message)),
             },
         );
+    }
+}
+
+impl<S, T> Resource<S, T>
+where
+    S: 'static,
+    T: Clone + Send + 'static,
+{
+    /// Declare how the server loads this resource during a **streaming**
+    /// render ([`render_to_stream`](crate::render_stream), ADR 0017).
+    ///
+    /// Inside a streaming render, `loader` is called once, on the render
+    /// thread, and the future it returns is run on the Tokio runtime after the
+    /// page shell has been flushed; its result is applied to this resource on
+    /// the render thread, and the enclosing `<Suspense>` boundary's resolved
+    /// content is streamed. The future must be `Send` and its value `Send`,
+    /// because it runs off the render thread.
+    ///
+    /// Everywhere else — a non-streaming render, the browser, a resource that
+    /// already holds an initial value — `loader` is **never called**. That is
+    /// what keeps ADR 0009's guarantee: an ordinary server render never waits
+    /// on data. On `wasm32` this is always a no-op; the browser keeps using
+    /// the fetcher.
+    ///
+    /// Returns `self`, so it chains onto the constructor:
+    ///
+    /// ```ignore
+    /// let user = create_resource(move || id, |id| async move { fetch_user(id).await })
+    ///     .with_server_loader(move || async move { db_load_user(id).await });
+    /// ```
+    pub fn with_server_loader<L, Fut, E>(self, loader: L) -> Self
+    where
+        L: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, E>> + Send + 'static,
+        E: std::fmt::Display + 'static,
+    {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // `untrack`: the check must not subscribe whatever effect is
+            // building this resource.
+            let already_loaded = untrack(|| self.value.with(Option::is_some));
+            if !already_loaded && crate::render_stream::stream_active() {
+                let future = loader();
+                let set_state = self.set_state.clone();
+                let set_value = self.set_value.clone();
+                let registered = crate::render_stream::register_server_loader(
+                    async move { future.await.map_err(|error| error.to_string()) },
+                    move |outcome: Result<T, String>| match outcome {
+                        Ok(value) => {
+                            set_value.set(Some(value));
+                            set_state.set(ResourceState::Ready);
+                        }
+                        Err(message) => set_state.set(ResourceState::Error(message)),
+                    },
+                );
+                if registered {
+                    if let Some(handle) = &self.suspense {
+                        handle.mark_streamable();
+                    }
+                }
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = loader;
+        self
     }
 }
 
@@ -220,6 +302,15 @@ where
     });
     let (value, set_value) = create_signal(initial);
 
+    // Registered with the nearest `<Suspense>`, if any. "Pending" for a
+    // boundary means *no value yet*: a refetch over existing data, or a
+    // failure, must not swap loaded content back out for the fallback.
+    let suspense = crate::suspense::use_suspense().map(|boundary| {
+        let state = state.clone();
+        let value = value.clone();
+        boundary.register(move || state.get().is_pending() && value.with(Option::is_none))
+    });
+
     let resource = Resource {
         state,
         set_state,
@@ -228,6 +319,7 @@ where
         source: Rc::new(source),
         fetcher: flatten_display_errors(fetcher),
         generation: Rc::new(Cell::new(0)),
+        suspense,
     };
 
     // The tracked read lives here: the effect subscribes to whatever `source`

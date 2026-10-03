@@ -14,11 +14,11 @@ burn, rollback decisions — use the
 
 | Symptom | Likely layer | Start here |
 |---|---|---|
-| Island renders but is not interactive | WASM bundle / hydration | [`crates/framework/krab_client/src/lib.rs`](../../crates/framework/krab_client/src/lib.rs), browser console |
+| Island renders but is not interactive | WASM bundle / hydration | [`crates/framework/krab_client/src/hydration.rs`](../../crates/framework/krab_client/src/hydration.rs), browser console |
 | Route returns unexpected 404/500 | Service router | [`services/service_frontend/src/main.rs`](../../services/service_frontend/src/main.rs) and its generated route registration ([`build.rs`](../../services/service_frontend/build.rs)) |
 | Service exits at startup | Config validation | [`crates/framework/krab_core/src/config.rs`](../../crates/framework/krab_core/src/config.rs), [`.env.example`](../../.env.example) |
 | `/ready` fails while `/health` passes | Downstream dependency | [`krab.toml`](../../krab.toml) dependency wiring, dependency service logs |
-| Contract or protocol gate fails | CLI governance | `cargo run -p krab_cli -- contract check --diagnostics` |
+| Contract or protocol gate fails | CLI governance | `cargo run -p krab_cli -- contract check --diagnostics` (framework checkout only — see [Reproduce the gate itself](#reproduce-the-gate-itself)) |
 | DB lifecycle gate fails | Migration governance | [`crates/framework/krab_core/src/db/`](../../crates/framework/krab_core/src/db/), [database reference](../reference/database.md) |
 | Compile error: module not found in `krab_core` | Feature gating | [Feature-set mismatch](#a-ci-gate-fails-or-passes-locally-but-not-in-ci) |
 
@@ -40,9 +40,17 @@ wasm-pack build --target web -- --features web
 ```
 
 Then the page must load it (`<script type="module" src="/pkg/<crate>.js"></script>`)
-and the server must serve the `pkg/` directory as static files. Open the
-browser's network tab: a 404 on the `.js` or `_bg.wasm` request means the bundle
-is missing or the static route is not wired. `krab_core::static_assets` provides
+and the server must serve the whole `pkg/` directory as static files —
+including its `snippets/` subdirectory, which holds the JS half of
+`krab_client`'s per-island panic isolation and is imported by the glue file.
+Open the browser's network tab: a 404 on the `.js`, `_bg.wasm` or a
+`snippets/…` request means the bundle is incomplete or the static route is not
+wired.
+
+The bundle must be built from **the crate that defines your islands**, not from
+`krab_client`: `#[island]` registers the hydrating half in the crate where it is
+written, and `krab_client` defines none, so loading `/pkg/krab_client.js`
+hydrates nothing (every boundary resolves to `missing-definition`). `krab_core::static_assets` provides
 `resolve_static_pkg_path` for serving `pkg/` safely.
 
 `--features web` is required and only valid on wasm32 — `#[island]` selects its
@@ -52,14 +60,16 @@ compile. See [Getting Started §4](getting_started.md#4-your-first-island).
 ### 2. What does the browser console say?
 
 The hydration runtime in
-[`krab_client`](../../crates/framework/krab_client/src/lib.rs) logs structured
+[`krab_client`](../../crates/framework/krab_client/src/hydration.rs) logs structured
 diagnostics to the console rather than failing silently:
 
-- `Hydrating Krab app...` — the bundle loaded and hydration started. If this
-  line is absent, the problem is step 1, not hydration.
-- `Hydrating island: <name>` — per-island progress.
 - JSON-shaped warnings/errors with a `scope` field — decode failures, missing
-  registrations, and hydration mismatches, each naming the island and boundary.
+  registrations, hydration mismatches and island panics (`island_panic`, with
+  the panic message), each naming the island and boundary. Always on.
+- `Hydrating Krab app...` and `Hydrating island: <name>` — start-of-hydration
+  and per-island progress. **Only in a bundle built with `krab_client`'s
+  `debug` feature**; a release build never prints them, so their absence proves
+  nothing. Use the boundary states in step 3 instead.
 
 ### 3. Check the marker attributes in the DOM
 
@@ -84,8 +94,14 @@ Every island wrapper carries the markers the runtime queries on
 | `missing-definition` | `data-island` names an island the bundle never registered — usually a stale bundle or a renamed island |
 | `error` | The island's render panicked or threw; see the console error |
 
-A state stuck at `ssr` means the runtime never reached that island; a state
-stuck at `hydrating` means it started and died — the console has the reason.
+A state stuck at `ssr` means the runtime never reached that island — either the
+bundle never ran, or the page stages hydration (`hydrate_within_selector`) and
+has not reached that island yet; the reference frontend reports a deferred
+island that never hydrated as `KRAB-HYDRATE-510`. Since 0.6.0 a panicking island
+is isolated and ends at `error`, so a state stuck at `hydrating` means the page
+died mid-walk in a way the isolation did not contain — the console has the
+reason. (A missing `snippets/` directory fails the bundle's import outright,
+which leaves every island at `ssr`.)
 
 ### 4. Common causes, in observed order
 
@@ -232,8 +248,8 @@ A warning that is tolerable locally is a hard failure under `-D warnings`, and
 
 ### Reproduce the gate itself
 
-Every governance workflow in
-[`.github/workflows/`](../../.github/workflows/) runs the same binaries you
+The governance workflows in
+[`.github/workflows/`](../../.github/workflows/) run `krab_cli` commands you
 can run locally:
 
 ```sh
@@ -244,6 +260,12 @@ cargo run -p krab_cli -- db drift --diagnostics
 cargo run -p krab_cli -- topology doctor --diagnostics
 cargo run -p krab_cli -- security dependency-gate --diagnostics
 ```
+
+`contract`, `db` and `release` validate the framework's own reference services:
+since 0.6.0 they refuse to run outside a Krab framework checkout, and `db
+lifecycle`, `db rollback` and `db drift` fail when no Postgres is reachable. In a
+generated project use `cargo test`, `krab doctor --strict`, `krab topology
+doctor` and `krab security dependency-gate`.
 
 Open the failing workflow file, find the command it runs, and run that exact
 command. The generated [dev workflow guide](dev_workflow.md) lists the full

@@ -14,7 +14,6 @@ use crate::configuration::{
     KrabConfig, ServiceDefinition, DEFAULT_SHUTDOWN_TIMEOUT_MS, PORT_ENV_KEY,
 };
 
-const ORCHESTRATOR_ARTIFACT_ROOT: &str = "internal/audit/orchestrator";
 const PROBE_BODY_EXCERPT_LIMIT: usize = 160;
 /// How long to wait for a child to be reaped after the force-kill path has run.
 ///
@@ -73,7 +72,7 @@ fn orchestrator_artifact_dir() -> &'static Path {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            PathBuf::from(ORCHESTRATOR_ARTIFACT_ROOT)
+            crate::artifact_root::orchestrator_artifact_root()
                 .join(format!("run-{run_id}-{}", std::process::id()))
         })
         .as_path()
@@ -603,6 +602,44 @@ pub(super) fn build_command(name: &str, service: &ServiceDefinition) -> Command 
     cmd
 }
 
+/// The orchestrator-wide kill-on-close job, created on first use.
+///
+/// A `static`, so the handle is never closed by this process: it closes when
+/// the process ends, by any route, and that is what kills the services. `None`
+/// when the job could not be created; that is logged once and the orchestrator
+/// carries on with the `taskkill` shutdown path alone, as it did before.
+#[cfg(windows)]
+fn service_job() -> Option<&'static crate::job_object::KillOnCloseJob> {
+    static JOB: OnceLock<Option<crate::job_object::KillOnCloseJob>> = OnceLock::new();
+    JOB.get_or_init(|| match crate::job_object::KillOnCloseJob::new() {
+        Ok(job) => {
+            info!("service_job_object_created");
+            Some(job)
+        }
+        Err(err) => {
+            warn!(error = %err, "service_job_object_unavailable_services_may_outlive_a_crash");
+            None
+        }
+    })
+    .as_ref()
+}
+
+/// Put a freshly spawned service into the kill-on-close job. Failure is a
+/// warning, never an error: the service still runs, it just loses the
+/// crash-cleanup guarantee.
+#[cfg(windows)]
+fn assign_to_service_job(name: &str, child: &tokio::process::Child) {
+    let Some(job) = service_job() else {
+        return;
+    };
+    let Some(handle) = child.raw_handle() else {
+        return;
+    };
+    if let Err(err) = job.assign(handle) {
+        warn!(service = %name, error = %err, "service_job_assignment_failed");
+    }
+}
+
 /// Spawn a configured service process using its command, arguments, environment, and cwd.
 pub(super) async fn spawn_service(
     name: &str,
@@ -633,8 +670,10 @@ pub(super) async fn spawn_service(
         // `terminate_child` exists to close, and one this cannot close because
         // `Drop` is synchronous and the child map is not reachable from it.
         //
-        // What that means in practice: an orchestrator panic or SIGKILL may
-        // leak services. `krab bootstrap` shutting down normally does not.
+        // What that means in practice: on Unix an orchestrator panic or
+        // SIGKILL may leak services. `krab bootstrap` shutting down normally
+        // does not. On Windows the kill-on-close job assigned below closes
+        // that gap (see `job_object.rs`).
         .kill_on_drop(true);
 
     let mut child = cmd.spawn().with_context(|| {
@@ -646,6 +685,9 @@ pub(super) async fn spawn_service(
             service.cwd.as_deref().unwrap_or(".")
         )
     })?;
+
+    #[cfg(windows)]
+    assign_to_service_job(name, &child);
 
     let stdout_log = log_artifact_path(name, "stdout");
     let stderr_log = log_artifact_path(name, "stderr");

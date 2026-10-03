@@ -57,6 +57,27 @@ fn readme_counter_example_renders_on_the_server() {
     assert!(html.contains("7"));
 }
 
+// ── An island used as a `view!` tag (ADR 0013) ──────────────────────────────
+//
+// `<Counter initial={7}/>` is the call `Counter(CounterProps { initial: 7 })`,
+// and on the server that call is the SSR half: the tag must produce the same
+// hydration wrapper as calling the island by hand.
+
+#[test]
+fn island_used_as_a_view_tag_renders_its_ssr_wrapper() {
+    let html = view! { <section><Counter initial={7}/></section> }.render();
+
+    assert!(html.starts_with("<section><div"), "got: {html}");
+    assert!(html.contains("data-island=\"Counter\""), "got: {html}");
+    assert!(html.contains("data-props="), "got: {html}");
+    assert!(html.contains("initial"), "props not serialized: {html}");
+    assert!(html.contains("Count: "), "got: {html}");
+
+    let html = view! { <Greeting label="hi"/> }.render();
+    assert!(html.contains("data-island=\"Greeting\""), "got: {html}");
+    assert!(html.contains(">hi</span>"), "got: {html}");
+}
+
 // ── Props that are deliberately not `Clone` ─────────────────────────────────
 //
 // The server half used to render as `inner(props.clone())`, which put a `Clone`

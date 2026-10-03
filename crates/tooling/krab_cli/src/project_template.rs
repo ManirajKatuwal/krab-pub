@@ -34,7 +34,7 @@ pub(crate) enum DependencySource {
 ///   it with `invalid path url`, so the prefix is stripped.
 /// - A backslash is an invalid escape inside a TOML basic string, so separators
 ///   are normalised to `/`. Cargo accepts forward slashes on every platform.
-fn path_for_toml(path: &Path) -> String {
+pub(crate) fn path_for_toml(path: &Path) -> String {
     let text = path.to_string_lossy();
     let stripped = text
         .strip_prefix(r"\\?\UNC\")
@@ -45,22 +45,50 @@ fn path_for_toml(path: &Path) -> String {
 }
 
 impl DependencySource {
+    /// The source a `--path-deps` flag selects, shared by `krab new` and
+    /// `krab gen service` so the two cannot disagree about what it means.
+    ///
+    /// The root is canonicalised so the generated manifest holds an absolute
+    /// path. A relative one would be interpreted relative to the *generated*
+    /// crate, not the working directory the user typed it in. A root that is
+    /// not a Krab checkout is rejected here, where the message can name the
+    /// flag, rather than by Cargo later with a path the user never wrote.
+    pub(crate) fn from_path_deps(path_deps: Option<&Path>) -> Result<Self> {
+        let Some(root) = path_deps else {
+            return Ok(DependencySource::Registry);
+        };
+        let root = root.canonicalize().map_err(|err| {
+            anyhow::anyhow!(
+                "--path-deps root '{}' is not readable: {err}",
+                root.display()
+            )
+        })?;
+        if !root.join("crates/framework/krab_core/Cargo.toml").is_file() {
+            anyhow::bail!(
+                "--path-deps root '{}' is not a Krab checkout: it has no \
+                 crates/framework/krab_core/Cargo.toml",
+                path_for_toml(&root)
+            );
+        }
+        Ok(DependencySource::Path(root))
+    }
+
     /// Render one dependency line, e.g. `krab_core = { ... }`.
     ///
     /// `crate_dir` is the crate's location relative to the repository root; it
     /// is only consulted for [`DependencySource::Path`].
-    fn render(&self, crate_name: &str, crate_dir: &str, features: &[&str]) -> String {
+    pub(crate) fn render(&self, crate_name: &str, crate_dir: &str, features: &[&str]) -> String {
         self.render_with_defaults(crate_name, crate_dir, features, true)
     }
 
     /// Render one dependency line, opting out of the dependency's own default
     /// features.
     ///
-    /// Only `krab_client` needs this so far: its defaults include
-    /// `demo-islands`, whose bundled `Counter`/`Toggle`/`Likes` register
-    /// themselves in the same `inventory` island registry a generated project
-    /// uses, so a template that names its own `Counter` gets two entries and
-    /// `hydrate()` may bind the demo one over the template's SSR markup.
+    /// Only `krab_client` uses this. Its defaults included `demo-islands`
+    /// through 0.5.x, whose bundled `Counter`/`Toggle`/`Likes` registered in
+    /// the same `inventory` island registry a generated project uses. That
+    /// feature is gone in 0.6.0; the opt-out stays so a generated project names
+    /// exactly the features it needs (`web`) and nothing a future default adds.
     fn render_no_default_features(
         &self,
         crate_name: &str,
@@ -252,11 +280,12 @@ krab doctor --diagnostics
 cargo test
 ```
 
-> Note: the `krab` governance commands (`release certify`, `contract check`,
-> `db lifecycle`) currently operate on the Krab framework workspace itself —
-> they are hardcoded to its internal services and are not wired to generated
-> projects. Use your project's own CI (see `.github/workflows/ci.yaml`) as the
-> release gate.
+> Note: the `krab` governance commands (`release check`, `release certify`,
+> `contract check`, `db lifecycle`, ...) operate on the Krab framework workspace
+> itself — they validate its reference services, and in this project they exit
+> with an error saying so. Use `cargo test`, `krab doctor --strict`,
+> `krab topology doctor`, `krab security dependency-gate`, and your project's own
+> CI (see `.github/workflows/ci.yaml`) as the release gate.
 
 ## Deployment
 
@@ -409,6 +438,13 @@ fn validate_project_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The `.gitignore` a scaffold starts with.
+///
+/// `.krab/` is the default artifact root — release evidence, rehearsal
+/// evidence, orchestrator logs (see `artifacts.rs`). It is generated output, so
+/// a project that runs `krab bootstrap` must not find it in `git status`.
+const GENERATED_GITIGNORE: &str = "target/\ndist/\n.env\n.krab/\n*.swp\n";
+
 fn write_project_from_template(
     path: &Path,
     name: &str,
@@ -483,7 +519,7 @@ fn write_project_from_template(
     let readme = generate_readme(name, metadata);
     fs::write(path.join("README.md"), readme)?;
 
-    fs::write(path.join(".gitignore"), "target/\ndist/\n.env\n*.swp\n")?;
+    fs::write(path.join(".gitignore"), GENERATED_GITIGNORE)?;
 
     println!("✅ Project '{}' created successfully!", name);
     println!("   Template: {:?}", template);
@@ -588,18 +624,7 @@ pub(super) fn generate_project_from_template(
         name, template
     );
 
-    let deps = match path_deps {
-        // Canonicalise so the generated manifest holds an absolute path. A
-        // relative one would be interpreted relative to the *generated*
-        // project, not the working directory the user typed it in.
-        Some(root) => DependencySource::Path(root.canonicalize().map_err(|err| {
-            anyhow::anyhow!(
-                "--path-deps root '{}' is not readable: {err}",
-                root.display()
-            )
-        })?),
-        None => DependencySource::Registry,
-    };
+    let deps = DependencySource::from_path_deps(path_deps)?;
 
     let path = PathBuf::from(name);
     write_project_from_template(&path, name, template, &deps)?;
@@ -661,7 +686,13 @@ fn generate_env_example(name: &str, template: &ProjectTemplate) -> String {
          KRAB_PORT=3000\n\
          \n\
          # Required in staging/prod: startup refuses wildcard CORS outside dev.\n\
-         # KRAB_CORS_ORIGINS=https://app.example.com\n"
+         # KRAB_CORS_ORIGINS=https://app.example.com\n\
+         \n\
+         # Only /health and /ready are open by default. Krab 0.6.x still adds a\n\
+         # deprecated list of application routes unless this is false; list this\n\
+         # project's own public routes in KRAB_AUTH_PUBLIC_PATHS instead.\n\
+         KRAB_AUTH_LEGACY_OPEN_PATHS=false\n\
+         # KRAB_AUTH_PUBLIC_PATHS=/,/assets/*\n"
     );
 
     match template {
@@ -855,7 +886,7 @@ fn generate_default_main(name: &str) -> String {
         r#"use axum::routing::get;
 use axum::{{Json, Router}};
 use krab_core::config::KrabConfig;
-use krab_core::telemetry::init_tracing;
+use krab_core::telemetry::init_tracing_with_version;
 use serde_json::json;
 use std::net::SocketAddr;
 
@@ -881,7 +912,7 @@ async fn ready() -> Json<serde_json::Value> {{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {{
-    init_tracing("{name}");
+    init_tracing_with_version("{name}", env!("CARGO_PKG_VERSION"));
     let cfg = KrabConfig::from_env_checked("{name}", 3000)?;
     cfg.validate_all()?;
     let addr: SocketAddr = format!("{{}}:{{}}", cfg.host, cfg.port).parse()?;
@@ -991,10 +1022,8 @@ tower-http = {{ version = "0.6", features = ["fs"] }}
 tracing = "0.1"
 tracing-subscriber = {{ version = "0.3", features = ["json", "env-filter"] }}
 
-# Browser only. `krab_client` takes `default-features = false` on purpose: its
-# defaults include the deprecated `demo-islands` bundle, whose `Counter` /
-# `Toggle` / `Likes` register in the same island registry your own `#[island]`
-# components do, so leaving it on shadows a component of the same name.
+# Browser only. `krab_client` takes `default-features = false` and names `web`
+# explicitly, so this crate depends on exactly the runtime it uses.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 {krab_core_wasm_dep}
 {krab_client_wasm_dep}
@@ -1040,7 +1069,7 @@ fn fullstack_main_imports(crate_name: &str) -> String {
         "use axum::routing::{get, post};".to_string(),
         "use axum::{Json, Router};".to_string(),
         "use krab_core::config::KrabConfig;".to_string(),
-        "use krab_core::telemetry::init_tracing;".to_string(),
+        "use krab_core::telemetry::init_tracing_with_version;".to_string(),
         format!("use {crate_name}::{{greet_server_handler, render_home_page}};"),
         "use serde_json::json;".to_string(),
         "use std::net::SocketAddr;".to_string(),
@@ -1074,7 +1103,7 @@ async fn ready() -> Json<serde_json::Value> {{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {{
-    init_tracing("{name}");
+    init_tracing_with_version("{name}", env!("CARGO_PKG_VERSION"));
     let cfg = KrabConfig::from_env_checked("{name}", 3000)?;
     cfg.validate_all()?;
     let addr: SocketAddr = format!("{{}}:{{}}", cfg.host, cfg.port).parse()?;
@@ -1295,7 +1324,7 @@ fn generate_saas_main(name: &str) -> String {
 use axum::{{Json, Router}};
 use krab_core::config::KrabConfig;
 use krab_core::http::{{apply_common_http_layers, HasRuntimeState, RuntimeState}};
-use krab_core::telemetry::init_tracing;
+use krab_core::telemetry::init_tracing_with_version;
 use serde_json::json;
 use std::net::SocketAddr;
 
@@ -1328,7 +1357,7 @@ async fn tenants_handler() -> Json<serde_json::Value> {{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {{
-    init_tracing("{name}");
+    init_tracing_with_version("{name}", env!("CARGO_PKG_VERSION"));
     let cfg = KrabConfig::from_env_checked("{name}", 3000)?;
     cfg.validate_all()?;
     let addr: SocketAddr = format!("{{}}:{{}}", cfg.host, cfg.port).parse()?;
@@ -1369,7 +1398,7 @@ use axum::{{Json, Router}};
 use krab_core::config::KrabConfig;
 use krab_core::isr::{{IsrCache, IsrPolicy}};
 use krab_core::render_policy::{{CacheMode, EdgeCapability, RenderMode, RouteRenderPolicy}};
-use krab_core::telemetry::init_tracing;
+use krab_core::telemetry::init_tracing_with_version;
 use serde_json::json;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -1452,7 +1481,7 @@ async fn ready_handler() -> Json<serde_json::Value> {{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {{
-    init_tracing("{name}");
+    init_tracing_with_version("{name}", env!("CARGO_PKG_VERSION"));
     let cfg = KrabConfig::from_env_checked("{name}", 3000)?;
     cfg.validate_all()?;
     let addr: SocketAddr = format!("{{}}:{{}}", cfg.host, cfg.port).parse()?;
@@ -1495,7 +1524,7 @@ use axum::routing::get;
 use axum::{{Json, Router}};
 use futures_util::StreamExt;
 use krab_core::config::KrabConfig;
-use krab_core::telemetry::init_tracing;
+use krab_core::telemetry::init_tracing_with_version;
 use serde_json::json;
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -1555,7 +1584,7 @@ async fn handle_ws(mut socket: WebSocket) {{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {{
-    init_tracing("{name}");
+    init_tracing_with_version("{name}", env!("CARGO_PKG_VERSION"));
     let cfg = KrabConfig::from_env_checked("{name}", 3000)?;
     cfg.validate_all()?;
     let addr: SocketAddr = format!("{{}}:{{}}", cfg.host, cfg.port).parse()?;
@@ -1919,7 +1948,18 @@ mod tests {
             !readme.contains("krab release certify --out release-evidence"),
             "generated README instructs consumers to run framework-internal governance"
         );
-        assert!(readme.contains("operate on the Krab framework workspace itself"));
+        assert!(readme.contains("operate on the Krab framework workspace"));
+        // ...and must point at what does work in a generated project, which is
+        // what the governance commands' own refusal message says too.
+        assert!(readme.contains("krab security dependency-gate"));
+
+        // `.krab/` is the default artifact root; generated evidence and
+        // orchestrator logs must not show up in `git status`.
+        let gitignore = fs::read_to_string(project_dir.join(".gitignore"))?;
+        assert!(
+            gitignore.lines().any(|line| line == ".krab/"),
+            "{gitignore}"
+        );
 
         // The Dockerfile must not COPY files the scaffold does not create:
         // generated projects have no committed Cargo.lock, and a COPY of a

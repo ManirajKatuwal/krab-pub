@@ -43,6 +43,9 @@ use web_sys::Element;
 
 #[path = "support/mod.rs"]
 mod support;
+// `Counter` and `Toggle`, which `krab_client` itself shipped until 0.6.0.
+#[path = "support/islands.rs"]
+mod islands;
 use support::{document, settle};
 
 wasm_bindgen_test_configure!(run_in_browser);
@@ -77,7 +80,7 @@ fn attr(element: &Element, name: &str) -> Option<String> {
     element.get_attribute(name)
 }
 
-/// Server-rendered markup for the `Counter` island shipped in this crate.
+/// Server-rendered markup for the test-local `Counter` island (`support/islands.rs`).
 ///
 /// Mirrors what `#[island]` emits: the wrapper attributes plus the SSR content
 /// the island would have produced for these props.
@@ -273,7 +276,7 @@ fn an_island_with_extra_server_children_has_them_removed() {
 use wasm_bindgen::JsCast as _;
 
 /// SSR markup for the `Toggle` island, whose two element children make it the
-/// only shipped island that can express a reorder.
+/// only test island that can express a reorder.
 ///
 /// The `data-krab-node-id` values are predictable: `hydrate` annotates the
 /// client tree with the boundary id read from the DOM, root path `0`, children

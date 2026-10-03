@@ -200,6 +200,13 @@ pub(crate) fn resolve_protocol_for_request(
     Ok(allowed[0])
 }
 
+/// The protocol the client asked for, if any: the `x-krab-protocol` header,
+/// else a `protocol=` query parameter (key matched case-insensitively).
+///
+/// Values that [`ProtocolKind::parse`] does not recognise are ignored. This
+/// only reads the preference; whether it is honoured depends on
+/// `KRAB_PROTOCOL_ALLOW_RUNTIME_SWITCH_HEADER` and the operation/tenant
+/// policy.
 pub fn extract_protocol_preference(req: &Request<Body>) -> Option<ProtocolKind> {
     if let Some(value) = req.headers().get("x-krab-protocol") {
         if let Ok(raw) = value.to_str() {
@@ -223,6 +230,13 @@ pub fn extract_protocol_preference(req: &Request<Body>) -> Option<ProtocolKind> 
     None
 }
 
+/// The protocol a path's route family is bound to, if it has one:
+/// `/api/v1/graphql` → GraphQL, `/api/v1/rpc` → RPC, `/api/v1/users` → REST
+/// (each including sub-paths).
+///
+/// A route-family protocol takes precedence over any client preference; a
+/// request to a family whose protocol is disabled is rejected with
+/// `PROTOCOL_NOT_SUPPORTED`.
 pub fn route_family_protocol(path: &str) -> Option<ProtocolKind> {
     if path == "/api/v1/graphql" || path.starts_with("/api/v1/graphql/") {
         return Some(ProtocolKind::Graphql);
@@ -236,6 +250,11 @@ pub fn route_family_protocol(path: &str) -> Option<ProtocolKind> {
     None
 }
 
+/// True when the request carries an `x-krab-protocol` header but `config`
+/// does not allow runtime protocol switching
+/// (`KRAB_PROTOCOL_ALLOW_RUNTIME_SWITCH_HEADER`). The protocol-resolution
+/// middleware answers such a request with a `400 BAD_REQUEST` rather than
+/// silently ignoring the header.
 pub fn runtime_switch_header_rejected_by_default(
     req: &Request<Body>,
     config: &ProtocolConfig,

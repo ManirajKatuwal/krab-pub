@@ -49,14 +49,18 @@ groups:
           description: "5xx ratio exceeded 0.6% (6x burn for 99.9% SLO) over 30m on {{ $labels.job }}."
           runbook: "docs/operations/oncall_playbook.md#p2-availability-burn-rate-slow"
 
+      # `krab_readiness_status` is 0 while `/ready` would answer not-ready.
+      # (Until 0.6.0 this queried `krab_dependency_up`, which no service emits,
+      # so the alert could never fire.) The metric carries no per-dependency
+      # label; `/ready`'s JSON body names the failing dependency.
       - alert: ServiceNotReady
-        expr: krab_dependency_up == 0
+        expr: krab_readiness_status == 0
         for: 30s
         labels:
           severity: critical
         annotations:
-          summary: "Critical dependency {{ $labels.dependency }} is down for {{ $labels.job }}"
-          description: "The readiness check for critical dependency {{ $labels.dependency }} is failing on {{ $labels.job }}."
+          summary: "{{ $labels.job }} is not ready"
+          description: "{{ $labels.job }} reports not-ready; GET /ready on the instance names the failing dependency."
 
   - name: krab_latency
     rules:
@@ -70,7 +74,8 @@ groups:
           severity: warning
         annotations:
           summary: "P99 latency above 2 s on {{ $labels.job }}"
-          description: "P99 request latency is {{ $value }}ms on {{ $labels.job }}, exceeding the 2000ms threshold."
+          # $value is in seconds: histogram_quantile over *_seconds_bucket.
+          description: "P99 request latency is {{ $value }}s on {{ $labels.job }}, exceeding the 2s threshold."
 
       - alert: HighInflightRequests
         expr: krab_inflight_requests > 500

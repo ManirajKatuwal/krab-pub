@@ -113,16 +113,30 @@ pub(super) fn run_protocol_contract_checks(diagnostics: bool) -> Result<()> {
     Ok(())
 }
 
+/// A `cargo test` invocation for one of the Postgres governance suites.
+///
+/// `KRAB_REQUIRE_DB_TESTS=1` is always set. Without it the suites print
+/// "this test executed NOTHING" and report `ok` when no database is reachable,
+/// so `krab db lifecycle`, `db rollback` and `db drift` passed green on any
+/// machine without Postgres — a governance gate that could not fail. Only
+/// `db rehearsal` set the flag before 0.6.0.
+fn db_governance_test(filter: &str) -> Command {
+    let mut command = Command::new("cargo");
+    command
+        .arg("test")
+        .arg("--package")
+        .arg("krab_core")
+        .arg("--features")
+        .arg("db-postgres rest")
+        .arg(filter)
+        .env("KRAB_REQUIRE_DB_TESTS", "1");
+    command
+}
+
 pub(super) fn run_db_lifecycle_check(diagnostics: bool) -> Result<()> {
     run_command_logged(
         "db migration lifecycle checks",
-        Command::new("cargo")
-            .arg("test")
-            .arg("--package")
-            .arg("krab_core")
-            .arg("--features")
-            .arg("db-postgres rest")
-            .arg("test_migration_lifecycle"),
+        &mut db_governance_test("test_migration_lifecycle"),
         diagnostics,
     )
 }
@@ -130,13 +144,7 @@ pub(super) fn run_db_lifecycle_check(diagnostics: bool) -> Result<()> {
 pub(super) fn run_db_rollback_check(diagnostics: bool) -> Result<()> {
     run_command_logged(
         "db rollback checks",
-        Command::new("cargo")
-            .arg("test")
-            .arg("--package")
-            .arg("krab_core")
-            .arg("--features")
-            .arg("db-postgres rest")
-            .arg("test_migration_rollback"),
+        &mut db_governance_test("test_migration_rollback"),
         diagnostics,
     )
 }
@@ -144,13 +152,7 @@ pub(super) fn run_db_rollback_check(diagnostics: bool) -> Result<()> {
 pub(super) fn run_db_drift_check(diagnostics: bool) -> Result<()> {
     run_command_logged(
         "db drift checks",
-        Command::new("cargo")
-            .arg("test")
-            .arg("--package")
-            .arg("krab_core")
-            .arg("--features")
-            .arg("db-postgres rest")
-            .arg("test_drift_detection"),
+        &mut db_governance_test("test_drift_detection"),
         diagnostics,
     )
 }
@@ -169,21 +171,19 @@ pub(super) fn run_db_rollback_rehearsal(out: &PathBuf, diagnostics: bool) -> Res
     // rehearse is a failure by definition.
     run_command_logged(
         "db rollback rehearsal test",
-        Command::new("cargo")
-            .arg("test")
-            .arg("--package")
-            .arg("krab_core")
-            .arg("--features")
-            .arg("db-postgres rest")
-            .arg("test_migration_rollback")
+        db_governance_test("test_migration_rollback")
             .arg("--")
-            .arg("--nocapture")
-            .env("KRAB_REQUIRE_DB_TESTS", "1"),
+            .arg("--nocapture"),
         diagnostics,
     )?;
 
     let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_else(|_| "local".to_string());
-    let sha = std::env::var("GITHUB_SHA").unwrap_or_else(|_| "local".to_string());
+    // Outside CI there is no GITHUB_SHA; the evidence must still say which
+    // commit it rehearsed, or it cannot be tied to a release.
+    let sha = std::env::var("GITHUB_SHA")
+        .ok()
+        .or_else(local_git_head)
+        .unwrap_or_else(|| "unknown".to_string());
     let git_ref = std::env::var("GITHUB_REF").unwrap_or_else(|_| "local".to_string());
     let timestamp = rfc3339_utc_now();
 
@@ -709,7 +709,7 @@ fn build_release_certification_index(
         summary_json: path_for_docs(&root.join("08-signoff/summary.json")),
         summary_markdown: path_for_docs(&root.join("08-signoff/summary.md")),
         ci_run_id: std::env::var("GITHUB_RUN_ID").ok(),
-        ci_sha: std::env::var("GITHUB_SHA").ok(),
+        ci_sha: std::env::var("GITHUB_SHA").ok().or_else(local_git_head),
         ci_ref: std::env::var("GITHUB_REF").ok(),
     }
 }
@@ -749,6 +749,19 @@ fn render_release_certification_index_markdown(index: &ReleaseCertificationIndex
         out.push_str(&format!("- ci_ref: {}\n", git_ref));
     }
     out
+}
+
+/// `git rev-parse HEAD` in the working directory, if git is available.
+fn local_git_head() -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!sha.is_empty()).then_some(sha)
 }
 
 pub(super) fn run_command_logged(label: &str, cmd: &mut Command, diagnostics: bool) -> Result<()> {
@@ -1034,6 +1047,33 @@ fn run_protocol_version_compatibility_check() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod db_governance_tests {
+    use super::db_governance_test;
+
+    /// Every Postgres governance suite must fail, not skip, without a
+    /// database — otherwise `krab db lifecycle|rollback|drift` is a gate that
+    /// cannot fail.
+    #[test]
+    fn every_db_governance_run_requires_a_real_database() {
+        for filter in [
+            "test_migration_lifecycle",
+            "test_migration_rollback",
+            "test_drift_detection",
+        ] {
+            let command = db_governance_test(filter);
+            let required = command.get_envs().any(|(key, value)| {
+                key == "KRAB_REQUIRE_DB_TESTS" && value.and_then(|v| v.to_str()) == Some("1")
+            });
+            assert!(required, "{filter} runs without KRAB_REQUIRE_DB_TESTS=1");
+            assert!(
+                command.get_args().any(|arg| arg == filter),
+                "{filter} not passed to cargo test"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

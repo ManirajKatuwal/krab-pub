@@ -1,3 +1,12 @@
+//! Environment-driven configuration and the secrets-source policy.
+//!
+//! [`KrabConfig`] and [`HttpConfig`] read the `KRAB_*` environment variables
+//! documented in `docs/reference/environment.md`. [`read_env_or_file`] is the
+//! one sanctioned way to read a secret: it resolves `NAME`, then `NAME_FILE`,
+//! and rejects `NAME_VAULT_REF`, which has no runtime resolver.
+//! [`KrabConfig::validate_all`] enforces the per-environment rules — outside
+//! `dev`, inline secrets, static bearer tokens and wildcard CORS are refused.
+
 use anyhow::{Context, Result};
 use std::fs;
 
@@ -21,6 +30,8 @@ pub struct SecretIssue {
     pub var_name: String,
     /// Machine-readable policy rule code (e.g. `INLINE_SECRET_IN_PROD`).
     pub policy_rule: String,
+    /// Whether this issue blocks startup ([`SecretIssueSeverity::Error`]) or is
+    /// advisory.
     pub severity: SecretIssueSeverity,
     /// Human-readable description of the violation.
     pub reason: String,
@@ -43,16 +54,20 @@ impl std::fmt::Display for SecretIssue {
 /// Aggregated result of secrets-source policy validation.
 #[derive(Debug, Clone)]
 pub struct SecretsValidationReport {
+    /// Every violation found, in the order the secret variables were checked.
     pub issues: Vec<SecretIssue>,
 }
 
 impl SecretsValidationReport {
+    /// True when at least one issue has [`SecretIssueSeverity::Error`], i.e.
+    /// the configuration must not be allowed to start.
     pub fn has_errors(&self) -> bool {
         self.issues
             .iter()
             .any(|i| i.severity == SecretIssueSeverity::Error)
     }
 
+    /// True when there are no issues at all, warnings included.
     pub fn is_clean(&self) -> bool {
         self.issues.is_empty()
     }
@@ -129,14 +144,30 @@ fn check_secret_source(var_name: &str, env: &Environment, issues: &mut Vec<Secre
     }
 }
 
+/// Deployment environment, read from `KRAB_ENVIRONMENT` by
+/// [`Environment::from_env`].
+///
+/// Only `Dev` relaxes the security checks. An unrecognised value is kept as
+/// `Unknown` and treated with the same rules as `Prod`, so a typo fails
+/// closed rather than open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Environment {
+    /// Local development (`dev` or its alias `local`, and the default when
+    /// the variable is unset):
+    /// any secret source, static auth and allow-all CORS are permitted.
     Dev,
+    /// `staging`: production rules, except an inline secret is a warning
+    /// rather than an error.
     Staging,
+    /// `prod` or `production`: secrets must come from `*_FILE` sourcing and
+    /// CORS origins must be listed explicitly.
     Prod,
+    /// Any other value, verbatim. Validated as strictly as `Prod`.
     Unknown(String),
 }
 
+/// Reads environment variable `name`, trimmed; `None` when it is unset, not
+/// valid Unicode, or empty after trimming.
 pub fn env_non_empty(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -169,6 +200,62 @@ pub(crate) fn jwt_allowlist_mixes_hmac_and_asymmetric(raw: &str) -> bool {
     has_hmac && has_asymmetric
 }
 
+/// Whether the resolved `KRAB_JWT_ALLOWED_ALGS` allowlist admits only HMAC
+/// (`HS*`) algorithms. `None` (unset) is the `HS256` default, so it is.
+fn jwt_allowlist_is_hmac_only(raw: Option<&str>) -> bool {
+    let Some(raw) = raw else {
+        return true;
+    };
+    let mut has_hmac = false;
+    for alg in raw.split(',').map(str::trim).filter(|alg| !alg.is_empty()) {
+        let upper = alg.to_ascii_uppercase();
+        if upper.starts_with("HS") {
+            has_hmac = true;
+        } else if upper.starts_with("RS")
+            || upper.starts_with("PS")
+            || upper.starts_with("ES")
+            || upper == "EDDSA"
+        {
+            return false;
+        }
+    }
+    has_hmac
+}
+
+/// Whether any provider in `KRAB_JWT_PROVIDERS_JSON` (or its `_FILE` form)
+/// declares a non-empty `jwks_url`. An unreadable or malformed bundle
+/// answers `false`: other checks report those.
+fn provider_bundle_uses_jwks() -> bool {
+    let Ok(Some(raw)) = read_env_or_file("KRAB_JWT_PROVIDERS_JSON") else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .is_some_and(|providers| {
+            providers.iter().any(|provider| {
+                provider
+                    .get("jwks_url")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|url| !url.trim().is_empty())
+            })
+        })
+}
+
+/// Reads a secret named `name` from the environment, the sanctioned way.
+///
+/// Resolution order:
+///
+/// 1. `name` itself, if set and non-empty (trimmed).
+/// 2. `{name}_FILE`: the contents of the file it points at, trimmed. A file
+///    that cannot be read, or is empty, is an error — not `None`.
+/// 3. `{name}_VAULT_REF`: always an error, because there is no runtime vault
+///    resolver; the secret has to be materialised (for example to a file)
+///    before startup.
+///
+/// Returns `Ok(None)` when none of the three is set. This function does not
+/// apply the per-environment policy that forbids inline values outside `dev`;
+/// that is [`KrabConfig::validate_secrets_sources`].
 pub fn read_env_or_file(name: &str) -> Result<Option<String>> {
     if let Some(value) = env_non_empty(name) {
         return Ok(Some(value));
@@ -203,9 +290,19 @@ pub fn read_env_or_file(name: &str) -> Result<Option<String>> {
 }
 
 impl Environment {
+    /// Reads `KRAB_ENVIRONMENT`, case-insensitively. Unset means
+    /// [`Environment::Dev`]; `local` is an alias of `dev`; `prod` and
+    /// `production` both mean [`Environment::Prod`]; anything unrecognised
+    /// becomes [`Environment::Unknown`].
+    ///
+    /// `local` is accepted because every other reader of the variable already
+    /// treats it as dev-like: `krab env-check` / `krab doctor`, the auth
+    /// service's startup guard, and the migration promotion ladder (where it
+    /// is the stage below `dev`). Parsing it as `Unknown` applied prod rules
+    /// to a name the rest of the framework calls local development.
     pub fn from_env() -> Self {
         match std::env::var("KRAB_ENVIRONMENT") {
-            Ok(v) if v.eq_ignore_ascii_case("dev") => Self::Dev,
+            Ok(v) if v.eq_ignore_ascii_case("dev") || v.eq_ignore_ascii_case("local") => Self::Dev,
             Ok(v) if v.eq_ignore_ascii_case("staging") => Self::Staging,
             Ok(v) if v.eq_ignore_ascii_case("prod") || v.eq_ignore_ascii_case("production") => {
                 Self::Prod
@@ -215,6 +312,8 @@ impl Environment {
         }
     }
 
+    /// The canonical name (`dev`, `staging`, `prod`), or the raw value for
+    /// [`Environment::Unknown`]. Used in log and error messages.
     pub fn as_str(&self) -> &str {
         match self {
             Self::Dev => "dev",
@@ -225,11 +324,24 @@ impl Environment {
     }
 }
 
+/// HTTP-layer settings: authentication mode, rate limiting, proxy trust and
+/// CORS. Built by [`HttpConfig::from_env`].
 #[derive(Debug, Clone)]
 pub struct HttpConfig {
+    /// `KRAB_AUTH_MODE` (default `jwt`). [`KrabConfig::validate`] accepts
+    /// `jwt` or `oidc` outside `dev`; `static` is dev-only.
     pub auth_mode: String,
+    /// `KRAB_SERVICE_AUTH_SCOPE` (default `service:internal`): the scope a
+    /// caller's token must carry to reach `/internal` and `/api/internal`
+    /// paths.
     pub service_auth_scope: String,
+    /// `KRAB_RATE_LIMIT_CAPACITY` (default 120): the most requests one client
+    /// IP may make per rate-limit window.
     pub rate_limit_capacity: u64,
+    /// `KRAB_RATE_LIMIT_REFILL_PER_SEC` (default 60). Together with the
+    /// capacity it sets the window length, `ceil(capacity / refill)` seconds
+    /// clamped to 1–300; the limiter is a fixed-window counter, not a token
+    /// bucket.
     pub rate_limit_refill_per_sec: u64,
     /// Behavior when distributed rate-limit store errors occur.
     /// true = fail-open, false = fail-closed.
@@ -258,6 +370,9 @@ pub struct HttpConfig {
 }
 
 impl HttpConfig {
+    /// Reads the `KRAB_*` HTTP variables. Never fails: an unparseable number
+    /// falls back to its default. `KRAB_RATE_LIMIT_FAIL_OPEN` defaults to
+    /// true only in `dev`, and allow-all CORS is enabled only in `dev`.
     pub fn from_env() -> Self {
         let environment = Environment::from_env();
         let env_bool = |name: &str| {
@@ -311,17 +426,29 @@ impl HttpConfig {
 /// `std::env::var` ad-hoc in individual modules.
 #[derive(Debug, Clone)]
 pub struct KrabConfig {
+    /// `KRAB_ENVIRONMENT`; decides how strict [`KrabConfig::validate_all`] is.
     pub environment: Environment,
+    /// `KRAB_SERVICE_NAME`, or the default the service passes in.
     pub service_name: String,
+    /// `KRAB_HOST`, the address to bind (default `127.0.0.1`).
     pub host: String,
+    /// `KRAB_PORT`, or the default the service passes in. An empty value also
+    /// means the default; an unparseable one is [`ConfigError::InvalidPort`].
     pub port: u16,
+    /// `RUST_LOG`, the `tracing` filter directive (default `info`).
     pub log_filter: String,
+    /// HTTP-layer settings.
     pub http: HttpConfig,
 }
 
+/// A configuration value that could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
-    InvalidPort { raw: String },
+    /// `KRAB_PORT` is set but is not an integer in 0–65535.
+    InvalidPort {
+        /// The trimmed value that failed to parse.
+        raw: String,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -357,18 +484,9 @@ fn parse_port_from_env(default_port: u16) -> Result<u16, ConfigError> {
 impl KrabConfig {
     /// Load all configuration from environment variables with typed defaults.
     ///
-    /// Panics if `KRAB_PORT` holds a value that does not parse as a `u16`.
-    /// Startup paths must not panic — use [`KrabConfig::from_env_checked`]
-    /// and propagate the error instead.
-    #[deprecated(
-        since = "0.3.0",
-        note = "use from_env_checked; this panics on invalid KRAB_PORT"
-    )]
-    pub fn from_env(default_service_name: &str, default_port: u16) -> Self {
-        Self::from_env_checked(default_service_name, default_port)
-            .expect("KrabConfig::from_env should only be used where invalid config is unrecoverable; prefer from_env_checked")
-    }
-
+    /// Returns an error, rather than panicking, when a value such as
+    /// `KRAB_PORT` does not parse. The panicking `from_env` wrapper was
+    /// deprecated in 0.3.0 and removed in 0.6.0.
     pub fn from_env_checked(
         default_service_name: &str,
         default_port: u16,
@@ -399,9 +517,10 @@ impl KrabConfig {
             Environment::Staging | Environment::Prod | Environment::Unknown(_) => {}
         }
 
-        if matches!(self.environment, Environment::Staging | Environment::Prod)
-            && self.http.cors_origins.is_empty()
-        {
+        // Every non-dev environment, including unrecognised ones: those already
+        // get the prod secret rules above, and exempting them from this one
+        // meant a typo such as `KRAB_ENVIRONMENT=prdo` shipped wildcard CORS.
+        if self.http.cors_origins.is_empty() {
             anyhow::bail!(
                 "KRAB_CORS_ORIGINS must be explicitly configured in '{}' environment; refusing wildcard CORS",
                 self.environment.as_str()
@@ -436,6 +555,16 @@ impl KrabConfig {
             let has_secret_vault_ref = has_non_empty("KRAB_JWT_SECRET_VAULT_REF");
             let has_issuer = has_non_empty("KRAB_OIDC_ISSUER");
             let has_audience = has_non_empty("KRAB_OIDC_AUDIENCE");
+            // A published key set is a key source that needs no secret at all.
+            let jwks_url = std::env::var("KRAB_OIDC_JWKS_URL").unwrap_or_default();
+            let has_jwks_url = !jwks_url.trim().is_empty();
+            if has_jwks_url && !jwks_url.trim().starts_with("https://") {
+                anyhow::bail!(
+                    "KRAB_OIDC_JWKS_URL must use https:// in '{}' environment; keys fetched over \
+                     plain HTTP can be substituted by anyone on the path",
+                    self.environment.as_str()
+                );
+            }
 
             let has_secure_secret_source =
                 has_keys_file || has_secret_file || has_keys_vault_ref || has_secret_vault_ref;
@@ -450,15 +579,15 @@ impl KrabConfig {
             let has_provider_bundle =
                 has_provider_json || has_provider_json_file || has_provider_json_vault_ref;
             let has_fallback_provider_tuple =
-                (has_keys || has_secret || has_keys_file || has_secret_file)
+                (has_keys || has_secret || has_keys_file || has_secret_file || has_jwks_url)
                     && has_issuer
                     && has_audience;
 
             if !has_provider_bundle && !has_fallback_provider_tuple {
                 anyhow::bail!(
                     "JWT/OIDC provider configuration required in '{}' environment; set KRAB_JWT_PROVIDERS_JSON \
-                     or provide KRAB_OIDC_ISSUER + KRAB_OIDC_AUDIENCE + secure secret sourcing via \
-                     KRAB_JWT_SECRET_FILE/KRAB_JWT_KEYS_JSON_FILE (or *_VAULT_REF)",
+                     or provide KRAB_OIDC_ISSUER + KRAB_OIDC_AUDIENCE + a key source: KRAB_OIDC_JWKS_URL, \
+                     or secure secret sourcing via KRAB_JWT_SECRET_FILE/KRAB_JWT_KEYS_JSON_FILE (or *_VAULT_REF)",
                     self.environment.as_str()
                 );
             }
@@ -487,6 +616,26 @@ impl KrabConfig {
                         raw
                     );
                 }
+            }
+
+            // A published key set holds only asymmetric keys (`oct` keys in
+            // one are ignored: a public document cannot carry a secret). With
+            // an HMAC-only allowlist — including the HS256 default — such a
+            // configuration starts cleanly and then rejects every token.
+            let allowlist = env_non_empty("KRAB_JWT_ALLOWED_ALGS");
+            if jwt_allowlist_is_hmac_only(allowlist.as_deref())
+                && (has_jwks_url || provider_bundle_uses_jwks())
+            {
+                anyhow::bail!(
+                    "A JWKS URL is configured (KRAB_OIDC_JWKS_URL or a provider's jwks_url) but \
+                     KRAB_JWT_ALLOWED_ALGS {} allows only HMAC algorithms, which never verify \
+                     against a published key set; set KRAB_JWT_ALLOWED_ALGS to the provider's \
+                     signing algorithms (for example RS256)",
+                    match &allowlist {
+                        Some(raw) => format!("('{raw}')"),
+                        None => "(unset, default HS256)".to_string(),
+                    }
+                );
             }
         } else {
             anyhow::bail!(
@@ -548,6 +697,25 @@ impl KrabConfig {
                     name,
                     self.environment.as_str()
                 );
+            }
+
+            // The same rule as KRAB_OIDC_JWKS_URL: the bundle is the other
+            // way to name a key set, and it must not be the unchecked one.
+            if let Some(url) = provider
+                .get("jwks_url")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
+                if !url.starts_with("https://") {
+                    anyhow::bail!(
+                        "JWT provider '{}' in KRAB_JWT_PROVIDERS_JSON has a jwks_url that does not \
+                         use https:// in '{}' environment; keys fetched over plain HTTP can be \
+                         substituted by anyone on the path",
+                        name,
+                        self.environment.as_str()
+                    );
+                }
             }
         }
 
@@ -756,6 +924,137 @@ mod tests {
         assert!(err.contains("KRAB_CORS_ORIGINS must be explicitly configured"));
     }
 
+    /// A JWKS URL with issuer and audience is a complete provider in prod,
+    /// and it must be https.
+    #[test]
+    #[serial]
+    fn validate_accepts_a_jwks_url_as_the_key_source_and_requires_https() {
+        let _guard = env_lock();
+        clear_auth_env();
+        std::env::set_var("KRAB_ENVIRONMENT", "prod");
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_OIDC_ISSUER", "https://issuer.example.com");
+        std::env::set_var("KRAB_OIDC_AUDIENCE", "krab-api");
+        std::env::set_var("KRAB_CORS_ORIGINS", "https://app.example.com");
+        std::env::set_var("KRAB_JWT_ALLOWED_ALGS", "RS256");
+        std::env::set_var("KRAB_OIDC_JWKS_URL", "https://issuer.example.com/jwks");
+
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("valid port");
+        let accepted = cfg.validate();
+
+        std::env::set_var("KRAB_OIDC_JWKS_URL", "http://issuer.example.com/jwks");
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("valid port");
+        let rejected = cfg.validate();
+
+        std::env::remove_var("KRAB_OIDC_JWKS_URL");
+        std::env::remove_var("KRAB_JWT_ALLOWED_ALGS");
+        assert!(accepted.is_ok(), "{accepted:?}");
+        assert!(rejected.unwrap_err().to_string().contains("https://"));
+    }
+
+    /// A JWKS-only configuration under an HMAC-only allowlist (including the
+    /// HS256 default) can never verify a token: published keys are
+    /// asymmetric. It used to pass validation and then reject everything.
+    #[test]
+    #[serial]
+    fn validate_rejects_jwks_with_an_hmac_only_allowlist() {
+        let _guard = env_lock();
+        clear_auth_env();
+        std::env::set_var("KRAB_ENVIRONMENT", "prod");
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_OIDC_ISSUER", "https://issuer.example.com");
+        std::env::set_var("KRAB_OIDC_AUDIENCE", "krab-api");
+        std::env::set_var("KRAB_CORS_ORIGINS", "https://app.example.com");
+        std::env::set_var("KRAB_OIDC_JWKS_URL", "https://issuer.example.com/jwks");
+        let validate = || {
+            KrabConfig::from_env_checked("users", 3002)
+                .expect("valid port")
+                .validate()
+        };
+
+        let default_allowlist = validate();
+        std::env::set_var("KRAB_JWT_ALLOWED_ALGS", "HS256,HS512");
+        let explicit_hmac = validate();
+        std::env::set_var("KRAB_JWT_ALLOWED_ALGS", "RS256");
+        let asymmetric = validate();
+
+        std::env::remove_var("KRAB_OIDC_JWKS_URL");
+        std::env::remove_var("KRAB_JWT_ALLOWED_ALGS");
+        std::env::set_var(
+            "KRAB_JWT_PROVIDERS_JSON",
+            r#"[{"name":"idp","issuer":"https://i","audience":"a","jwks_url":"https://i/jwks"}]"#,
+        );
+        let bundle_default = validate();
+        std::env::set_var("KRAB_JWT_ALLOWED_ALGS", "RS256");
+        std::env::set_var(
+            "KRAB_JWT_PROVIDERS_JSON",
+            r#"[{"name":"idp","issuer":"https://i","audience":"a","jwks_url":"http://i/jwks"}]"#,
+        );
+        let bundle_plain_http = validate();
+        std::env::remove_var("KRAB_JWT_ALLOWED_ALGS");
+        std::env::remove_var("KRAB_JWT_PROVIDERS_JSON");
+        let err = bundle_plain_http.unwrap_err().to_string();
+        assert!(err.contains("does not use https://"), "{err}");
+
+        for result in [&default_allowlist, &explicit_hmac, &bundle_default] {
+            let err = result.as_ref().unwrap_err().to_string();
+            assert!(err.contains("allows only HMAC"), "{err}");
+        }
+        assert!(asymmetric.is_ok(), "{asymmetric:?}");
+    }
+
+    /// `local` is an alias of `dev`, case-insensitively: the CLI, the auth
+    /// service and the promotion ladder all treat it as dev-like, and it used
+    /// to parse as `Unknown` and get prod rules here.
+    #[test]
+    #[serial]
+    fn local_is_an_alias_of_dev() {
+        let _guard = env_lock();
+        for value in ["local", "LOCAL", "Local"] {
+            std::env::set_var("KRAB_ENVIRONMENT", value);
+            assert_eq!(Environment::from_env(), Environment::Dev, "{value}");
+        }
+        std::env::set_var("KRAB_ENVIRONMENT", "locale");
+        assert_eq!(
+            Environment::from_env(),
+            Environment::Unknown("locale".to_string())
+        );
+
+        // Dev rules: an inline secret is not a policy error under `local`.
+        std::env::set_var("KRAB_ENVIRONMENT", "local");
+        std::env::set_var("KRAB_TEST_LOCAL_ALIAS_SECRET", "inline-value");
+        let mut issues = Vec::new();
+        check_secret_source(
+            "KRAB_TEST_LOCAL_ALIAS_SECRET",
+            &Environment::from_env(),
+            &mut issues,
+        );
+        std::env::remove_var("KRAB_TEST_LOCAL_ALIAS_SECRET");
+        std::env::remove_var("KRAB_ENVIRONMENT");
+        assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    /// An unrecognised environment name gets the same CORS rule as prod; a
+    /// typo must not be the way to ship wildcard CORS.
+    #[test]
+    #[serial]
+    fn validate_rejects_empty_cors_origins_in_an_unknown_environment() {
+        let _guard = env_lock();
+        clear_auth_env();
+        std::env::set_var("KRAB_ENVIRONMENT", "prdo");
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_OIDC_ISSUER", "https://issuer.example.com");
+        std::env::set_var("KRAB_OIDC_AUDIENCE", "krab-api");
+        std::env::set_var("KRAB_JWT_SECRET_FILE", "/run/secrets/krab_jwt_secret");
+
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("KRAB_CORS_ORIGINS must be explicitly configured"),
+            "{err}"
+        );
+    }
+
     #[test]
     #[serial]
     fn validate_accepts_non_empty_cors_origins_in_staging() {
@@ -795,23 +1094,19 @@ mod tests {
         std::env::remove_var("KRAB_PORT");
     }
 
-    /// The deprecated panicking wrapper must keep delegating to the checked
-    /// path so both constructors read identical configuration.
+    /// `from_env_checked` reads `KRAB_PORT` and falls back to the caller's
+    /// defaults for the service name.
     #[test]
     #[serial]
-    #[allow(deprecated)]
-    fn deprecated_from_env_delegates_to_checked_variant() {
+    fn from_env_checked_reads_port_and_defaults_service_name() {
         let _guard = env_lock();
         clear_auth_env();
         std::env::set_var("KRAB_PORT", "4711");
 
-        let via_deprecated = KrabConfig::from_env("users", 3002);
-        let via_checked =
-            KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
+        let cfg = KrabConfig::from_env_checked("users", 3002).expect("test env has a valid port");
 
-        assert_eq!(via_deprecated.port, 4711);
-        assert_eq!(via_deprecated.port, via_checked.port);
-        assert_eq!(via_deprecated.service_name, via_checked.service_name);
+        assert_eq!(cfg.port, 4711);
+        assert_eq!(cfg.service_name, "users");
         std::env::remove_var("KRAB_PORT");
     }
 

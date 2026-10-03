@@ -1,3 +1,6 @@
+//! Service bootstrap: a bind configuration and, with feature `rest`, an
+//! axum server loop that shuts down gracefully on SIGINT or SIGTERM.
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -7,15 +10,26 @@ use anyhow::Context as _;
 #[cfg(feature = "rest")]
 use std::net::SocketAddr;
 
+/// A service that can be started. Nothing in `krab_core` calls it; it is a
+/// shape for applications to implement.
 #[async_trait]
 pub trait ApiService: Send + Sync {
+    /// Runs the service, typically until shutdown. `Err` if it fails to start
+    /// or exits abnormally.
     async fn start(&self) -> Result<()>;
 }
 
+/// Where a service listens, and under what name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
+    /// Service name, used in log events and error messages (default
+    /// `unknown`).
     pub name: String,
+    /// Address to bind (default `127.0.0.1`). Must be an IP literal:
+    /// `serve_with_graceful_shutdown` parses `host:port` as a socket address
+    /// and does not resolve host names.
     pub host: String,
+    /// Port to bind (default 8080).
     pub port: u16,
     /// Protocol configuration. `None` keeps legacy single-protocol behavior.
     #[serde(default)]
@@ -33,6 +47,13 @@ impl Default for ServiceConfig {
     }
 }
 
+/// Binds `config.host:config.port` and serves `app` until SIGINT (Ctrl+C) or,
+/// on Unix, SIGTERM, then drains in-flight requests before returning.
+///
+/// Serves with connection info, so handlers and the client-IP extraction see
+/// the peer address. Errors when the address does not parse, the bind fails,
+/// or the server exits with an error. Logs `service_listening`,
+/// `service_shutdown_signal_received` and `service_shutdown_complete`.
 #[cfg(feature = "rest")]
 pub async fn serve_with_graceful_shutdown(app: axum::Router, config: &ServiceConfig) -> Result<()> {
     let addr = format!("{}:{}", config.host, config.port)

@@ -35,6 +35,9 @@ uuid = { version = "1", features = ["v4"], optional = true }
 # Content types for static assets. Came in with `krab_core::static_assets`, which
 # was ported here when `krab_server` was removed (ADR 0005).
 mime_guess = { version = "2.0", optional = true }
+# `render_stream::RenderStream` implements `Stream` for axum's `Body::from_stream`.
+# Already in the graph through axum and tokio; this only names the trait.
+futures-core = { version = "0.3", optional = true }
 
 # Password hashing (Optional)
 #
@@ -71,7 +74,7 @@ sha2 = { version = "0.10" }
 
 [features]
 default = []
-rest = ["dep:axum", "dep:tower-http", "dep:jsonwebtoken", "dep:tower", "dep:uuid", "dep:mime_guess"]
+rest = ["dep:axum", "dep:tower-http", "dep:jsonwebtoken", "dep:tower", "dep:uuid", "dep:mime_guess", "dep:futures-core"]
 redis-store = ["dep:redis"]
 
 # Password credential verification: Argon2id hashing and the `CredentialStore`
@@ -86,11 +89,7 @@ graphql = ["dep:async-graphql"]
 # 0007, which is the point at which the name stopped implying a capability the
 # crate does not have.
 grpc-semantics = []
-
-# Deprecated alias for `grpc-semantics`, kept for one minor version per the
-# breaking-change policy in RELEASE_POLICY.md. Remove no earlier than 0.3.0.
-grpc = ["grpc-semantics"]
-web = ["dep:web-sys", "dep:js-sys", "dep:wasm-bindgen"]
+web =["dep:web-sys", "dep:js-sys", "dep:wasm-bindgen"]
 
 # Postgres: connection pooling plus the full migration governance surface —
 # checksum validation, drift detection, rollback, promotion policy.
@@ -99,10 +98,6 @@ db-postgres = ["dep:sqlx", "sqlx/postgres"]
 # SQLite: the driver only. Migration governance is Postgres-specific and does
 # not apply; see docs/reference/database.md.
 db-sqlite = ["dep:sqlx", "sqlx/sqlite"]
-
-# Deprecated alias for `db-postgres`, kept for one minor version per the
-# breaking-change policy in RELEASE_POLICY.md. Remove no earlier than 0.3.0.
-db = ["db-postgres"]
 
 [dependencies.web-sys]
 version = "0.3"
@@ -118,6 +113,9 @@ features = [
     "Request",
     "RequestInit",
     "Response",
+    # `#[server(stream)]` on wasm32 reads the event stream incrementally.
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
     "Window",
 ]
 optional = true

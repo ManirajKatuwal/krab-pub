@@ -61,7 +61,7 @@ Common codes:
 ## 5. Protocol Parity and Exposure Mode Policy
 
 ### 5.1 Parity Matrix Required
-- Any operation exposed on multiple protocols MUST have a parity matrix in `plans/` documenting:
+- Any operation exposed on multiple protocols MUST have a parity matrix in the service's documentation under `docs/` documenting:
   - REST endpoint ↔ GraphQL query/mutation ↔ RPC method mapping
   - known behavioral gaps (if any)
   - source-of-record adapter

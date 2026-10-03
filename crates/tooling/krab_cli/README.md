@@ -35,10 +35,18 @@ cargo install krab_cli
 | `krab topology split <domain>` | Extract a domain into a split service |
 | `krab security dependency-gate` | Dependency policy gate |
 | `krab release check` | Release pre-flight |
-| `krab release certify --out <dir>` | Generate a release evidence bundle |
+| `krab release certify [--out <dir>]` | Generate a release evidence bundle (default `<artifact root>/release-certify/local`; the root is `KRAB_ARTIFACT_DIR`, else `.krab`) |
+
+`contract`, `db` and `release` validate the Krab framework's own reference
+services: they refuse to run outside a Krab framework checkout, and `db
+lifecycle`, `db rollback` and `db drift` need a reachable Postgres. `doctor`,
+`env-check`, `topology doctor` and `security dependency-gate` work in any
+project; `doctor` and `env-check` load `./.env` first (variables already set in
+the process win).
 
 Most commands accept `--diagnostics` for verbose output and `--json` for
-machine-readable results. These are the same binaries CI runs.
+machine-readable results. The `contract`, `db`, `release certify` and
+`security dependency-gate` commands are the ones the CI workflows run.
 
 ## Documentation
 

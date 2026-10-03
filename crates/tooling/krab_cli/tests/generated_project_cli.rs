@@ -30,7 +30,9 @@
 //!   variables the CLI reads, so a developer's shell cannot change the result.
 //! - Nothing here may invoke a cargo or wasm toolchain (`krab build`, `dev`,
 //!   `watch`, `release check`, `release certify`). `new` and `gen` only write
-//!   files, which is what keeps this suite in the low seconds.
+//!   files, which is what keeps this suite in the low seconds. The framework-
+//!   only governance commands are invoked here solely in generated projects,
+//!   where they refuse before reaching cargo.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -40,9 +42,9 @@ use tempfile::TempDir;
 /// Project name used by the scaffolding helpers.
 const PROJECT: &str = "demo_app";
 
-/// `krab_core` feature aliases that are deprecated and scheduled for removal.
-/// A generated project pinned to one of these breaks the day it goes away, so
-/// no generator output may name them. See ADR 0007 for the `grpc` rename.
+/// Former `krab_core` feature aliases, removed in 0.6.0. A generated project
+/// naming one fails to resolve, so no generator output may name them. See
+/// ADR 0007 for the `grpc` rename.
 const DEPRECATED_KRAB_CORE_ALIASES: &[&str] = &["grpc", "db"];
 
 /// A finished `krab` invocation.
@@ -619,8 +621,8 @@ fn generated_modules_are_declared_in_main_and_the_route_is_registered() {
 // ---------------------------------------------------------------------------
 
 /// `--type grpc` scaffolds against `grpc-semantics`, the canonical feature.
-/// It emitted the deprecated `grpc` alias, which is slated for removal, so
-/// every service generated with it was pinned to a feature that is going away.
+/// It emitted the `grpc` alias, since removed (0.6.0), so every service
+/// generated with it was pinned to a feature that no longer exists.
 /// ADR 0007 covers the rename; `grpc-semantics` is status-code and header
 /// vocabulary, not a gRPC transport.
 #[test]
@@ -664,8 +666,8 @@ fn gen_service_emits_only_features_krab_core_declares() {
     }
 }
 
-/// The `saas` template needs a Postgres driver, and `db` is the deprecated
-/// alias for `db-postgres`. It also once emitted `features = ["db, rest"]` —
+/// The `saas` template needs a Postgres driver, and `db` was the alias for
+/// `db-postgres` (removed in 0.6.0). It also once emitted `features = ["db, rest"]` —
 /// one feature literally named `db, rest` — so the list is checked element by
 /// element, not as a substring.
 #[test]
@@ -724,6 +726,276 @@ fn the_fullstack_template_configures_dual_targets_and_wasm_assets() {
         "a freshly generated fullstack project must pass its own strict gate: {}",
         strict.report()
     );
+}
+
+// ---------------------------------------------------------------------------
+// `.env` loading for `krab doctor` / `krab env-check`.
+// ---------------------------------------------------------------------------
+
+/// Every environment variable the environment policy reads, removed rather
+/// than pinned: these tests are about what `./.env` contributes, so nothing
+/// may leak in from the developer's shell.
+const POLICY_VARIABLES: &[&str] = &[
+    "KRAB_AUTH_MODE",
+    "KRAB_ENVIRONMENT",
+    "KRAB_OIDC_ISSUER",
+    "KRAB_OIDC_AUDIENCE",
+    "KRAB_RUNTIME_TOPOLOGY",
+    "KRAB_RUNTIME_ENDPOINTS_JSON",
+];
+
+fn run_with_bare_env(cwd: &Path, args: &[&str]) -> Run {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_krab"));
+    command.current_dir(cwd).args(args);
+    for name in POLICY_VARIABLES {
+        command.env_remove(name);
+    }
+    let output = command
+        .output()
+        .unwrap_or_else(|err| panic!("failed to spawn `krab {}`: {err}", args.join(" ")));
+    Run {
+        args: args.join(" "),
+        code: output.status.code(),
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// The README's own first step is `cp .env.example .env`, and after it
+/// `krab doctor --strict` still failed: the policy read the process
+/// environment only, saw no `KRAB_AUTH_MODE`, defaulted to `jwt`, and warned
+/// about a missing OIDC issuer the project never uses. Both commands now load
+/// `./.env` first.
+#[test]
+fn doctor_and_env_check_strict_pass_after_copying_the_env_example() {
+    let (_temp, root) = scaffold("default");
+
+    // The contrast first: with nothing exported and no `.env`, the policy
+    // falls back to `jwt` and strict mode fails. Without this, the passing
+    // run below could be passing for a reason that has nothing to do with
+    // the file.
+    let bare = run_with_bare_env(&root, &["doctor", "--strict"]);
+    assert!(
+        !bare.success,
+        "doctor --strict should fail with no environment at all: {}",
+        bare.report()
+    );
+
+    fs::copy(root.join(".env.example"), root.join(".env")).expect("cp .env.example .env");
+
+    let doctor = run_with_bare_env(&root, &["doctor", "--diagnostics", "--strict"]);
+    assert!(doctor.success, "{}", doctor.report());
+    assert!(
+        doctor.stderr.contains("from .env"),
+        "doctor must say which file it loaded: {}",
+        doctor.report()
+    );
+    assert_eq!(
+        doctor_check(&parse_doctor_report(&doctor.stdout), "environment-policy").level,
+        "OK",
+        "{}",
+        doctor.report()
+    );
+
+    let env_check = run_with_bare_env(&root, &["env-check", "--strict"]);
+    assert!(env_check.success, "{}", env_check.report());
+
+    // `--json` stays machine-readable: the load summary goes to stderr.
+    let json = run_with_bare_env(&root, &["env-check", "--strict", "--json"]);
+    assert!(json.success, "{}", json.report());
+    assert!(
+        json.stdout.trim_start().starts_with('{') && json.stdout.contains("\"passed\""),
+        "{}",
+        json.report()
+    );
+}
+
+/// An exported variable is a deliberate choice for this run; the file is a
+/// default. The environment must win.
+#[test]
+fn an_exported_variable_overrides_the_env_file() {
+    let (_temp, root) = scaffold("default");
+    fs::copy(root.join(".env.example"), root.join(".env")).expect("cp .env.example .env");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_krab"));
+    command.current_dir(&root).args(["env-check", "--strict"]);
+    for name in POLICY_VARIABLES {
+        command.env_remove(name);
+    }
+    // `.env` says `static` in `dev`; the shell says `prod`, where static
+    // auth is forbidden. If the file won, this would pass.
+    command.env("KRAB_ENVIRONMENT", "prod");
+    let output = command.output().expect("spawn krab env-check");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("KRAB_AUTH_MODE=static is forbidden outside local/dev"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("already set in the environment"),
+        "{stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Framework-only governance commands.
+// ---------------------------------------------------------------------------
+
+/// `contract check`, `db lifecycle` and friends drive the framework's own
+/// reference services (`cargo test -p service_auth`, ...). In a generated
+/// project they used to fail with cargo's "package ID specification did not
+/// match" — a framework assumption reported as the user's bug. They now
+/// refuse up front, before invoking cargo, with one message that says what
+/// they are for and what to run instead.
+#[test]
+fn framework_only_governance_commands_refuse_in_a_generated_project() {
+    let (_temp, root) = scaffold("default");
+
+    for args in [
+        vec!["contract", "check"],
+        vec!["contract", "protocol-check"],
+        vec!["db", "lifecycle"],
+        vec!["db", "rehearsal"],
+        vec!["release", "check"],
+        vec!["release", "certify"],
+    ] {
+        let refused = run(&root, &args);
+        let command = args.join(" ");
+
+        assert_eq!(refused.code, Some(1), "{}", refused.report());
+        assert!(
+            refused.stderr.contains(&format!("`krab {command}`")),
+            "the refusal must name the command: {}",
+            refused.report()
+        );
+        assert!(
+            refused
+                .stderr
+                .contains("validates the Krab framework's own reference services"),
+            "{}",
+            refused.report()
+        );
+        assert!(
+            refused.stderr.contains("krab security dependency-gate")
+                && refused.stderr.contains("krab doctor"),
+            "the refusal must say what to run instead: {}",
+            refused.report()
+        );
+        // Refused before doing anything: no cargo invocation, and no
+        // artifact directory created for a run that never happened.
+        assert!(
+            !refused.stdout.contains("Running") && !root.join(".krab").exists(),
+            "{}",
+            refused.report()
+        );
+    }
+}
+
+/// `--json` still produces an envelope for the thin gates, and the exit
+/// status matches the human mode.
+#[test]
+fn a_refused_gate_still_emits_its_json_envelope() {
+    let (_temp, root) = scaffold("default");
+
+    let refused = run(&root, &["db", "lifecycle", "--json"]);
+
+    assert_eq!(refused.code, Some(1), "{}", refused.report());
+    assert!(
+        refused.stdout.contains("\"status\": \"failed\"")
+            && refused.stdout.contains("\"command\": \"db lifecycle\""),
+        "{}",
+        refused.report()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `krab gen service` next steps and `--path-deps`.
+// ---------------------------------------------------------------------------
+
+/// A `krab new` project has no `[workspace]`, so the old "Add to your
+/// workspace members" hint pointed at a list that does not exist.
+#[test]
+fn gen_service_in_a_generated_project_does_not_mention_workspace_members() {
+    let (_temp, root) = scaffold("default");
+
+    let generated = run_ok(&root, &["gen", "service", "payments", "--type", "rest"]);
+
+    assert!(
+        !generated.stdout.contains("members"),
+        "{}",
+        generated.report()
+    );
+    assert!(
+        generated.stdout.contains("cd payments && cargo build"),
+        "{}",
+        generated.report()
+    );
+}
+
+#[test]
+fn gen_service_inside_a_workspace_names_the_member_entry() {
+    let temp = TempDir::new().expect("tempdir");
+    fs::write(
+        temp.path().join("Cargo.toml"),
+        "[workspace]\nmembers = []\nresolver = \"2\"\n",
+    )
+    .expect("write workspace manifest");
+
+    let generated = run_ok(
+        temp.path(),
+        &["gen", "service", "payments", "--type", "rest"],
+    );
+
+    assert!(
+        generated.stdout.contains("\"payments\"")
+            && generated.stdout.contains("[workspace] members"),
+        "{}",
+        generated.report()
+    );
+}
+
+#[test]
+fn gen_service_path_deps_points_krab_core_at_the_checkout() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("..");
+    let temp = TempDir::new().expect("tempdir");
+
+    run_ok(
+        temp.path(),
+        &[
+            "gen",
+            "service",
+            "payments",
+            "--type",
+            "rest",
+            "--exposure-mode",
+            "multi",
+            "--protocols",
+            "rest,graphql",
+            "--path-deps",
+            repo_root.to_str().expect("utf-8 repo path"),
+        ],
+    );
+
+    let manifest = read(temp.path(), "payments/Cargo.toml");
+    let line = manifest
+        .lines()
+        .find(|line| line.starts_with("krab_core ="))
+        .unwrap_or_else(|| panic!("no krab_core line:\n{manifest}"));
+    assert!(
+        line.contains("path = \"") && line.contains("crates/framework/krab_core\""),
+        "{manifest}"
+    );
+    assert!(!line.contains("version ="), "{manifest}");
+
+    let main_rs = read(temp.path(), "payments/src/main.rs");
+    for decl in ["mod adapters;", "mod capabilities;", "mod domain;"] {
+        assert_eq!(declaration_lines(&main_rs, decl), 1, "{main_rs}");
+    }
 }
 
 // ---------------------------------------------------------------------------

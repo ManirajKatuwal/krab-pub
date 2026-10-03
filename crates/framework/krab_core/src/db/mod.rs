@@ -16,7 +16,8 @@
 //! |---|---|
 //! | `db-postgres` | [`postgres`] — connection, migrations, drift, rollback, promotion policy |
 //! | `db-sqlite` | `sqlx`'s SQLite driver, for applications building their own repositories |
-//! | `db` | Deprecated alias for `db-postgres` |
+//!
+//! The `db` alias for `db-postgres`, deprecated since 0.2.0, was removed in 0.6.0.
 //!
 //! Driver selection is available whenever *either* driver feature is on, since
 //! choosing between them is the point.

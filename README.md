@@ -31,15 +31,16 @@ alternatives forgot to build it.
 | Multi-service orchestration | Write a process runner, or use `docker compose` | `krab.toml` and a supervised orchestrator |
 | Migration governance | `sqlx migrate` + your own rollback discipline | Checksum validation, drift detection, rollback rehearsal, promotion policy |
 | Dependency security | `cargo-deny` you configure and wire into CI | Pre-wired gate, no `ignore` list, one documented exception |
-| Secret management | Read env vars; enforce `*_FILE` yourself | `read_env_or_file()`, with inline secrets rejected at startup outside `local` |
+| Secret management | Read env vars; enforce `*_FILE` yourself | `read_env_or_file()`, with inline secrets rejected at startup in `prod` (a warning in `staging`) |
 | Telemetry and SLOs | `tracing` + your own metric names | OTel-aligned field keys, RED/USE taxonomy, burn-rate alerts |
-| Release evidence | Whatever you remember to capture | `krab release certify` bundles |
+| Pre-deploy checks | Whatever you remember to run | `krab doctor --strict`, `krab topology doctor`, `krab security dependency-gate` in any project |
 
 **Where the alternatives are ahead.** Leptos and Dioxus have far richer
 reactivity, and their routers do nested layouts and client-side route tables;
 Krab's router ([`krab_client::router`](crates/framework/krab_client/src/router.rs))
 does same-origin navigation with one outlet and leaves routing authority on the
-server. Krab's signal system is ~330 lines and is scoped to islands, not to
+server. Krab's signal system — signals, effects, memos and a context
+API on a tree of owners — is one module scoped to islands, not
 whole-application reactivity. Next.js has an ecosystem Krab will not match. If
 your application is a rich SPA, those are the better tools today. Krab's case is
 the server-first application that has to be *operated*.
@@ -49,16 +50,23 @@ the server-first application that has to be *operated*.
 ## Installation
 
 All five crates are on [crates.io](https://crates.io/crates/krab_core). The
-current release is `0.5.0`; release channels and versioning policy are in
+current release is `0.6.0`; release channels and versioning policy are in
 [RELEASE_POLICY.md](RELEASE_POLICY.md).
 
-> **Upgrading to `0.5.0`?** Four breaking changes — three operator-visible, one for Rust callers matching on `ErrorCategory`:
-> `/metrics` and `/metrics/prometheus` now require auth unless
-> `KRAB_METRICS_PUBLIC=true`, the orchestrator owns each service's port and name
-> from `krab.toml`, and `krab_core::render_stream`'s streaming writer is no longer
-> compiled for `wasm32` (its marker parser still is). The
-> [migration guide](docs/guides/migration_guide.md) has the
-> one-line fix for each.
+> **Upgrading to `0.6.0`?** It removes every item that was deprecated with a
+> removal version — `krab_client`'s `demo-islands` feature among them — so a
+> crate that builds warning-free on `0.5.0` has little to change. Operators
+> should check six things: `krab db lifecycle|rollback|drift` now need
+> Postgres, `krab contract|db|release` refuse to run outside the framework
+> checkout, tooling output defaults to `.krab/`, the latency histogram is now
+> `krab_http_request_duration_seconds`, the auth-failure limiter answers `503`
+> (not `429`) while its store is unreachable, and an explicit
+> `KRAB_AUTH_OPEN_PATHS` is the complete open list — it also overrides the
+> public routes a service now declares in code (the reference frontend's
+> `/_krab/*` scripts and `/streaming`). The
+> [0.5.0 → 0.6.0 section of the migration guide](docs/guides/migration_guide.md#050--060)
+> has the one-line fix for each; upgrading from `0.4.x`, read the `0.4.0 → 0.5.0`
+> section too.
 >
 > If you installed `0.2.0`, upgrade regardless. The `krab_client` published at
 > `0.2.0` was built without its `web` feature, so its `hydrate()` logged one line
@@ -124,6 +132,10 @@ cp .env.example .env
 # Edit .env with your local settings (DATABASE_URL, KRAB_AUTH_MODE, etc.)
 ```
 
+`krab doctor` and `krab env-check` read `./.env` themselves. The services read
+only the process environment, so export the file into your shell (for example
+`set -a; . ./.env; set +a` in a POSIX shell) before starting them.
+
 ### Run services
 
 ```sh
@@ -176,13 +188,16 @@ Krab follows a server-first, client-opt-in architecture organized as a Cargo wor
 | Crate                                                    | Purpose                                                                                 |
 | -------------------------------------------------------- | --------------------------------------------------------------------------------------- |
 | [`krab_core`](crates/framework/krab_core)               | Shared config, HTTP middleware, resilience, telemetry, DB governance, and signal system |
-| [`krab_macros`](crates/framework/krab_macros)           | Procedural macros (`view!`, `#[island]`)                                                |
+| [`krab_macros`](crates/framework/krab_macros)           | Procedural macros (`view!`, `#[island]`, `#[server]`)                                   |
 | [`krab_client`](crates/framework/krab_client)           | WASM runtime for island hydration (browser)                                             |
 | [`service_auth`](services/service_auth)                 | Authentication service (REST — JWT/OIDC token issuance)                                 |
 | [`service_users`](services/service_users)               | Users service (GraphQL + PostgreSQL/SQLite)                                             |
 | [`service_frontend`](services/service_frontend)         | SSR frontend service with island hydration                                              |
+| [`service_frontend_islands`](services/service_frontend_islands) | The frontend's islands: server-rendered by `service_frontend`, hydrated by this crate's WASM bundle |
+| [`service_users_split`](services/service_users_split)   | Split-topology reference service                                                        |
+| [`islands_rpc`](examples/reference_apps/islands_rpc)    | Vendored reference app: islands plus server functions                                   |
 | [`krab_orchestrator`](crates/tooling/krab_orchestrator) | Multi-service process orchestrator                                                      |
-| [`krab_cli`](crates/tooling/krab_cli)                   | Developer CLI helpers (env-check, bootstrap)                                            |
+| [`krab_cli`](crates/tooling/krab_cli)                   | The `krab` CLI: scaffolding, generators, dev workflow, governance                       |
 
 ---
 
@@ -245,7 +260,7 @@ PostgreSQL includes enterprise features: versioned migrations with checksums, dr
 
 ### Authentication and security
 
-- **JWT/OIDC** token issuance with key rotation (`KeyRing` with multiple `kid` support)
+- **JWT/OIDC** token issuance with key rotation (`KeyRing` with multiple `kid` support), scheduled key retirement (`KRAB_JWT_KEY_NOT_AFTER_JSON`), and remote JWKS for OIDC providers (`KRAB_OIDC_JWKS_URL`)
 - **Rate limiting** with configurable capacity/refill and explicit store-failure policy (`KRAB_RATE_LIMIT_FAIL_OPEN`)
 - **JWT algorithm allowlist** via `KRAB_JWT_ALLOWED_ALGS`
 - **Proxy trust controls** via `KRAB_TRUST_PROXY_HEADERS` (forwarded headers are untrusted by default)
@@ -266,8 +281,8 @@ Zero-tolerance dependency governance enforced via `cargo-deny`:
 ### Observability
 
 - **Structured logging** via `tracing` with OpenTelemetry-aligned field names
-- **Prometheus metrics** at `/metrics/prometheus` on every service
-- **Prometheus compatibility aliases** maintained for legacy dashboard/alert migration (`krab_response_5xx_total`, `krab_request_duration_ms_*`)
+- **Prometheus metrics** at `/metrics/prometheus` on every service (authenticated unless `KRAB_METRICS_PUBLIC=true`), including the `krab_http_request_duration_seconds` latency histogram and `krab_auth_failures_by_reason_total{reason}`
+- **Prometheus compatibility names** kept for older dashboards: `krab_response_{2xx,4xx,5xx}_total`, and the deprecated `krab_request_duration_seconds` histogram (buckets only, removed in 0.7.0)
 - **JSON metrics** at `/metrics` for programmatic consumption
 - **Health** (`/health`) and **readiness** (`/ready`) endpoints with dependency status
 - **Request correlation** via `x-request-id` header propagation
@@ -331,7 +346,11 @@ KRAB_DB_DRIVER=sqlite DATABASE_URL="sqlite://krab_users.sqlite?mode=rwc" cargo r
 
 ## CI/CD Gates
 
-All gates must pass before merge. Automated workflows enforce quality at every PR:
+These workflows define the gate surface (six of the fourteen in
+[`.github/workflows/`](.github/workflows/) are listed). GitHub Actions has not
+yet run successfully on this repository, so release gates are run locally or in
+a container and recorded as evidence — see the
+[0.6.0 release checklist](docs/operations/release_0_6_0_checklist.md#what-gates-this-release-and-what-does-not).
 
 | Workflow            | File                                                                                       | Purpose                                          |
 | ------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------ |
@@ -365,7 +384,7 @@ Full index: [`docs/README.md`](docs/README.md).
 | [`docs/guides/why_krab.md`](docs/guides/why_krab.md) | Krab's product position and differentiators |
 | [`docs/guides/ide_setup.md`](docs/guides/ide_setup.md) | Editor and toolchain setup |
 | [`docs/guides/dev_workflow.md`](docs/guides/dev_workflow.md) | Local dev loop, watch mode, and build outputs |
-| [`docs/guides/migration_guide.md`](docs/guides/migration_guide.md) | Migration notes from Axum, Leptos, and JS full-stack frameworks |
+| [`docs/guides/migration_guide.md`](docs/guides/migration_guide.md) | Upgrading between Krab releases, and migrating from Axum, Leptos, and JS full-stack frameworks |
 | [`docs/guides/reference_apps.md`](docs/guides/reference_apps.md) | Official reference app tracks and starter mapping |
 | [`docs/guides/troubleshooting.md`](docs/guides/troubleshooting.md) | Developer troubleshooting: hydration, service startup, CI gates |
 
@@ -423,7 +442,7 @@ Current security posture:
 - JWT algorithm allowlist enforcement via `KRAB_JWT_ALLOWED_ALGS`
 - Proxy headers untrusted by default via `KRAB_TRUST_PROXY_HEADERS=false`
 - CORS, compression, and request-id middleware on all services
-- Non-development startup rejects empty CORS allowlists, requiring `KRAB_CORS_ORIGINS` in staging and production
+- Non-development startup rejects empty CORS allowlists, requiring `KRAB_CORS_ORIGINS` in staging, production, and any unrecognised `KRAB_ENVIRONMENT` value
 
 For the full security architecture, see [`docs/reference/security.md`](docs/reference/security.md).
 

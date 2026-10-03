@@ -1,0 +1,12 @@
+error: <Suspense> has no attribute `fallbak`. It accepts: fallback.
+  --> tests/compile_fail/suspense_unknown_attribute.rs:6:13
+   |
+ 6 |       let _ = view! {
+   |  _____________^
+ 7 | |         <Suspense fallback={|| view! { <p>"loading"</p> }} fallbak={1}>
+ 8 | |             <p>"content"</p>
+ 9 | |         </Suspense>
+10 | |     }
+   | |_____^
+   |
+   = note: this error originates in the macro `view` (in Nightly builds, run with -Z macro-backtrace for more info)

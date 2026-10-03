@@ -254,14 +254,14 @@ fn emit_asset_manifest() {
     let out_dir = Path::new("public").join("__ssg");
     let _ = fs::create_dir_all(&out_dir);
     // No `integrity` field. This runs at build time, before `wasm-pack` has
-    // produced `krab_client.js`, so there is nothing here to hash — and the
+    // produced `service_frontend_islands.js`, so there is nothing here to hash — and the
     // constant `sha256-demo-manifest-checksum` that used to stand in described
     // no file ever built while still satisfying the browser's `sha256-` prefix
     // check. The live manifest is served by the `/asset-manifest.json` handler,
     // which hashes the bundle's actual bytes; this static copy exists only for
     // the SSG output shape.
     let manifest =
-        "{\"assets\":{\"krab_client.js\":{\"path\":\"/pkg/krab_client.js\",\"immutable\":true}}}";
+        "{\"assets\":{\"service_frontend_islands.js\":{\"path\":\"/pkg/service_frontend_islands.js\",\"immutable\":true}}}";
     let _ = fs::write(out_dir.join("asset-manifest.json"), manifest);
 }
 

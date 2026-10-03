@@ -15,10 +15,16 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Where a [`CircuitBreaker`] is in its cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CircuitState {
+    /// Normal operation: every request is allowed and outcomes are counted
+    /// against the trip policy.
     Closed,
+    /// Tripped: requests are refused until the cooldown has elapsed.
     Open,
+    /// Cooldown elapsed: a limited number of probe requests are allowed. A
+    /// probe success closes the circuit; a probe failure reopens it.
     HalfOpen,
 }
 
@@ -159,6 +165,12 @@ impl RateWindow {
     }
 }
 
+/// A circuit breaker for calls to one dependency.
+///
+/// Ask [`allow_request`](Self::allow_request) before each call and report the
+/// outcome with [`record_success`](Self::record_success) or
+/// [`record_failure`](Self::record_failure). Opening and closing are logged
+/// (`circuit_breaker_opened`, `circuit_breaker_closed`).
 #[derive(Debug, Clone)]
 pub struct CircuitBreaker {
     open_cooldown: Duration,
@@ -202,10 +214,21 @@ impl CircuitBreaker {
         }
     }
 
+    /// The current state. The move from `Open` to `HalfOpen` happens inside
+    /// [`allow_request`](Self::allow_request), so this still reports `Open`
+    /// after the cooldown until a request is attempted.
     pub fn state(&self) -> CircuitState {
         self.state
     }
 
+    /// Whether a call may go ahead now.
+    ///
+    /// `Closed` always allows. `Open` refuses until `open_cooldown` has
+    /// passed since it opened; the first call after that moves to `HalfOpen`
+    /// and is allowed as a probe. `HalfOpen` allows up to
+    /// `half_open_max_probes` probes in total — they are counted when
+    /// admitted, not released when they finish — and refuses the rest until
+    /// an outcome is recorded.
     pub fn allow_request(&mut self) -> bool {
         match self.state {
             CircuitState::Closed => true,
@@ -230,6 +253,9 @@ impl CircuitBreaker {
         }
     }
 
+    /// Reports a successful call. When `Closed`, resets the consecutive
+    /// failure count and adds a success to the rate window; otherwise closes
+    /// the circuit and resets every counter.
     pub fn record_success(&mut self) {
         match self.state {
             CircuitState::Closed => {
@@ -244,6 +270,9 @@ impl CircuitBreaker {
         }
     }
 
+    /// Reports a failed call. When `Closed`, counts it and opens the circuit
+    /// if the trip policy is met; when `HalfOpen`, reopens the circuit and
+    /// restarts the cooldown; when `Open`, has no effect on the state.
     pub fn record_failure(&mut self) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
 
@@ -348,18 +377,22 @@ impl SharedCircuitBreaker {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// See [`CircuitBreaker::state`].
     pub fn state(&self) -> CircuitState {
         self.lock().state()
     }
 
+    /// See [`CircuitBreaker::allow_request`].
     pub fn allow_request(&self) -> bool {
         self.lock().allow_request()
     }
 
+    /// See [`CircuitBreaker::record_success`].
     pub fn record_success(&self) {
         self.lock().record_success();
     }
 
+    /// See [`CircuitBreaker::record_failure`].
     pub fn record_failure(&self) {
         self.lock().record_failure();
     }

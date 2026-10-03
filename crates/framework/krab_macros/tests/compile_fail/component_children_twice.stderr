@@ -1,0 +1,6 @@
+error: <Panel> sets `children` twice: once as an attribute and once as the content
+         between its tags. Keep one.
+  --> tests/compile_fail/component_children_twice.rs:15:28
+   |
+15 |     let _ = view! { <Panel children={Node::Text("a".into())}>"b"</Panel> }.render();
+   |                            ^^^^^^^^

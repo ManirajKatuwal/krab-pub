@@ -314,3 +314,345 @@ fn control_flow_nests_inside_elements() {
     assert!(html.starts_with(r#"<div class="wrapper">"#), "got: {html}");
     assert!(html.contains("inner"), "got: {html}");
 }
+
+// ── Component composition (ADR 0013) ────────────────────────────────────────
+//
+// A capitalised tag calls the function of that name with a `{Name}Props`
+// built from its attributes. These components follow the same convention as
+// `#[island]`: one props argument, returning `krab_core::Node`.
+#[allow(non_snake_case)]
+mod components {
+    use krab_core::Node;
+    use krab_macros::view;
+
+    pub struct CardProps {
+        pub title: String,
+        pub count: i32,
+        pub children: Node,
+    }
+
+    pub fn Card(props: CardProps) -> Node {
+        view! {
+            <section class="card">
+                <h2>{props.title}</h2>
+                <span class="count">{props.count}</span>
+                {props.children}
+            </section>
+        }
+    }
+
+    #[derive(Default)]
+    pub struct ButtonProps {
+        pub label: String,
+        pub disabled: bool,
+        pub aria_label: Option<String>,
+        pub r#type: &'static str,
+    }
+
+    pub fn Button(props: ButtonProps) -> Node {
+        let kind = if props.r#type.is_empty() {
+            "button"
+        } else {
+            props.r#type
+        };
+        let aria = props.aria_label.unwrap_or_default();
+        let disabled = if props.disabled { "true" } else { "false" };
+        view! {
+            <button type={kind} aria-label={aria} data-disabled={disabled}>{props.label}</button>
+        }
+    }
+
+    pub mod ui {
+        use krab_core::Node;
+        use krab_macros::view;
+
+        pub struct BadgeProps {
+            pub label: &'static str,
+        }
+
+        pub fn Badge(props: BadgeProps) -> Node {
+            view! { <em>{props.label}</em> }
+        }
+
+        #[derive(Default)]
+        pub struct PanelProps {
+            pub children: Node,
+        }
+
+        pub fn Panel(props: PanelProps) -> Node {
+            view! { <div class="panel">{props.children}</div> }
+        }
+    }
+}
+
+use components::{ui, Button, ButtonProps, Card, CardProps};
+
+#[test]
+fn component_with_children_renders_through_its_function() {
+    let count = 3;
+    let html = view! {
+        <Card title="Inbox" count={count}>
+            <p>"You have mail"</p>
+        </Card>
+    }
+    .render();
+
+    assert_eq!(
+        html,
+        r#"<section class="card"><h2>Inbox</h2><span class="count">3</span><p>You have mail</p></section>"#
+    );
+}
+
+#[test]
+fn several_children_reach_the_component_as_one_fragment() {
+    let html = view! {
+        <Card title="List" count={2}>
+            <p>"one"</p>
+            "two"
+        </Card>
+    }
+    .render();
+
+    assert!(html.ends_with("<p>one</p>two</section>"), "got: {html}");
+}
+
+#[test]
+fn path_tag_calls_the_function_at_that_path() {
+    let html = view! { <div><ui::Badge label="new"/></div> }.render();
+    assert_eq!(html, "<div><em>new</em></div>");
+}
+
+#[test]
+fn path_tag_with_children_closes_with_the_same_path() {
+    let html = view! {
+        <ui::Panel>
+            <ui::Badge label="inside"/>
+        </ui::Panel>
+    }
+    .render();
+    assert_eq!(html, r#"<div class="panel"><em>inside</em></div>"#);
+}
+
+#[test]
+fn bare_rest_fills_omitted_props_from_default() {
+    let html = view! { <Button label="Save" ../> }.render();
+    assert_eq!(
+        html,
+        r#"<button type="button" aria-label="" data-disabled="false">Save</button>"#
+    );
+}
+
+#[test]
+fn rest_leaves_children_to_default_when_there_is_no_content() {
+    let html = view! { <ui::Panel ../> }.render();
+    assert_eq!(html, r#"<div class="panel"></div>"#);
+}
+
+#[test]
+fn hyphenated_and_keyword_attributes_map_to_fields() {
+    let html = view! {
+        <Button label="Go" disabled={true} aria-label={Some("go".to_string())} type="submit"/>
+    }
+    .render();
+    assert_eq!(
+        html,
+        r#"<button type="submit" aria-label="go" data-disabled="true">Go</button>"#
+    );
+}
+
+#[test]
+fn components_nest_and_can_be_the_root() {
+    let html = view! {
+        <Card title="Outer" count={1}>
+            <Card title="Inner" count={2}>
+                <ui::Badge label="deep"/>
+            </Card>
+        </Card>
+    }
+    .render();
+    assert!(
+        html.contains(
+            r#"<h2>Inner</h2><span class="count">2</span><em>deep</em></section></section>"#
+        ),
+        "got: {html}"
+    );
+}
+
+#[test]
+fn component_tag_is_the_same_call_as_writing_it_out() {
+    let by_tag = view! { <ui::Badge label="x"/> }.render();
+    let by_call = ui::Badge(ui::BadgeProps { label: "x" }).render();
+    assert_eq!(by_tag, by_call);
+
+    let by_tag = view! { <Button label="y" ../> }.render();
+    let by_call = Button(ButtonProps {
+        label: "y".into(),
+        ..Default::default()
+    })
+    .render();
+    assert_eq!(by_tag, by_call);
+
+    // `CardProps` is used by name only through the tag above; this keeps the
+    // import honest.
+    let _ = |props: CardProps| Card(props);
+}
+
+#[test]
+fn components_compose_with_control_flow() {
+    let html = view! {
+        <Show when={|| true}>
+            <ui::Badge label="shown"/>
+        </Show>
+    }
+    .render();
+    assert!(html.contains("<em>shown</em>"), "got: {html}");
+}
+
+// ── Context through component tags (ADR 0014) ───────────────────────────────
+//
+// Each tag runs its component in a context scope of its own, so a provide in
+// one component reaches the components it renders and not its siblings.
+#[allow(non_snake_case)]
+mod context_components {
+    use krab_core::signal::{provide_context, use_context};
+    use krab_core::Node;
+    use krab_macros::view;
+
+    #[derive(Clone)]
+    struct Theme(&'static str);
+
+    pub struct ThemedProps {
+        pub theme: &'static str,
+    }
+
+    pub fn Themed(props: ThemedProps) -> Node {
+        provide_context(Theme(props.theme));
+        view! { <div><Label/></div> }
+    }
+
+    pub struct LabelProps {}
+
+    pub fn Label(_props: LabelProps) -> Node {
+        let theme = use_context::<Theme>()
+            .map(|theme| theme.0)
+            .unwrap_or("none");
+        view! { <span>{theme}</span> }
+    }
+}
+
+// A tag needs both names in scope: the function and its props type.
+use context_components::{Themed, ThemedProps};
+
+#[test]
+fn a_context_provided_by_a_component_reaches_what_it_renders_and_not_its_siblings() {
+    let html = krab_core::signal::with_owner(|| {
+        view! {
+            <section>
+                <Themed theme="dark"/>
+                <context_components::Label/>
+                <Themed theme="light"/>
+            </section>
+        }
+        .render()
+    });
+    assert_eq!(
+        html,
+        "<section><div><span>dark</span></div><span>none</span><div><span>light</span></div></section>"
+    );
+}
+
+// ── Suspense (ADR 0016) ─────────────────────────────────────────────────────
+
+#[test]
+fn suspense_renders_the_fallback_while_a_resource_is_pending() {
+    let html = krab_core::signal::with_owner(|| {
+        view! {
+            <section>
+                <Suspense fallback={|| view! { <p>"Loading"</p> }}>
+                    {{
+                        let user = krab_core::resource::create_resource(
+                            || 1u32,
+                            |n| async move { Ok::<_, String>(n) },
+                        );
+                        move || view! { <p>{format!("{:?}", user.value().get())}</p> }
+                    }}
+                </Suspense>
+            </section>
+        }
+        .render()
+    });
+    assert!(html.contains("<p>Loading</p>"), "{html}");
+    assert!(html.contains(":pending-->"), "{html}");
+    assert!(html.contains(":resolved-->"), "{html}");
+    assert!(krab_core::render_stream::is_finalized_ssr_snapshot(&html));
+}
+
+#[test]
+fn suspense_renders_the_children_when_data_is_there() {
+    let html = krab_core::signal::with_owner(|| {
+        view! {
+            <Suspense fallback={|| view! { <p>"Loading"</p> }}>
+                <h2>"Profile"</h2>
+                {{
+                    let user = krab_core::resource::create_resource_with_initial(
+                        Some("ada".to_string()),
+                        || 1u32,
+                        |_| async move { Ok::<_, String>(String::new()) },
+                    );
+                    move || view! { <p>{user.value().get().unwrap_or_default()}</p> }
+                }}
+            </Suspense>
+        }
+        .render()
+    });
+    assert!(html.contains("<h2>Profile</h2><p>ada</p>"), "{html}");
+    assert!(!html.contains("Loading"), "{html}");
+}
+
+// ── Reactive attributes (ADR 0015) ──────────────────────────────────────────
+
+#[test]
+fn a_closure_attribute_is_dynamic_and_renders_its_current_value() {
+    let (label, set_label) = krab_core::signal::create_signal("one".to_string());
+    let node = view! { <div title={move || label.get()}></div> };
+
+    let krab_core::Node::Element(element) = &node else {
+        panic!("expected an element");
+    };
+    assert!(element.attributes[0].is_dynamic());
+
+    assert_eq!(node.render(), "<div title=\"one\"></div>");
+    set_label.set("two".to_string());
+    assert_eq!(node.render(), "<div title=\"two\"></div>");
+}
+
+#[test]
+fn a_boolean_closure_attribute_is_present_or_omitted() {
+    let (busy, set_busy) = krab_core::signal::create_signal(false);
+    let node = view! { <button disabled={move || busy.get()}>"Go"</button> };
+
+    assert_eq!(node.render(), "<button>Go</button>");
+    set_busy.set(true);
+    assert_eq!(node.render(), "<button disabled=\"\">Go</button>");
+}
+
+#[test]
+fn an_option_closure_attribute_is_omitted_on_none() {
+    let (href, set_href) = krab_core::signal::create_signal(None::<String>);
+    let node = view! { <a href={move || href.get()}>"link"</a> };
+
+    assert_eq!(node.render(), "<a>link</a>");
+    set_href.set(Some("/x?a=1&b=2".to_string()));
+    assert_eq!(node.render(), "<a href=\"/x?a=1&amp;b=2\">link</a>");
+}
+
+#[test]
+fn a_non_closure_expression_attribute_stays_static() {
+    let count = 3;
+    let node = view! { <span data-count={count}></span> };
+    let krab_core::Node::Element(element) = &node else {
+        panic!("expected an element");
+    };
+    assert!(!element.attributes[0].is_dynamic());
+    assert_eq!(node.render(), "<span data-count=\"3\"></span>");
+}

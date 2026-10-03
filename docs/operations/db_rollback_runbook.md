@@ -4,7 +4,7 @@ This document outlines the procedures for rolling back database migrations in th
 
 ## 1. Overview
 
-The rollback system relies on the `rollback_to_version` function in `krab_core/src/db.rs` and the `_krab_migrations` tracking table. All destructive migrations MUST have a corresponding `rollback_sql` definition.
+The rollback system relies on the `rollback_to_version` function in `krab_core/src/db/postgres.rs` and the `krab_migrations` ledger table. All destructive migrations MUST have a corresponding `rollback_sql` definition.
 
 ### Governance Scope
 
@@ -66,12 +66,25 @@ Before initiating a rollback, verify the system state:
 
 ## 3. Execution
 
-### Automatic Rollback (via CLI/Tooling)
+### Automatic Rollback (from your service)
 
-Execute the rollback command (to be implemented in CLI):
-```bash
-krab-cli db rollback --target-version <VERSION>
+There is no CLI command that rolls a deployed database back. `krab db rollback`
+runs the framework's own rollback *simulation* suite — it works only in a Krab
+framework checkout, needs a test Postgres, and takes no target version.
+
+Roll back from code that owns the migration slice, with
+`krab_core::db::postgres::rollback_to_version`:
+
+```rust,ignore
+rollback_to_version(&pool, &MIGRATIONS, target_version).await?;
 ```
+
+It undoes every applied migration above `target_version` with its
+`rollback_sql`, newest first, each in its own transaction that also deletes the
+`krab_migrations` row, under the same advisory lock as
+`run_versioned_migrations`. It stops at the first migration without
+`rollback_sql`, leaving the ones above it already rolled back — see
+[Failure Recovery](#5-failure-recovery).
 
 ### Rollback Rehearsal Artifacting (Required for Release Environments)
 

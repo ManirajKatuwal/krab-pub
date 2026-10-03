@@ -89,7 +89,7 @@ pub(super) fn watch_project(release: bool, poll_ms: u64, settle_ms: u64) -> Resu
     // a `cargo run` child is alive, and the guard is what keeps those exits from
     // orphaning it.
     let mut child = FrontendChildGuard::new(spawn_frontend(&project, release)?);
-    let mut pending_change_since: Option<std::time::Instant> = None;
+    let mut debouncer = ChangeDebouncer::new();
 
     // Change detection is a stat poll, not an OS watch: it re-stats every file
     // under the watch roots each interval, so cost grows with project size and a
@@ -111,23 +111,15 @@ pub(super) fn watch_project(release: bool, poll_ms: u64, settle_ms: u64) -> Resu
             child.replace(spawn_frontend(&project, release)?);
         }
 
-        let next = collect_file_fingerprints(&project)?;
-        if next == baseline {
-            pending_change_since = None;
+        let polled = collect_file_fingerprints(&project)?;
+        let Some(next) = debouncer.observe(
+            &baseline,
+            polled,
+            std::time::Instant::now(),
+            Duration::from_millis(settle_ms),
+        ) else {
             continue;
-        }
-
-        if pending_change_since.is_none() {
-            pending_change_since = Some(std::time::Instant::now());
-            continue;
-        }
-
-        if pending_change_since
-            .map(|t| t.elapsed() < Duration::from_millis(settle_ms))
-            .unwrap_or(false)
-        {
-            continue;
-        }
+        };
 
         let mut client_changed = false;
         let mut server_changed = false;
@@ -162,7 +154,6 @@ pub(super) fn watch_project(release: bool, poll_ms: u64, settle_ms: u64) -> Resu
             if let Err(err) = build_project(release, &BuildTarget::Client, false) {
                 eprintln!("⚠️ Client rebuild failed: {err}");
                 baseline = next;
-                pending_change_since = None;
                 continue;
             }
         } else if server_changed {
@@ -177,7 +168,6 @@ pub(super) fn watch_project(release: bool, poll_ms: u64, settle_ms: u64) -> Resu
             if let Err(err) = build_project(release, &target, false) {
                 eprintln!("⚠️ Rebuild failed: {err}");
                 baseline = next;
-                pending_change_since = None;
                 continue;
             }
             child.replace(spawn_frontend(&project, release)?);
@@ -188,7 +178,55 @@ pub(super) fn watch_project(release: bool, poll_ms: u64, settle_ms: u64) -> Resu
 
         write_hmr_signal_file(&project)?;
         baseline = next;
-        pending_change_since = None;
+    }
+}
+
+/// Debounce for the watch loop: a change is acted on only once the tree has
+/// stopped changing for `settle`.
+///
+/// Every poll that sees a *different* snapshot from the previous one restarts
+/// the quiet period. Before 0.6.0 the timer started at the first change and
+/// was never refreshed, so it was a fixed delay rather than a debounce: a save
+/// burst longer than `settle_ms` (a formatter, a branch switch) triggered a
+/// rebuild mid-burst and then another for the rest of it.
+struct ChangeDebouncer<T> {
+    /// The latest changed snapshot and when it was first seen unchanged-since.
+    pending: Option<(T, std::time::Instant)>,
+}
+
+impl<T: PartialEq> ChangeDebouncer<T> {
+    fn new() -> Self {
+        Self { pending: None }
+    }
+
+    /// Feed one poll. Returns the snapshot to rebuild from once it has been
+    /// stable for `settle`, and `None` while there is nothing to do or the
+    /// tree is still moving.
+    fn observe(
+        &mut self,
+        baseline: &T,
+        next: T,
+        now: std::time::Instant,
+        settle: Duration,
+    ) -> Option<T> {
+        if &next == baseline {
+            // Changed and changed back: nothing to rebuild.
+            self.pending = None;
+            return None;
+        }
+        match &self.pending {
+            Some((last, since)) if *last == next => {
+                if now.duration_since(*since) >= settle {
+                    self.pending.take().map(|(snapshot, _)| snapshot)
+                } else {
+                    None
+                }
+            }
+            _ => {
+                self.pending = Some((next, now));
+                None
+            }
+        }
     }
 }
 
@@ -321,7 +359,7 @@ pub(super) fn generate_docs(out: &PathBuf) -> Result<()> {
     );
     command_matrix.insert(
         "krab doctor [--diagnostics] [--strict] [--json]".to_string(),
-        "Run aggregated workspace health checks for project model, env policy, service config, and topology. Checks that do not apply to this project are reported SKIP, not OK".to_string(),
+        "Run aggregated workspace health checks for project model, env policy, service config, and topology. Checks that do not apply to this project are reported SKIP, not OK. Loads `./.env` first; variables already exported win".to_string(),
     );
     command_matrix.insert(
         // Comma-separated, not `a|b|c`: this string lands in a Markdown table
@@ -334,8 +372,16 @@ pub(super) fn generate_docs(out: &PathBuf) -> Result<()> {
         "Run local dependency governance gate with cargo-deny (CI parity)".to_string(),
     );
     command_matrix.insert(
+        "krab env-check [--strict] [--json]".to_string(),
+        "Check the environment policy (auth mode, OIDC settings, environment name). Like `krab doctor`, loads `./.env` first without overriding exported variables".to_string(),
+    );
+    command_matrix.insert(
         "krab release certify [--out <dir>] [--diagnostics] [--json]".to_string(),
-        "Run release gates and write a structured evidence bundle".to_string(),
+        "Run release gates and write a structured evidence bundle (default `<artifact root>/release-certify/local`). Framework checkout only: refuses to run in a generated project".to_string(),
+    );
+    command_matrix.insert(
+        "krab gen service <name> --type <rest, graphql, rpc, grpc> [--exposure-mode single, multi] [--path-deps <krab checkout>]".to_string(),
+        "Scaffold a standalone service crate; `--path-deps` points its `krab_core` dependency at a local checkout instead of crates.io".to_string(),
     );
     command_matrix.insert(
         "krab topology doctor [--diagnostics] [--json]".to_string(),
@@ -359,7 +405,7 @@ pub(super) fn generate_docs(out: &PathBuf) -> Result<()> {
         project.client_crate_dir.as_deref(),
     ) {
         (Some(package), Some(dir)) => format!(
-            "## Client/WASM Build\n\n- Client package: `{package}`\n- Crate directory: `{}`\n\n`krab build --client --release` runs:\n\n```sh\nwasm-pack build --release --target web --out-dir {}{}\n```\n\n`#[island]` compiles its hydrating half only under `feature = \"web\"`. A bundle built without it still loads and still exports `hydrate` — it just does nothing, at roughly a tenth of the size, with no error anywhere. The CLI passes the feature whenever the client crate's manifest declares it.\n\n",
+            "## Client/WASM Build\n\n- Client package: `{package}`\n- Crate directory: `{}`\n\n`krab build --target client --release` runs:\n\n```sh\nwasm-pack build --release --target web --out-dir {}{}\n```\n\n`#[island]` compiles its hydrating half only under `feature = \"web\"`. A bundle built without it still loads and still exports `hydrate` — it just does nothing, at roughly a tenth of the size, with no error anywhere. The CLI passes the feature whenever the client crate's manifest declares it.\n\n",
             dir.display(),
             project.dist_dir.display(),
             if client_web_feature(dir) {
@@ -372,7 +418,7 @@ pub(super) fn generate_docs(out: &PathBuf) -> Result<()> {
     };
 
     let content = format!(
-        "# Dev Workflow and Build Outputs\n\n## Project Model\n\n- Frontend bin: `{}`\n- Bootstrap bin: `{}`\n- Public dir: `{}`\n- Dist dir: `{}`\n- Watch roots: {:?}\n\n## CLI Commands\n\n`--diagnostics` and `--json` are global: they may be given before or after the subcommand, and are listed below only on the commands that act on them. `--json` changes what is printed, never the exit status.\n\n| Command | Description |\n|---|---|\n{}\n{}## Asset Fingerprinting\n\nWhen a client/WASM package is configured, the CLI fingerprints browser assets and writes `{}/assets.json`.\n\n## Watch/HMR Workflow\n\n`krab dev --watch` (or `krab watch`) performs incremental change detection over the configured watch roots, rebuilds only the necessary targets, mirrors changed public assets, and writes a lightweight HMR signal file at `{}`.\n\n## Bootstrap Health Semantics\n\n`krab bootstrap` starts services in dependency order, waits on each startup readiness probe before proceeding, and applies restart policy backoff/attempt limits from `krab.toml`. Use `/ready` for readiness probes and `/health` for liveness checks. Service stdout/stderr are captured with stable `[service::stream]` prefixes and written to `internal/audit/orchestrator/` for artifact collection.\n",
+        "# Dev Workflow and Build Outputs\n\n## Project Model\n\n- Frontend bin: `{}`\n- Bootstrap bin: `{}`\n- Public dir: `{}`\n- Dist dir: `{}`\n- Watch roots: {:?}\n\n## CLI Commands\n\n`--diagnostics` and `--json` are global: they may be given before or after the subcommand, and are listed below only on the commands that act on them. `--json` changes what is printed, never the exit status.\n\n| Command | Description |\n|---|---|\n{}\n{}## Asset Fingerprinting\n\nWhen a client/WASM package is configured, the CLI fingerprints browser assets and writes `{}/assets.json`.\n\n## Watch/HMR Workflow\n\n`krab dev --watch` (or `krab watch`) performs incremental change detection over the configured watch roots, rebuilds only the necessary targets, mirrors changed public assets, and writes a lightweight HMR signal file at `{}`.\n\n## Bootstrap Health Semantics\n\n`krab bootstrap` starts services in dependency order, waits on each startup readiness probe before proceeding, and applies restart policy backoff/attempt limits from `krab.toml`. Use `/ready` for readiness probes and `/health` for liveness checks. Service stdout/stderr are captured with stable `[service::stream]` prefixes and written to `<artifact root>/orchestrator/` for artifact collection.\n\n## Artifact Root\n\nCommands that write generated artifacts without an explicit `--out` (`krab db rehearsal`, `krab release certify`) and the orchestrator's service logs share one root:\n\n1. `KRAB_ARTIFACT_DIR`, when set to a non-empty value;\n2. otherwise `internal/audit/`, when that directory exists in the working directory. This fallback is deprecated, prints a warning, and is removed in 0.7.0;\n3. otherwise `.krab/`, which `krab new` adds to the generated `.gitignore`.\n\n## Framework-Only Governance Commands\n\n`krab contract check`, `krab contract protocol-check`, `krab db lifecycle`, `krab db rollback`, `krab db drift`, `krab db rehearsal`, `krab release check` and `krab release certify` validate the Krab framework's own reference services. They run only in a Krab framework checkout, recognised by `crates/framework/krab_core` being a `[workspace] members` entry of `./Cargo.toml` (and existing on disk). Anywhere else they exit non-zero with one message pointing at `cargo test`, `krab doctor --strict`, `krab topology doctor` and `krab security dependency-gate`, which work in any project.\n",
         project.frontend_bin,
         project.bootstrap_bin,
         project.public_dir.display(),
@@ -606,7 +652,7 @@ fn build_client_target(
 /// enabling it for a native build would not compile).
 ///
 /// The flag is passed only when the manifest declares the feature. Passing it
-/// unconditionally would turn `krab build --client` into a hard failure
+/// unconditionally would turn `krab build --target client` into a hard failure
 /// ("does not have the feature `web`") for every client crate that gates its
 /// browser half on something else, or on nothing at all.
 ///
@@ -907,10 +953,11 @@ fn fingerprint_assets(out_dir: &Path, artifact_stem: Option<&str>) -> Result<()>
             .and_then(|v| v.to_str())
             .unwrap_or("asset");
 
-        let output_name = format!("{}.{}.{}", stem, &digest[..8], ext);
+        let output_name = format!("{}.{}.{}", stem, &digest[..FINGERPRINT_HEX_LEN], ext);
         let output = out_dir.join(&output_name);
         fs::copy(&input, &output)
             .with_context(|| format!("Failed to copy {:?} -> {:?}", input, output))?;
+        prune_stale_fingerprinted_copies(out_dir, stem, ext, &output_name)?;
 
         manifest_entries.push(format!(
             "\"{}\":{{\"source\":\"{}\",\"fingerprinted\":\"{}\"}}",
@@ -921,6 +968,64 @@ fn fingerprint_assets(out_dir: &Path, artifact_stem: Option<&str>) -> Result<()>
     let manifest = format!("{{{}}}\n", manifest_entries.join(","));
     fs::write(out_dir.join("assets.json"), manifest).context("Failed to write assets.json")?;
 
+    Ok(())
+}
+
+/// Width of the digest prefix in a fingerprinted file name.
+const FINGERPRINT_HEX_LEN: usize = 8;
+
+/// Whether `file_name` is a fingerprinted copy of `<stem>.<ext>`: exactly
+/// `<stem>.<8 lowercase hex>.<ext>`.
+///
+/// Exact, not a prefix match: `demo_client.js` and `demo_client_bg.wasm` share
+/// a prefix, and a looser rule would let pruning one delete the other.
+fn is_fingerprinted_copy(file_name: &str, stem: &str, ext: &str) -> bool {
+    file_name
+        .strip_prefix(stem)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .and_then(|rest| rest.strip_suffix(ext))
+        .and_then(|rest| rest.strip_suffix('.'))
+        .is_some_and(|digest| {
+            digest.len() == FINGERPRINT_HEX_LEN
+                && digest
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        })
+}
+
+/// Delete earlier fingerprinted copies of one asset, keeping `keep`.
+///
+/// Every content change used to add another `<stem>.<digest>.<ext>` to
+/// `dist/` and nothing ever removed one, so a long `krab dev --watch` session
+/// accumulated a copy of the WASM bundle per rebuild — and a container image
+/// built from `dist/` shipped all of them. Only `assets.json`'s current entry
+/// is ever served, so every other hashed copy of the same stem is garbage.
+fn prune_stale_fingerprinted_copies(
+    out_dir: &Path,
+    stem: &str,
+    ext: &str,
+    keep: &str,
+) -> Result<()> {
+    for entry in fs::read_dir(out_dir)
+        .with_context(|| format!("Failed to read directory {}", out_dir.display()))?
+    {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if file_name != keep
+            && is_fingerprinted_copy(file_name, stem, ext)
+            && entry.file_type()?.is_file()
+        {
+            fs::remove_file(entry.path()).with_context(|| {
+                format!(
+                    "Failed to remove stale fingerprinted asset {}",
+                    entry.path().display()
+                )
+            })?;
+        }
+    }
     Ok(())
 }
 
@@ -1015,9 +1120,47 @@ struct PublicAssetManifest {
 
 #[cfg(test)]
 mod tests {
+    use super::ChangeDebouncer;
+
+    #[test]
+    fn debouncer_waits_for_quiet_and_restarts_on_every_change() {
+        let settle = std::time::Duration::from_millis(100);
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| t0 + std::time::Duration::from_millis(ms);
+        let mut d = ChangeDebouncer::new();
+
+        assert_eq!(d.observe(&0, 0, at(0), settle), None, "no change");
+        assert_eq!(
+            d.observe(&0, 1, at(10), settle),
+            None,
+            "first sight starts the timer"
+        );
+        assert_eq!(d.observe(&0, 1, at(60), settle), None, "not yet settled");
+        // A further change inside the window restarts the quiet period —
+        // the old fixed-delay loop would have rebuilt at 110 regardless.
+        assert_eq!(d.observe(&0, 2, at(90), settle), None);
+        assert_eq!(d.observe(&0, 2, at(150), settle), None, "only 60ms quiet");
+        assert_eq!(d.observe(&0, 2, at(190), settle), Some(2), "100ms quiet");
+        // Consumed: the next poll starts fresh.
+        assert_eq!(d.observe(&2, 2, at(200), settle), None);
+    }
+
+    #[test]
+    fn debouncer_forgets_a_change_that_was_reverted() {
+        let settle = std::time::Duration::from_millis(100);
+        let t0 = std::time::Instant::now();
+        let mut d = ChangeDebouncer::new();
+        assert_eq!(d.observe(&0, 1, t0, settle), None);
+        assert_eq!(d.observe(&0, 0, t0 + settle, settle), None);
+        assert_eq!(
+            d.observe(&0, 1, t0 + settle * 2, settle),
+            None,
+            "a fresh change starts a fresh timer"
+        );
+    }
     use super::{
         asset_content_digest, classify_path_change, client_web_feature, fingerprint_assets,
-        normalize_relative_path, FrontendChildGuard, ProjectModel,
+        is_fingerprinted_copy, normalize_relative_path, FrontendChildGuard, ProjectModel,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -1026,7 +1169,7 @@ mod tests {
 
     /// The bug this guards: a client bundle built without `web` still links and
     /// still loads, it just does nothing. Detecting the feature from the
-    /// manifest is what stops `krab build --client` from shipping that.
+    /// manifest is what stops `krab build --target client` from shipping that.
     #[test]
     fn the_web_feature_is_detected_from_the_client_manifest() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -1154,6 +1297,75 @@ mod tests {
             parsed["demo_client_bg.wasm"]["source"],
             "demo_client_bg.wasm"
         );
+    }
+
+    /// Every rebuild with different bytes used to add another hashed copy to
+    /// `dist/` and never remove the last one.
+    #[test]
+    fn fingerprinting_prunes_the_previous_hashed_copy_of_the_same_asset() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let js = dir.path().join("demo_client.js");
+        let wasm = dir.path().join("demo_client_bg.wasm");
+        fs::write(&wasm, b"\0asm\x01").expect("write wasm");
+
+        fs::write(&js, b"console.log(1);").expect("write js v1");
+        fingerprint_assets(dir.path(), Some("demo_client")).expect("fingerprint v1");
+        let v1 = format!(
+            "demo_client.{}.js",
+            &asset_content_digest(b"console.log(1);")[..8]
+        );
+        assert!(dir.path().join(&v1).exists());
+
+        // Files that merely look related must survive: the unhashed source,
+        // another asset's hashed copy, a different stem, and a name whose
+        // "digest" is not eight hex characters.
+        let bystanders = [
+            "other.0123abcd.js",
+            "demo_client.notahash.js",
+            "demo_client.0123abcd.css",
+        ];
+        for name in bystanders {
+            fs::write(dir.path().join(name), b"x").expect("write bystander");
+        }
+
+        fs::write(&js, b"console.log(2);").expect("write js v2");
+        fingerprint_assets(dir.path(), Some("demo_client")).expect("fingerprint v2");
+        let v2 = format!(
+            "demo_client.{}.js",
+            &asset_content_digest(b"console.log(2);")[..8]
+        );
+
+        assert!(dir.path().join(&v2).exists(), "the new copy is written");
+        assert!(!dir.path().join(&v1).exists(), "the stale copy is pruned");
+        assert!(js.exists(), "the unhashed source is never pruned");
+        let wasm_copy = format!(
+            "demo_client_bg.{}.wasm",
+            &asset_content_digest(b"\0asm\x01")[..8]
+        );
+        assert!(
+            dir.path().join(&wasm_copy).exists(),
+            "pruning one asset must not touch another's current copy"
+        );
+        for name in bystanders {
+            assert!(dir.path().join(name).exists(), "{name} was removed");
+        }
+
+        let hashed_js: Vec<String> = fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|name| is_fingerprinted_copy(name, "demo_client", "js"))
+            .collect();
+        assert_eq!(hashed_js, vec![v2]);
+    }
+
+    #[test]
+    fn fingerprinted_copy_matching_is_exact() {
+        assert!(is_fingerprinted_copy("app.0123abcd.js", "app", "js"));
+        assert!(!is_fingerprinted_copy("app.0123ABCD.js", "app", "js"));
+        assert!(!is_fingerprinted_copy("app.0123abc.js", "app", "js"));
+        assert!(!is_fingerprinted_copy("app_bg.0123abcd.js", "app", "js"));
+        assert!(!is_fingerprinted_copy("app.0123abcd.wasm", "app", "js"));
+        assert!(!is_fingerprinted_copy("app.js", "app", "js"));
     }
 
     /// A cheap long-lived process, portable across the platforms CI runs on.

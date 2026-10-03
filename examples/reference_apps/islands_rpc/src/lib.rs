@@ -13,6 +13,8 @@
 //! - [`TaskCounter`] and [`TaskFilter`] are two `#[island]` components with
 //!   distinct props, server-rendered with hydration markers and hydrated in the
 //!   browser.
+//! - [`task_countdown`] is a `#[server(stream)]` function: server-sent events
+//!   on the server, a `ServerEventStream` in the browser.
 //! - [`add_task`] is a `#[server]` function mounted at `/api/rpc/add_task`,
 //!   called from `TaskCounter`'s click handler.
 //! - `krab_boot` hydrates and then starts the **client router**, and
@@ -79,6 +81,25 @@ pub async fn add_task(title: String) -> Result<TaskSummary, ServerFnError> {
 /// Longest accepted task title.
 pub const MAX_TITLE_CHARS: usize = 80;
 
+/// Stream a countdown from `from` (capped at 10) as server-sent `tick` events.
+///
+/// A `#[server(stream)]` function. On the server it returns an SSE stream,
+/// mounted at `POST /api/rpc/task_countdown`; in the browser the same call
+/// returns a `krab_core::server_fn::ServerEventStream` to read events from.
+/// It is here so CI compiles both halves of a streaming server function —
+/// until 0.6.0 the browser half did not compile at all.
+#[server(stream)]
+pub async fn task_countdown(
+    from: u32,
+) -> impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>
+{
+    futures_util::stream::iter((0..=from.min(10)).rev().map(|n| {
+        Ok(axum::response::sse::Event::default()
+            .event("tick")
+            .data(n.to_string()))
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Islands
 // ---------------------------------------------------------------------------
@@ -100,7 +121,7 @@ pub struct TaskCounterProps {
 pub fn TaskCounter(props: TaskCounterProps) -> Node {
     // The setter is only read inside the `on:click` closure, which `view!`
     // compiles under `feature = "web"` alone — hence the underscore, matching
-    // the convention in `krab_client::components`.
+    // the convention in `services/service_frontend_islands`.
     let (count, _set_count) = create_signal(props.initial);
     let label = props.label.clone();
 
@@ -199,9 +220,16 @@ pub fn krab_boot() {
 
 /// The module script that calls [`krab_boot`].
 ///
-/// Emitted as a text child of a `<script>` element, so it must survive
-/// `krab_core`'s text escaping unchanged: no `<`, `>`, or `&`. That rules out
-/// arrow functions and `&&`, which is why it reads the way it does.
+/// Emitted as a text child of a `<script>` element. Since 0.6.0 `view!` renders
+/// `<script>` children as raw text — not entity-escaped, with only `</script`
+/// and `<!--` neutralised — so arrow functions and `&&` would survive too; the
+/// `function` form is kept from when they did not.
+///
+/// This is an **inline** script, which Krab's CSP (`script-src 'self'
+/// 'wasm-unsafe-eval'`, sent by `krab_core`'s common HTTP layers) blocks. The
+/// example's server does not apply those layers, so it hydrates; an app that
+/// does must serve this bootstrap as a same-origin module file instead, as the
+/// reference frontend does with `/_krab/home.js`.
 const BOOT_SCRIPT: &str = "import init, { krab_boot } from '/pkg/reference_app_islands_rpc.js';\n\
      init().then(function () { krab_boot(); });";
 

@@ -1,0 +1,15 @@
+error: <Suspense> requires `fallback`, a closure rendering what to show while
+         the resources inside it load.
+         Example:
+         <Suspense fallback={|| view! { <p>"Loading…"</p> }}>...</Suspense>
+  --> tests/compile_fail/suspense_missing_fallback.rs:7:13
+   |
+ 7 |       let _ = view! {
+   |  _____________^
+ 8 | |         <Suspense>
+ 9 | |             <p>"content"</p>
+10 | |         </Suspense>
+11 | |     }
+   | |_____^
+   |
+   = note: this error originates in the macro `view` (in Nightly builds, run with -Z macro-backtrace for more info)

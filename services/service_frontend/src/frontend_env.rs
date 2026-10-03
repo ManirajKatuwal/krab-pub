@@ -109,16 +109,39 @@ pub(crate) fn hydration_budget_for_route(path: &str, mode: HydrationMode) -> Rou
     }
 }
 
-pub(crate) fn hydration_preload_links_html(budget: &RouteHydrationBudget) -> String {
+/// Preload hints for the client bundle, and — when the bundle's digest is
+/// known — its integrity pinned on the module preload.
+///
+/// `integrity` is the `sha256-…` digest of the bundle this process can read.
+/// With it, the browser itself refuses to evaluate `/pkg/service_frontend_islands.js`
+/// unless its bytes match: the import map's `integrity` entry covers the
+/// dynamic `import()` the hydration script makes, and the `modulepreload`
+/// carries the same value. Before 0.6.0 the only check was the page's own
+/// script testing that the manifest's integrity string *started with*
+/// `sha256-`, and the module was imported unverified.
+pub(crate) fn hydration_preload_links_html(
+    budget: &RouteHydrationBudget,
+    integrity: Option<&str>,
+) -> String {
     if budget.island_count_hint == 0 || budget.mode != "wasm" {
         return String::new();
     }
 
-    [
-        "<link rel=\"modulepreload\" href=\"/pkg/krab_client.js\" fetchpriority=\"high\" />",
-        "<link rel=\"preload\" as=\"fetch\" type=\"application/wasm\" href=\"/pkg/krab_client_bg.wasm\" crossorigin=\"anonymous\" fetchpriority=\"high\" />",
-    ]
-    .join("")
+    let wasm_preload = "<link rel=\"preload\" as=\"fetch\" type=\"application/wasm\" href=\"/pkg/service_frontend_islands_bg.wasm\" crossorigin=\"anonymous\" fetchpriority=\"high\" />";
+    // The pin is on the `modulepreload`, which fetches the module into the
+    // page's module map with integrity checked; the later `import()` of the
+    // same URL is served from that entry. An inline import map with an
+    // `integrity` entry would pin the import itself too, but an import map is
+    // an inline script, and Krab's CSP (`script-src 'self'`) blocks it.
+    match integrity {
+        Some(integrity) => format!(
+            "<link rel=\"modulepreload\" href=\"/pkg/service_frontend_islands.js\" integrity=\"{integrity}\" fetchpriority=\"high\" />\
+             {wasm_preload}"
+        ),
+        None => format!(
+            "<link rel=\"modulepreload\" href=\"/pkg/service_frontend_islands.js\" fetchpriority=\"high\" />{wasm_preload}"
+        ),
+    }
 }
 
 pub(crate) fn isr_revalidate_duration() -> Duration {

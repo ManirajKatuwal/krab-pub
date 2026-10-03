@@ -23,10 +23,47 @@ pub(crate) fn canonical_url(base_url: &str, path: &str) -> String {
     format!("{}{}", base_url.trim_end_matches('/'), normalized_path)
 }
 
+/// The navigation shared by every page, rendered outside the router outlet so
+/// it survives a client-side navigation.
+///
+/// Each link is a same-origin path the client router can intercept, and each
+/// destination carries a `data-krab-router-outlet` of its own. A destination
+/// without one makes the router fall back to a full page load, which is correct
+/// but wastes the fetch it already made.
+pub(crate) fn site_nav() -> krab_core::Node {
+    view! {
+        <nav class="site-nav" aria-label="primary">
+            <a href="/">"Home"</a>
+            <a href="/about">"About"</a>
+            <a href="/greet">"Greet"</a>
+        </nav>
+    }
+}
+
+/// Wrap a page body in the shared navigation and the router outlet.
+///
+/// These pages do not load the WASM bundle themselves, so a hard load of one
+/// behaves as plain HTML. The outlet matters when the router — started on the
+/// home page — navigates *to* one: it swaps in exactly this `<main>`'s
+/// contents.
+fn with_router_outlet(body_html: &str) -> String {
+    format!(
+        "{}<main class=\"page\" data-krab-router-outlet=\"\" tabindex=\"-1\">{body_html}</main>",
+        site_nav().render()
+    )
+}
+
 fn render_seo_page(meta: SeoMeta, body_html: String) -> String {
+    let body_html = with_router_outlet(&body_html);
     let hydration_mode = HydrationMode::from_env();
     let hydration_budget = hydration_budget_for_route(&meta.path, hydration_mode);
-    let hydration_preloads = hydration_preload_links_html(&hydration_budget);
+    let bundle_digest = crate::client_bundle_digest();
+    let hydration_preloads = hydration_preload_links_html(
+        &hydration_budget,
+        bundle_digest
+            .as_deref()
+            .map(|(_, integrity)| integrity.as_str()),
+    );
 
     let base_url = normalize_public_base_url();
     let canonical = canonical_url(&base_url, &meta.path);

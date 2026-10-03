@@ -14,7 +14,7 @@
 //! server half (`rest`) and the browser half (`web` on `wasm32`) are never
 //! compiled together, so the shared names cannot live behind either gate.
 
-/// Cookie set by [`crate::http_security::csrf_token_endpoint`] and validated
+/// Cookie set by `http_security::csrf_token_endpoint` (feature `rest`) and validated
 /// by `csrf_protection_middleware`. `HttpOnly`, so it is deliberately
 /// unreadable from `document.cookie`.
 pub const CSRF_COOKIE_NAME: &str = "krab_csrf_token";

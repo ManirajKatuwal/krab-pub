@@ -16,7 +16,7 @@ use krab_core::http::{
 };
 use krab_core::protocol::{ProtocolConfig, ProtocolKind};
 use krab_core::service::{serve_with_graceful_shutdown, ApiService, ServiceConfig};
-use krab_core::telemetry::init_tracing;
+use krab_core::telemetry::init_tracing_with_version;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -40,6 +40,31 @@ struct AppState {
     /// re-parsing the credential map per request would add that cost to every
     /// login on top of the hashing itself.
     credentials: Arc<EnvHashCredentialStore>,
+    /// Issuer, audience and TTLs, read once. Every login, refresh and revoke
+    /// used to re-read these from the environment.
+    signing: Arc<SigningConfig>,
+    /// The signing key ring, loaded once — including any `*_FILE` read. `Err`
+    /// holds why it could not be loaded; the handlers that need it answer 503.
+    /// It was re-read (files included) on every token request.
+    key_ring: Arc<std::result::Result<KeyRing, String>>,
+}
+
+impl AppState {
+    fn new(runtime: RuntimeState, credentials: Arc<EnvHashCredentialStore>) -> Self {
+        Self {
+            runtime,
+            credentials,
+            signing: Arc::new(signing_config_from_env()),
+            key_ring: Arc::new(key_ring_from_env().map_err(|err| format!("{err:#}"))),
+        }
+    }
+
+    fn key_ring(&self) -> Result<&KeyRing> {
+        self.key_ring
+            .as_ref()
+            .as_ref()
+            .map_err(|err| anyhow::anyhow!("{err}"))
+    }
 }
 
 #[derive(Clone)]
@@ -323,14 +348,15 @@ fn decode_with_key_ring(
 }
 
 async fn issue_token_pair(
-    runtime: &RuntimeState,
+    state: &AppState,
     subject: &str,
     tenant_id: Option<String>,
     scopes: Vec<String>,
     roles: Vec<String>,
 ) -> Result<TokenPair> {
-    let cfg = signing_config_from_env();
-    let key_ring = key_ring_from_env()?;
+    let runtime = &state.runtime;
+    let cfg = &*state.signing;
+    let key_ring = state.key_ring()?;
     let secret = key_ring
         .keys
         .get(&key_ring.active_kid)
@@ -397,7 +423,7 @@ async fn issue_token_pair(
         refresh_token,
         expires_in: cfg.access_ttl_secs,
         refresh_expires_in: cfg.refresh_ttl_secs,
-        kid: key_ring.active_kid,
+        kid: key_ring.active_kid.clone(),
     })
 }
 
@@ -430,7 +456,7 @@ async fn login_handler(
     }
 
     match issue_token_pair(
-        &state.runtime,
+        &state,
         payload.username.trim(),
         payload.tenant_id,
         payload.scopes,
@@ -450,15 +476,15 @@ async fn refresh_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     Json(payload): Json<RefreshRequest>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
-    let cfg = signing_config_from_env();
-    let Ok(key_ring) = key_ring_from_env() else {
+    let cfg = &*state.signing;
+    let Ok(key_ring) = state.key_ring() else {
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error":"signing_keys_unavailable"})),
         );
     };
 
-    let Ok(claims) = decode_with_key_ring(&payload.refresh_token, &key_ring, &cfg) else {
+    let Ok(claims) = decode_with_key_ring(&payload.refresh_token, key_ring, cfg) else {
         return (
             axum::http::StatusCode::UNAUTHORIZED,
             Json(json!({"error":"invalid_refresh_token"})),
@@ -525,15 +551,7 @@ async fn refresh_handler(
         .split_whitespace()
         .map(|v| v.to_string())
         .collect::<Vec<String>>();
-    match issue_token_pair(
-        &state.runtime,
-        &claims.sub,
-        claims.tenant_id,
-        scopes,
-        claims.roles,
-    )
-    .await
-    {
+    match issue_token_pair(&state, &claims.sub, claims.tenant_id, scopes, claims.roles).await {
         Ok(pair) => (axum::http::StatusCode::OK, Json(json!(pair))),
         Err(err) => (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -546,15 +564,15 @@ async fn revoke_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     Json(payload): Json<RevokeRequest>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
-    let cfg = signing_config_from_env();
-    let Ok(key_ring) = key_ring_from_env() else {
+    let cfg = &*state.signing;
+    let Ok(key_ring) = state.key_ring() else {
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error":"signing_keys_unavailable"})),
         );
     };
 
-    let Ok(claims) = decode_with_key_ring(&payload.token, &key_ring, &cfg) else {
+    let Ok(claims) = decode_with_key_ring(&payload.token, key_ring, cfg) else {
         return (
             axum::http::StatusCode::UNAUTHORIZED,
             Json(json!({"error":"invalid_token"})),
@@ -594,8 +612,10 @@ async fn revoke_handler(
     )
 }
 
-async fn jwks_handler() -> (axum::http::StatusCode, Json<serde_json::Value>) {
-    match key_ring_from_env() {
+async fn jwks_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    match state.key_ring() {
         Ok(keys) => {
             let payload = keys
                 .keys
@@ -617,8 +637,10 @@ async fn jwks_handler() -> (axum::http::StatusCode, Json<serde_json::Value>) {
     }
 }
 
-async fn auth_status_handler() -> (axum::http::StatusCode, Json<serde_json::Value>) {
-    match key_ring_from_env() {
+async fn auth_status_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    match state.key_ring() {
         Ok(keys) => (
             axum::http::StatusCode::OK,
             Json(json!({
@@ -683,18 +705,32 @@ fn build_app(state: AppState) -> Router {
     apply_common_http_layers(app, state.clone()).with_state(state)
 }
 
+/// The endpoints a caller reaches before it holds a token. Declared by the
+/// service rather than inherited from the framework's default open-path list,
+/// whose application entries are deprecated (removed in 0.7.0).
+const AUTH_PUBLIC_PATHS: &[&str] = &[
+    "/api/v1/auth/login",
+    "/api/v1/auth/refresh",
+    "/api/v1/auth/revoke",
+    "/api/v1/auth/jwks",
+    "/api/v1/auth/capabilities",
+    "/api/v1/auth/status",
+];
+
 #[async_trait]
 impl ApiService for AuthService {
     async fn start(&self) -> Result<()> {
-        let state = AppState {
-            runtime: RuntimeState::try_new()?.with_protocol_config(
-                self.config
-                    .protocol
-                    .clone()
-                    .unwrap_or_else(ProtocolConfig::from_env),
-            ),
-            credentials: Arc::clone(&self.credentials),
-        };
+        let state = AppState::new(
+            RuntimeState::try_new()?
+                .with_protocol_config(
+                    self.config
+                        .protocol
+                        .clone()
+                        .unwrap_or_else(ProtocolConfig::from_env),
+                )
+                .with_public_paths(AUTH_PUBLIC_PATHS.iter().copied()),
+            Arc::clone(&self.credentials),
+        );
 
         let app = build_app(state);
 
@@ -829,7 +865,7 @@ fn bootstrap_auth_service() -> Result<AuthService> {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    init_tracing("service_auth");
+    init_tracing_with_version("service_auth", env!("CARGO_PKG_VERSION"));
 
     let service = bootstrap_auth_service()?;
     service.start().await
@@ -870,10 +906,7 @@ mod tests {
     fn test_app() -> Router {
         std::env::set_var("KRAB_AUTH_MODE", "static");
         std::env::set_var("KRAB_BEARER_TOKEN", TEST_BEARER_TOKEN);
-        build_app(AppState {
-            runtime: RuntimeState::new(),
-            credentials: test_credential_store(),
-        })
+        build_app(AppState::new(RuntimeState::new(), test_credential_store()))
     }
 
     async fn login_status(username: &str, password: &str) -> StatusCode {

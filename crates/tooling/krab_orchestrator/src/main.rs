@@ -1,10 +1,13 @@
 use anyhow::Result;
-use krab_core::telemetry::init_tracing;
+use krab_core::telemetry::init_tracing_with_version;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
+mod artifact_root;
 mod configuration;
+#[cfg(windows)]
+mod job_object;
 mod process_runtime;
 mod watch_runtime;
 
@@ -80,7 +83,7 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing("krab_orchestrator");
+    init_tracing_with_version("krab_orchestrator", env!("CARGO_PKG_VERSION"));
 
     info!("Starting Krab Orchestrator...");
 
@@ -196,6 +199,11 @@ async fn run_supervisor(config: KrabConfig) -> Result<()> {
                 maybe_event = runtime.rx.recv() => {
                     match maybe_event {
                         Some(Ok(event)) => {
+                            if event.paths.iter().all(|p| watch_runtime::is_ignored_watch_path(p)) {
+                                // Editor swap/backup files and build output: not a
+                                // source change.
+                                continue;
+                            }
                             info!(kind = ?event.kind, paths = ?event.paths, "watch_event_received");
                             pending_restart = true;
                             restart_deadline = Some(Instant::now() + settle);

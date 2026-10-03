@@ -52,11 +52,15 @@ jobs:
 
       # The runtime is identified by a string only the real build contains. A
       # stub is ~15 KB and passes every byte-size threshold below, so size alone
-      # cannot tell the two apart — this can.
+      # cannot tell the two apart — this can. `data-krab-boundary-state` is the
+      # attribute the hydration walk stamps on every boundary; it is compiled
+      # only under `web`. (Until 0.6.0 this grepped for "Hydrating island", a
+      # log line compiled only under the `debug` feature, so the check failed
+      # against every correct release build.)
       - name: Verify the bundle contains the hydration runtime
         run: |
           WASM_FILE=$(ls dist/pkg/*.wasm | head -n1)
-          if ! grep -qa "Hydrating island" "$WASM_FILE"; then
+          if ! grep -qa "data-krab-boundary-state" "$WASM_FILE"; then
             echo "❌ $WASM_FILE has no hydration runtime — this is a stub build"
             exit 1
           fi

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -156,6 +156,14 @@ pub(crate) fn topology_doctor_report_at(root: &Path) -> Result<TopologyDoctorRep
 
         for (line_idx, line) in raw.lines().enumerate() {
             if let Some(target) = parse_direct_service_import(line) {
+                // Only a crate that runs as its own process is a service
+                // boundary. A library under `services/` — such as
+                // `service_frontend_islands`, the islands one service renders
+                // and ships as its wasm bundle — is that service's own code,
+                // and importing it crosses no network boundary.
+                if !is_service_process_crate(&services_dir, &target) {
+                    continue;
+                }
                 if owner
                     .as_ref()
                     .map(|service| service != &target)
@@ -393,9 +401,17 @@ fn run_topology_split(
         ));
     }
 
-    let mut hasher = DefaultHasher::new();
-    service_crate.hash(&mut hasher);
-    let port = 3200 + (hasher.finish() % 300) as u16;
+    let used_ports = match fs::read_to_string("krab.toml") {
+        Ok(raw) => ports_declared_in_krab_toml(&raw),
+        Err(_) => BTreeSet::new(),
+    };
+    let preferred = preferred_split_port(&service_crate);
+    let port = choose_split_port(preferred, &used_ports)?;
+    if port != preferred {
+        println!(
+            "   > port {preferred} is already used by a service in krab.toml; using {port} instead"
+        );
+    }
 
     let cargo_toml = format!(
         "[package]\nname = \"{service_crate}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nanyhow.workspace = true\naxum.workspace = true\ntokio.workspace = true\ntracing.workspace = true\ntracing-subscriber.workspace = true\nserde.workspace = true\nserde_json.workspace = true\n"
@@ -537,33 +553,339 @@ fn resolved_split_protocols(protocols: &Option<Vec<ServiceType>>) -> Vec<Service
     deduped
 }
 
+/// The range split-service ports are drawn from: `3200..SPLIT_PORT_END`.
+const SPLIT_PORT_START: u16 = 3200;
+const SPLIT_PORT_END: u16 = 3500;
+
+/// The port a split service asks for first: a stable hash of its crate name
+/// into the split range, so re-running the scaffold proposes the same port.
+///
+/// `DefaultHasher` only has to be stable within one binary here — the chosen
+/// port is written into the generated files, never recomputed later.
+fn preferred_split_port(service_crate: &str) -> u16 {
+    let mut hasher = DefaultHasher::new();
+    service_crate.hash(&mut hasher);
+    let span = u64::from(SPLIT_PORT_END - SPLIT_PORT_START);
+    SPLIT_PORT_START + (hasher.finish() % span) as u16
+}
+
+/// Every port a `krab.toml` already assigns: `port` keys, `KRAB_PORT` in a
+/// service's `env`, and the port of its health-check URL.
+///
+/// The health-check URL counts because a service's probe is what the
+/// orchestrator treats as the service; a new service bound to that port would
+/// answer its neighbour's readiness checks. An unparseable manifest yields no
+/// ports — `krab topology doctor` reports it, and this only steers a default.
+fn ports_declared_in_krab_toml(raw: &str) -> BTreeSet<u16> {
+    let mut ports = BTreeSet::new();
+    let Ok(parsed) = toml::from_str::<toml::Value>(raw) else {
+        return ports;
+    };
+    let Some(services) = parsed.get("services").and_then(toml::Value::as_table) else {
+        return ports;
+    };
+
+    let port_of_url = |url: &str| -> Option<u16> {
+        let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+        let authority = after_scheme.split('/').next()?;
+        authority.rsplit_once(':')?.1.parse().ok()
+    };
+
+    for service in services.values().filter_map(toml::Value::as_table) {
+        if let Some(port) = service.get("port").and_then(toml::Value::as_integer) {
+            if let Ok(port) = u16::try_from(port) {
+                ports.insert(port);
+            }
+        }
+        if let Some(port) = service
+            .get("env")
+            .and_then(|env| env.get("KRAB_PORT"))
+            .and_then(|value| match value {
+                toml::Value::Integer(port) => u16::try_from(*port).ok(),
+                toml::Value::String(port) => port.trim().parse().ok(),
+                _ => None,
+            })
+        {
+            ports.insert(port);
+        }
+        let urls = [
+            service
+                .get("healthcheck")
+                .and_then(|probe| probe.get("url"))
+                .and_then(toml::Value::as_str),
+            service.get("healthcheck_url").and_then(toml::Value::as_str),
+        ];
+        for url in urls.into_iter().flatten() {
+            if let Some(port) = port_of_url(url) {
+                ports.insert(port);
+            }
+        }
+    }
+    ports
+}
+
+/// The first free port in the split range, starting at `preferred` and
+/// wrapping around.
+///
+/// The hash alone used to decide, with no probe at all, so two domains whose
+/// names hashed alike were scaffolded onto one port and the second failed to
+/// bind — or answered the first one's health checks. Only ports declared in
+/// `krab.toml` are considered: whether some unrelated process holds a port
+/// right now says nothing about the machine the service will run on.
+fn choose_split_port(preferred: u16, used: &BTreeSet<u16>) -> Result<u16> {
+    let span = SPLIT_PORT_END - SPLIT_PORT_START;
+    let offset = preferred.saturating_sub(SPLIT_PORT_START) % span;
+    (0..span)
+        .map(|step| SPLIT_PORT_START + (offset + step) % span)
+        .find(|candidate| !used.contains(candidate))
+        .with_context(|| {
+            format!(
+                "every split-service port in {SPLIT_PORT_START}..{SPLIT_PORT_END} is already \
+                 assigned in krab.toml; free one, or set a port by hand in the generated main.rs \
+                 and krab.toml"
+            )
+        })
+}
+
 fn register_workspace_member(member: &str) -> Result<()> {
     let workspace = PathBuf::from("Cargo.toml");
-    let mut raw = fs::read_to_string(&workspace)
+    let raw = fs::read_to_string(&workspace)
         .with_context(|| format!("Failed reading {}", workspace.display()))?;
-    let quoted = format!("\"{}\"", member.replace('\\', "/"));
-    if raw.contains(&quoted) {
-        return Ok(());
+    match insert_workspace_member(&raw, member)? {
+        Some(updated) => {
+            fs::write(&workspace, updated)
+                .with_context(|| format!("Failed writing {}", workspace.display()))?;
+            println!("🧩 Registered workspace member: {}", member);
+        }
+        None => println!("🧩 Workspace member already registered: {}", member),
+    }
+    Ok(())
+}
+
+/// Normalise a member path for comparison: forward slashes, no `./`, no
+/// trailing slash.
+fn normalize_member(member: &str) -> String {
+    let member = member.replace('\\', "/");
+    let member = member.strip_prefix("./").unwrap_or(&member);
+    member.trim_end_matches('/').to_string()
+}
+
+/// Byte range of the `[workspace] members` array in `raw`, from its `[` to
+/// its `]` inclusive.
+///
+/// A scanner rather than a search for `members = [` and the next `]`: that
+/// search matched a `members` key in any table, required exactly one space
+/// either side of `=`, and stopped at the first `]` even inside a string or a
+/// comment.
+fn members_array_span(raw: &str) -> Result<(usize, usize)> {
+    let mut in_workspace = false;
+    let mut offset = 0usize;
+    let mut open = None;
+    for line in raw.split_inclusive('\n') {
+        let trimmed = line.trim();
+        // A table header, possibly followed by a comment.
+        let header = trimmed.split('#').next().unwrap_or_default().trim_end();
+        if header.starts_with('[') && header.ends_with(']') {
+            in_workspace = header == "[workspace]";
+        } else if in_workspace {
+            if let Some(rest) = trimmed.strip_prefix("members") {
+                if let Some(value) = rest.trim_start().strip_prefix('=') {
+                    let value = value.trim_start();
+                    if value.starts_with('[') {
+                        let value_at =
+                            line.len() - line.trim_start().len() + trimmed.len() - value.len();
+                        open = Some(offset + value_at);
+                        break;
+                    }
+                }
+            }
+        }
+        offset += line.len();
+    }
+    let open = open.context("Cargo.toml has no `members = [...]` in its [workspace] table")?;
+
+    let bytes = raw.as_bytes();
+    let mut index = open + 1;
+    let mut in_string: Option<u8> = None;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match in_string {
+            Some(b'"') if byte == b'\\' => index += 1,
+            Some(quote) if byte == quote => in_string = None,
+            Some(_) => {}
+            None => match byte {
+                b'"' | b'\'' => in_string = Some(byte),
+                b'#' => {
+                    while index < bytes.len() && bytes[index] != b'\n' {
+                        index += 1;
+                    }
+                }
+                b']' => return Ok((open, index)),
+                _ => {}
+            },
+        }
+        index += 1;
+    }
+    anyhow::bail!("the [workspace] members array in Cargo.toml is not closed")
+}
+
+/// Add `member` to the `[workspace] members` array in `raw`, preserving the
+/// array's layout. Returns `None` when it is already a member.
+///
+/// Handles single-line and multi-line arrays, with or without a trailing
+/// comma, and keeps a comment on the last entry attached to that entry. The
+/// previous implementation inserted `    "member",\n` before the closing
+/// bracket, which produced `["a", "b"    "member",` — invalid TOML — for any
+/// array without a trailing comma. The result is parsed before it is returned,
+/// so a layout this does not understand fails here instead of corrupting the
+/// manifest.
+fn insert_workspace_member(raw: &str, member: &str) -> Result<Option<String>> {
+    let wanted = normalize_member(member);
+    let parsed: toml::Value = toml::from_str(raw).context("Cargo.toml is not valid TOML")?;
+    let already = parsed
+        .get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(toml::Value::as_array)
+        .is_some_and(|members| {
+            members
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .any(|existing| normalize_member(existing) == wanted)
+        });
+    if already {
+        return Ok(None);
     }
 
-    let members_pos = raw
-        .find("members = [")
-        .context("workspace Cargo.toml missing members array")?;
-    let list_start = raw[members_pos..]
-        .find('[')
-        .map(|idx| members_pos + idx)
-        .context("workspace members array opening bracket not found")?;
-    let list_end = raw[list_start..]
-        .find(']')
-        .map(|idx| list_start + idx)
-        .context("workspace members array closing bracket not found")?;
+    let (open, close) = members_array_span(raw)?;
+    let body = &raw[open + 1..close];
 
-    let insertion = format!("    {},\n", quoted);
-    raw.insert_str(list_end, &insertion);
-    fs::write(&workspace, raw)
-        .with_context(|| format!("Failed writing {}", workspace.display()))?;
-    println!("🧩 Registered workspace member: {}", member);
-    Ok(())
+    // End of the last value in the array (exclusive), ignoring whitespace and
+    // comments, and whether that value is followed by a comma.
+    let mut last_value_end: Option<usize> = None;
+    let mut trailing_comma = false;
+    {
+        let bytes = body.as_bytes();
+        let mut index = 0;
+        let mut in_string: Option<u8> = None;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            match in_string {
+                Some(b'"') if byte == b'\\' => index += 1,
+                Some(quote) if byte == quote => {
+                    in_string = None;
+                    last_value_end = Some(index + 1);
+                    trailing_comma = false;
+                }
+                Some(_) => {}
+                None => match byte {
+                    b'"' | b'\'' => in_string = Some(byte),
+                    b'#' => {
+                        while index < bytes.len() && bytes[index] != b'\n' {
+                            index += 1;
+                        }
+                        continue;
+                    }
+                    b',' => trailing_comma = true,
+                    byte if byte.is_ascii_whitespace() => {}
+                    _ => {
+                        last_value_end = Some(index + 1);
+                        trailing_comma = false;
+                    }
+                },
+            }
+            index += 1;
+        }
+    }
+
+    let quoted = format!("\"{wanted}\"");
+    let multi_line = body.contains('\n');
+    let mut updated = raw.to_string();
+
+    match last_value_end {
+        None if multi_line => {
+            // `members = [\n]`: one entry on its own line.
+            updated.insert_str(open + 1, &format!("\n    {quoted},"));
+        }
+        None => {
+            // `members = []`.
+            updated.replace_range(open + 1..close, &quoted);
+        }
+        Some(end) if multi_line => {
+            let value_at = open + 1 + end;
+            // Indent like the first entry, and keep the comma style the array
+            // already uses.
+            let first_entry_line = body
+                .lines()
+                .find(|line| {
+                    let line = line.trim();
+                    !line.is_empty() && !line.starts_with('#')
+                })
+                .unwrap_or("    ");
+            let indent: String = first_entry_line
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect();
+            let indent = if indent.is_empty() {
+                "    ".to_string()
+            } else {
+                indent
+            };
+            // Insert at the end of the last entry's line so a trailing comment
+            // on it stays with it.
+            let line_end = updated[value_at..]
+                .find('\n')
+                .map_or(close, |at| value_at + at);
+            let line_end = line_end.min(close);
+            // Strip a `\r` so a CRLF manifest keeps one line-ending style.
+            let line_end = if line_end > value_at && updated.as_bytes()[line_end - 1] == b'\r' {
+                line_end - 1
+            } else {
+                line_end
+            };
+            let eol = if raw.contains("\r\n") { "\r\n" } else { "\n" };
+            let entry = if trailing_comma {
+                format!("{eol}{indent}{quoted},")
+            } else {
+                format!("{eol}{indent}{quoted}")
+            };
+            updated.insert_str(line_end, &entry);
+            if !trailing_comma {
+                updated.insert(value_at, ',');
+            }
+        }
+        Some(end) => {
+            let value_at = open + 1 + end;
+            if trailing_comma {
+                // `["a",]` or `["a", ]`: after the comma.
+                let comma_at = updated[value_at..close]
+                    .find(',')
+                    .map_or(value_at, |at| value_at + at + 1);
+                updated.insert_str(comma_at, &format!(" {quoted},"));
+            } else {
+                updated.insert_str(value_at, &format!(", {quoted}"));
+            }
+        }
+    }
+
+    let reparsed: toml::Value = toml::from_str(&updated).context(
+        "registering the workspace member would have produced invalid TOML; add it by hand",
+    )?;
+    let registered = reparsed
+        .get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(toml::Value::as_array)
+        .is_some_and(|members| {
+            members
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .any(|existing| existing == wanted)
+        });
+    if !registered {
+        anyhow::bail!(
+            "could not register `{wanted}` in the workspace members array; add it by hand"
+        );
+    }
+    Ok(Some(updated))
 }
 
 fn register_krab_service(service_key: &str, service_crate: &str, port: u16) -> Result<()> {
@@ -601,6 +923,14 @@ fn owning_service_name(path: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether `services/<name>` builds a binary — `src/main.rs` or `src/bin/` —
+/// and so runs as a separate service. A `service_*` crate that is only a
+/// library (no binary target) is shared code, not a boundary.
+fn is_service_process_crate(services_dir: &Path, name: &str) -> bool {
+    let crate_dir = services_dir.join(name);
+    crate_dir.join("src").join("main.rs").is_file() || crate_dir.join("src").join("bin").is_dir()
 }
 
 fn parse_direct_service_import(line: &str) -> Option<String> {
@@ -772,44 +1102,63 @@ fn detect_service_config_violations(raw: &str) -> Vec<String> {
             ));
         }
 
-        let Some(healthcheck) = service_table
+        // The orchestrator accepts two spellings for health checks and restart
+        // policy: the `[services.X.healthcheck]` / `[services.X.restart_policy]`
+        // tables, and the older flat keys (`healthcheck_url`,
+        // `restart_on_exit`, ...). The doctor used to reject the flat form
+        // outright, so a krab.toml the orchestrator ran happily failed
+        // `topology doctor`. Both are validated now; the table form is the
+        // one generators emit.
+        match service_table
             .get("healthcheck")
             .and_then(toml::Value::as_table)
-        else {
-            violations.push(format!(
-                "services.{name} missing [services.{name}.healthcheck]"
-            ));
-            continue;
-        };
+        {
+            Some(healthcheck) => {
+                match healthcheck.get("url").and_then(toml::Value::as_str) {
+                    Some(url) if url.ends_with("/ready") => {}
+                    Some(url) => violations.push(format!(
+                        "services.{name}.healthcheck.url should target /ready, got `{url}`"
+                    )),
+                    None => violations.push(format!("services.{name}.healthcheck.url missing")),
+                }
 
-        match healthcheck.get("url").and_then(toml::Value::as_str) {
-            Some(url) if url.ends_with("/ready") => {}
-            Some(url) => violations.push(format!(
-                "services.{name}.healthcheck.url should target /ready, got `{url}`"
-            )),
-            None => violations.push(format!("services.{name}.healthcheck.url missing")),
-        }
-
-        for field in ["timeout_ms", "retries", "interval_ms"] {
-            if !healthcheck.contains_key(field) {
-                violations.push(format!("services.{name}.healthcheck.{field} missing"));
+                for field in ["timeout_ms", "retries", "interval_ms"] {
+                    if !healthcheck.contains_key(field) {
+                        violations.push(format!("services.{name}.healthcheck.{field} missing"));
+                    }
+                }
             }
+            None => match service_table
+                .get("healthcheck_url")
+                .and_then(toml::Value::as_str)
+            {
+                Some(url) if url.ends_with("/ready") => {}
+                Some(url) => violations.push(format!(
+                    "services.{name}.healthcheck_url should target /ready, got `{url}`"
+                )),
+                None => violations.push(format!(
+                    "services.{name} missing [services.{name}.healthcheck] \
+                     (or the legacy healthcheck_url key)"
+                )),
+            },
         }
 
-        let Some(restart_policy) = service_table
+        match service_table
             .get("restart_policy")
             .and_then(toml::Value::as_table)
-        else {
-            violations.push(format!(
-                "services.{name} missing [services.{name}.restart_policy]"
-            ));
-            continue;
-        };
-
-        for field in ["on_exit", "backoff_ms", "max_attempts"] {
-            if !restart_policy.contains_key(field) {
-                violations.push(format!("services.{name}.restart_policy.{field} missing"));
+        {
+            Some(restart_policy) => {
+                for field in ["on_exit", "backoff_ms", "max_attempts"] {
+                    if !restart_policy.contains_key(field) {
+                        violations.push(format!("services.{name}.restart_policy.{field} missing"));
+                    }
+                }
             }
+            None if service_table.contains_key("restart_on_exit") => {}
+            None => violations.push(format!(
+                "services.{name} missing [services.{name}.restart_policy] \
+                 (or the legacy restart_on_exit key)"
+            )),
         }
     }
 
@@ -819,13 +1168,167 @@ fn detect_service_config_violations(raw: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
+        choose_split_port, insert_workspace_member, ports_declared_in_krab_toml,
+        preferred_split_port, SPLIT_PORT_END, SPLIT_PORT_START,
+    };
+    use super::{
         detect_service_config_violations, parse_direct_service_import,
         runtime_topology_env_violation, split_contract_conformance_test, topology_doctor_report_at,
         CHECK_CONTRACT_PAYLOAD_DERIVES, CHECK_ORCHESTRATOR_SERVICE_CONFIG,
         CHECK_SERVICE_SOURCE_SCAN,
     };
+    use std::collections::BTreeSet;
     use std::fs;
     use std::path::Path;
+
+    fn members_of(raw: &str) -> Vec<String> {
+        let parsed: toml::Value = toml::from_str(raw).unwrap_or_else(|e| panic!("{e}\n{raw}"));
+        parsed["workspace"]["members"]
+            .as_array()
+            .expect("members array")
+            .iter()
+            .map(|m| m.as_str().expect("string member").to_string())
+            .collect()
+    }
+
+    /// Every layout the old insertion broke, and the ones it happened to get
+    /// right: the member lands last, the TOML stays valid, and a second run
+    /// changes nothing.
+    #[test]
+    fn workspace_member_registration_handles_every_array_layout() {
+        let cases = [
+            // Single-line, no trailing comma: the old code produced
+            // `["a", "b"    "services/x",` here.
+            "[workspace]\nmembers = [\"a\", \"b\"]\n",
+            "[workspace]\nmembers = [\"a\", \"b\",]\n",
+            "[workspace]\nmembers = []\n",
+            "[workspace]\nmembers=[\"a\"]\nresolver = \"2\"\n",
+            // Multi-line, with and without trailing comma.
+            "[workspace]\nmembers = [\n    \"a\",\n    \"b\",\n]\n",
+            "[workspace]\nmembers = [\n    \"a\",\n    \"b\"\n]\n",
+            "[workspace]\nmembers = [\n  \"a\",\n  \"b\"]\n",
+            "[workspace]\nmembers = [\n]\n",
+            // A `]` inside a comment or string must not end the array early.
+            "[workspace]\nmembers = [\n    \"a\", # see [docs]\n    \"b\",  # last [one]\n]\n",
+            // CRLF line endings.
+            "[workspace]\r\nmembers = [\r\n    \"a\",\r\n    \"b\"\r\n]\r\n",
+            // `members` in another table first must not be the one edited.
+            "[package.metadata.x]\nmembers = [\"nope\"]\n\n[workspace]\nmembers = [\"a\"]\n",
+        ];
+
+        for raw in cases {
+            let updated = insert_workspace_member(raw, "services/x")
+                .unwrap_or_else(|err| panic!("{err:#}\n{raw}"))
+                .unwrap_or_else(|| panic!("services/x was reported as present:\n{raw}"));
+            let members = members_of(&updated);
+            assert_eq!(
+                members.last().map(String::as_str),
+                Some("services/x"),
+                "{updated}"
+            );
+            assert!(
+                insert_workspace_member(&updated, "services/x")
+                    .expect("second run")
+                    .is_none(),
+                "registration is not idempotent:\n{updated}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_line_registration_keeps_the_layout_and_the_last_entrys_comment() {
+        let raw =
+            "[workspace]\nmembers = [\n    \"a\",\n    \"b\"  # keep me\n]\nresolver = \"2\"\n";
+
+        let updated = insert_workspace_member(raw, "services/x")
+            .expect("insert")
+            .expect("changed");
+
+        assert_eq!(
+            updated,
+            "[workspace]\nmembers = [\n    \"a\",\n    \"b\",  # keep me\n    \"services/x\"\n]\nresolver = \"2\"\n"
+        );
+    }
+
+    #[test]
+    fn multi_line_registration_with_a_trailing_comma_adds_one_line() {
+        let raw = "[workspace]\nmembers = [\n    \"a\",\n]\n";
+
+        let updated = insert_workspace_member(raw, "services/x")
+            .expect("insert")
+            .expect("changed");
+
+        assert_eq!(
+            updated,
+            "[workspace]\nmembers = [\n    \"a\",\n    \"services/x\",\n]\n"
+        );
+    }
+
+    /// A member spelled with a leading `./` or backslashes is the same member.
+    #[test]
+    fn an_existing_member_is_recognised_across_spellings() {
+        let raw = "[workspace]\nmembers = [\"./services/x/\"]\n";
+        assert!(insert_workspace_member(raw, "services\\x")
+            .expect("parse")
+            .is_none());
+    }
+
+    #[test]
+    fn a_manifest_without_a_workspace_members_array_is_an_error() {
+        let err = insert_workspace_member("[package]\nname = \"x\"\n", "services/x")
+            .expect_err("no workspace");
+        assert!(err.to_string().contains("members"), "{err}");
+    }
+
+    #[test]
+    fn declared_ports_come_from_port_env_and_probe_urls() {
+        let raw = r#"
+[services.a]
+port = 3201
+
+[services.b]
+env = { KRAB_PORT = "3202" }
+
+[services.c.healthcheck]
+url = "http://127.0.0.1:3203/ready"
+
+[services.d]
+healthcheck_url = "http://localhost:3204/ready"
+"#;
+        assert_eq!(
+            ports_declared_in_krab_toml(raw),
+            BTreeSet::from([3201, 3202, 3203, 3204])
+        );
+        assert!(ports_declared_in_krab_toml("not toml [").is_empty());
+    }
+
+    /// The hash picks the first candidate; a taken port moves to the next
+    /// free one, wrapping at the end of the range.
+    #[test]
+    fn split_port_selection_skips_taken_ports_and_wraps() {
+        let empty = BTreeSet::new();
+        assert_eq!(choose_split_port(3250, &empty).expect("free"), 3250);
+
+        let taken = BTreeSet::from([3250, 3251]);
+        assert_eq!(choose_split_port(3250, &taken).expect("free"), 3252);
+
+        let last = SPLIT_PORT_END - 1;
+        let taken = BTreeSet::from([last]);
+        assert_eq!(
+            choose_split_port(last, &taken).expect("free"),
+            SPLIT_PORT_START
+        );
+
+        let preferred = preferred_split_port("service_billing_split");
+        assert!((SPLIT_PORT_START..SPLIT_PORT_END).contains(&preferred));
+    }
+
+    #[test]
+    fn an_exhausted_split_port_range_is_reported() {
+        let all: BTreeSet<u16> = (SPLIT_PORT_START..SPLIT_PORT_END).collect();
+        let err = choose_split_port(3300, &all).expect_err("no free port");
+        assert!(err.to_string().contains("already assigned"), "{err}");
+    }
 
     /// `service_entry` with an explicit `service_name`, for the identity checks.
     fn service_entry_named(name: &str, port: u16, service_name: Option<&str>) -> String {
@@ -1072,6 +1575,28 @@ mod tests {
         );
     }
 
+    /// The flat keys the orchestrator still accepts pass the doctor too.
+    #[test]
+    fn legacy_flat_healthcheck_and_restart_keys_are_accepted() {
+        let manifest = "[services.auth]\n\
+             command = \"cargo\"\n\
+             port = 3001\n\
+             healthcheck_url = \"http://127.0.0.1:3001/ready\"\n\
+             restart_on_exit = true\n";
+        let violations = detect_service_config_violations(manifest);
+        assert!(violations.is_empty(), "{violations:?}");
+
+        let manifest = "[services.auth]\ncommand = \"cargo\"\nport = 3001\n\
+             healthcheck_url = \"http://127.0.0.1:3001/health\"\nrestart_on_exit = true\n";
+        let violations = detect_service_config_violations(manifest);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("healthcheck_url should target /ready")),
+            "{violations:?}"
+        );
+    }
+
     /// The generated test must never again assert something that cannot fail.
     ///
     /// The original body was
@@ -1230,5 +1755,35 @@ interval_ms = 300
             Some("service_users".to_string())
         );
         assert_eq!(parse_direct_service_import("use crate::domain;"), None);
+    }
+
+    /// Importing a library crate under `services/` is not a cross-service
+    /// import; importing another service's binary crate still is.
+    #[test]
+    fn library_crates_under_services_are_not_boundaries() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let write = |path: &str, body: &str| {
+            let full = root.path().join(path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(full, body).unwrap();
+        };
+        write(
+            "services/service_web/src/main.rs",
+            "use service_web_islands::Counter;\nuse service_users::Client;\nfn main() {}\n",
+        );
+        write(
+            "services/service_web_islands/src/lib.rs",
+            "pub struct Counter;\n",
+        );
+        write("services/service_users/src/main.rs", "fn main() {}\n");
+
+        let report = topology_doctor_report_at(root.path()).expect("report");
+        let imports: Vec<_> = report
+            .violations
+            .iter()
+            .filter(|v| v.contains("direct cross-service import"))
+            .collect();
+        assert_eq!(imports.len(), 1, "{:?}", report.violations);
+        assert!(imports[0].contains("service_users"), "{imports:?}");
     }
 }

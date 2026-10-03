@@ -10,7 +10,7 @@ Once mounted, every server function is a public HTTP endpoint. Treat it like any
 - Arguments: zero or more named arguments. Each argument must implement `serde::Serialize` and `serde::Deserialize`.
 - Return type: non-streaming functions must return `Result<T, ServerFnError>`, where `T` is JSON serializable.
 - Endpoint path: `/api/rpc/{function_name}`.
-- Streaming form: `#[server(stream)]` returns an SSE stream and uses the same JSON argument decoding path.
+- Streaming form: `#[server(stream)]` returns an SSE stream and uses the same JSON argument decoding path. On `wasm32` (since 0.6.0) the generated client stub POSTs the arguments like any server function and returns a `krab_core::server_fn::ServerEventStream`, which yields parsed `ServerEvent`s (`event`, `data`, `id`) as the response body arrives; `SseParser` is the target-independent parser behind it. Before 0.6.0 a `#[server(stream)]` function did not compile for `wasm32`.
 - Error body: `ServerFnError` is emitted as a JSON envelope with `error`, `message`, `status_code`, and `code`.
 
 ## Validation Failure
@@ -115,9 +115,12 @@ view! {
 }
 ```
 
-Attribute values in `view!` are evaluated once at build time — they are not
-reactive, so state like `pending` is reflected through `<Show>` or text
-interpolation, not through a `disabled={ … }` closure (which does not compile).
+An attribute whose value is a closure literal is reactive, so state like
+`pending` can drive an attribute directly — `disabled={ move || rename.pending().get() }`
+keeps the button disabled while the call is in flight (a `bool` source renders
+the attribute when `true` and removes it when `false`). Any other attribute
+expression is evaluated once, when the element is built. See
+[ADR 0015](../adr/0015-reactive-attributes.md).
 
 `Action` exposes `pending`, `value`, and `error` as signals. A failed dispatch
 keeps the previous `value`, and a superseded dispatch cannot overwrite a newer

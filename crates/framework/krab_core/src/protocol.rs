@@ -1,20 +1,38 @@
+//! Protocol selection: which API protocols (REST, GraphQL, RPC) a service
+//! exposes, how they are deployed, and which one a request is served with.
+//!
+//! [`ProtocolConfig::from_env`] reads the `KRAB_PROTOCOL_*` variables and
+//! [`ProtocolConfig::validate`] checks them at startup; the request-time
+//! resolution lives in the `rest` HTTP stack. `grpc` is deliberately not a
+//! protocol here — see ADR 0007.
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Versioned RPC envelope for additive schema evolution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcEnvelope<T> {
+    /// The payload.
     pub data: T,
+    /// Optional request id for correlation; omitted from the JSON when `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// Version of the payload schema, chosen by the producer.
     pub schema_version: u32,
+    /// Free-form feature names agreed between producer and consumer; Krab
+    /// attaches no meaning to them. Omitted from the JSON when empty and
+    /// defaulted to empty when absent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub feature_flags: Vec<String>,
+    /// A producer-set compatibility marker; Krab attaches no behaviour to it.
+    /// Always serialised, and defaulted to `false` when absent.
     #[serde(default)]
     pub compatibility_mode: bool,
 }
 
 impl<T> RpcEnvelope<T> {
+    /// Wraps `data` at schema `version`, with no request id, no feature flags
+    /// and compatibility mode off.
     pub fn new(data: T, version: u32) -> Self {
         Self {
             data,
@@ -25,11 +43,13 @@ impl<T> RpcEnvelope<T> {
         }
     }
 
+    /// Sets the request id.
     pub fn with_request_id(mut self, id: String) -> Self {
         self.request_id = Some(id);
         self
     }
 
+    /// Sets `compatibility_mode` to `true`.
     pub fn with_compatibility_mode(mut self) -> Self {
         self.compatibility_mode = true;
         self
@@ -40,8 +60,11 @@ impl<T> RpcEnvelope<T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProtocolKind {
+    /// JSON REST endpoints (`rest`).
     Rest,
+    /// GraphQL (`graphql`).
     Graphql,
+    /// Krab's JSON-over-HTTP RPC (`rpc`). Not gRPC.
     Rpc,
 }
 
@@ -63,6 +86,8 @@ impl ProtocolKind {
         }
     }
 
+    /// The lowercase wire name (`rest`, `graphql`, `rpc`), as used in
+    /// configuration, the `x-krab-protocol` header and metric labels.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Rest => "rest",
@@ -83,6 +108,7 @@ pub enum ExposureMode {
 }
 
 impl ExposureMode {
+    /// Parses `single` or `multi`, case-insensitively; `None` otherwise.
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "single" => Some(Self::Single),
@@ -103,6 +129,8 @@ pub enum DeploymentTopology {
 }
 
 impl DeploymentTopology {
+    /// Parses `single_service` or `split_services`, case-insensitively;
+    /// `None` otherwise.
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "single_service" => Some(Self::SingleService),
@@ -115,8 +143,11 @@ impl DeploymentTopology {
 /// Advertised protocol capabilities for a service.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceCapabilities {
+    /// Name of the service advertising these capabilities.
     pub service: String,
+    /// Protocol used when a request does not select one.
     pub default_protocol: ProtocolKind,
+    /// Every protocol the service exposes.
     pub supported_protocols: Vec<ProtocolKind>,
     /// Maps protocol → base route, e.g. Rest → "/api/v1/users".
     pub protocol_routes: HashMap<ProtocolKind, String>,
@@ -138,10 +169,19 @@ pub struct ProtocolPolicy {
 /// Full runtime protocol config loaded from env at startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProtocolConfig {
+    /// `KRAB_PROTOCOL_EXPOSURE_MODE` (default `single`). `single` requires
+    /// exactly one enabled protocol.
     pub exposure_mode: ExposureMode,
+    /// `KRAB_PROTOCOL_ENABLED_<SERVICE>` or `KRAB_PROTOCOL_ENABLED` (default
+    /// `[rest]`). The default protocol is always added if missing.
     pub enabled_protocols: Vec<ProtocolKind>,
+    /// `KRAB_PROTOCOL_DEFAULT` (default `rest`): served when neither the
+    /// route family nor an allowed client preference picks one.
     pub default_protocol: ProtocolKind,
+    /// `KRAB_PROTOCOL_TOPOLOGY` (default `single_service`).
+    /// `split_services` also requires `KRAB_PROTOCOL_SPLIT_TARGETS_JSON`.
     pub topology: DeploymentTopology,
+    /// Per-operation and per-tenant restrictions.
     pub policy: ProtocolPolicy,
     /// Disabled by default. When false, `x-krab-protocol` must not be used for switching.
     pub allow_runtime_switch_header: bool,
@@ -333,6 +373,8 @@ impl ProtocolConfig {
     }
 }
 
+/// Axum handler that answers with the [`ServiceCapabilities`] held in router
+/// state, as JSON.
 #[cfg(feature = "rest")]
 pub async fn capabilities_handler(
     axum::extract::State(caps): axum::extract::State<ServiceCapabilities>,

@@ -67,7 +67,7 @@ The `#[server]` attribute macro generates both client and server implementations
 - ✅ `go to definition` works on the function name
 - ✅ Non-async functions produce a clear compile error with fix suggestion
 - ✅ Missing return type produces a clear compile error
-- ⚠️ The generated `_handler` and `_Args` struct won't appear in autocomplete until the project is built at least once
+- ⚠️ The generated `<fn>_handler` and the hidden `__<FnName>Args` struct won't appear in autocomplete until the project is built at least once
 
 ### `#[island]` Macro
 

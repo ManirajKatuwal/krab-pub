@@ -79,3 +79,59 @@ jobs:
       - name: Format
         working-directory: ${{ runner.temp }}/gate-${{ matrix.template }}
         run: cargo fmt --check
+
+  # `krab gen service` output was never compiled by any gate. Multi mode wrote
+  # `capabilities.rs`, `domain/` and `adapters/` without declaring them, so the
+  # code was dead on arrival and nothing noticed. This job generates services
+  # inside a `krab new` project, exactly as a user would, with `--path-deps`
+  # pointing at this checkout, and holds each one to the same build, test,
+  # clippy `-D warnings` and fmt bar as the project itself.
+  gen-service:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: svc_single
+            args: --type rest
+          - service: svc_multi
+            args: --type rest --exposure-mode multi --protocols rest,graphql,rpc,grpc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Build the CLI
+        run: cargo build -p krab_cli
+
+      # Outside the checkout for the same workspace-walk reason as above.
+      - name: Scaffold project and generate service
+        run: |
+          cd "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/target/debug/krab" new gate-gen --path-deps "$GITHUB_WORKSPACE" --no-git
+          cd gate-gen
+          "$GITHUB_WORKSPACE/target/debug/krab" gen service "${{ matrix.service }}" \
+            ${{ matrix.args }} --path-deps "$GITHUB_WORKSPACE"
+
+      - name: Show generated manifest
+        run: cat "$RUNNER_TEMP/gate-gen/${{ matrix.service }}/Cargo.toml"
+
+      - name: Build
+        working-directory: ${{ runner.temp }}/gate-gen/${{ matrix.service }}
+        run: cargo build
+
+      - name: Test
+        working-directory: ${{ runner.temp }}/gate-gen/${{ matrix.service }}
+        run: cargo test
+
+      - name: Clippy
+        working-directory: ${{ runner.temp }}/gate-gen/${{ matrix.service }}
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Format
+        working-directory: ${{ runner.temp }}/gate-gen/${{ matrix.service }}
+        run: cargo fmt --check

@@ -1,0 +1,5 @@
+error: Mismatched closing tag: expected </ui::Card>, found </Card>
+  --> tests/compile_fail/component_mismatched_closing_tag.rs:21:39
+   |
+21 |     let _ = view! { <ui::Card>"body"</Card> }.render();
+   |                                       ^^^^

@@ -140,28 +140,6 @@ impl WsRoom {
         }
     }
 
-    /// Track a new connection.
-    #[deprecated(
-        since = "0.3.0",
-        note = "use `WsRoom::join()`; its guard decrements on drop and cannot leak counts on panic or abort"
-    )]
-    pub async fn connect(&self) {
-        self.connection_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Track a disconnection.
-    #[deprecated(
-        since = "0.3.0",
-        note = "use `WsRoom::join()`; dropping the returned guard replaces manual disconnect()"
-    )]
-    pub async fn disconnect(&self) {
-        let _ = self
-            .connection_count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                Some(count.saturating_sub(1))
-            });
-    }
-
     /// Get the number of active connections.
     pub fn connections(&self) -> usize {
         self.connection_count.load(Ordering::Relaxed)
@@ -410,21 +388,6 @@ mod tests {
         drop(guard_a);
         assert_eq!(room.connections(), 1);
         drop(guard_b);
-        assert_eq!(room.connections(), 0);
-    }
-
-    #[tokio::test]
-    #[allow(deprecated)]
-    async fn ws_room_deprecated_connect_disconnect_still_count() {
-        let room = WsRoom::new("legacy");
-        room.connect().await;
-        room.connect().await;
-        assert_eq!(room.connections(), 2);
-
-        room.disconnect().await;
-        assert_eq!(room.connections(), 1);
-        room.disconnect().await;
-        room.disconnect().await; // extra disconnect saturates at zero
         assert_eq!(room.connections(), 0);
     }
 

@@ -1,0 +1,9 @@
+error: <ui::card> is a path, so `view!` reads it as a component, but `card` is not capitalised.
+         A component tag names its function, and component functions are capitalised
+         (the same convention as #[island]):
+           <ui::Card title="x"/>  calls  ui::Card(ui::CardProps { .. })
+         HTML element names never contain `::`.
+ --> tests/compile_fail/component_lowercase_path.rs:7:26
+  |
+7 |     let _ = view! { <ui::card/> }.render();
+  |                          ^^^^

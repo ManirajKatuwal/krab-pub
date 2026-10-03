@@ -1,0 +1,5 @@
+error[E0063]: missing field `count` in initializer of `CardProps`
+  --> tests/compile_fail/component_missing_prop.rs:18:22
+   |
+18 |     let _ = view! { <Card title="Inbox"/> }.render();
+   |                      ^^^^ missing `count`

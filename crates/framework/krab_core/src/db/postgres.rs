@@ -1,3 +1,13 @@
+//! The Postgres runtime (feature `db-postgres`): pool configuration and
+//! connection with retry, versioned migrations, drift detection, rollback,
+//! and the migration governance and promotion policies.
+//!
+//! Every item is re-exported from [`crate::db`]. Migration state lives in
+//! tables the functions create on first use: `krab_migrations` (applied
+//! versions and checksums), `krab_migration_environment`,
+//! `krab_migration_schema_ownership`, `krab_migration_policy_audit` and
+//! `krab_migration_rollback_rehearsals`. See `docs/reference/database.md`.
+
 use anyhow::{Context, Result};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Connection, Row};
@@ -23,12 +33,19 @@ fn csv_env(name: &str, default: &str) -> Vec<String> {
         .collect()
 }
 
+/// The `sqlx` Postgres connection pool every function here takes.
 pub type DbPool = Pool<Postgres>;
 
+/// A row of the `krab_migrations` table: one applied migration.
 #[derive(Debug, Clone)]
 pub struct MigrationRecord {
+    /// The migration's version.
     pub version: i64,
+    /// The migration's name when it was applied.
     pub name: String,
+    /// SHA-256 of the SQL that was applied, hex-encoded. Rows written before
+    /// 0.2.0 hold a 16-character legacy hash until a migration run or drift
+    /// check rewrites them.
     pub checksum: String,
 }
 
@@ -48,13 +65,24 @@ where
     }
 }
 
+/// A user row, decodable with `sqlx::FromRow` from columns `id`, `username`,
+/// `email`, `tenant_id`, `created_at` and `updated_at`.
+///
+/// Krab creates no users table; this maps one an application defines with
+/// those columns.
 #[derive(Debug, Clone)]
 pub struct UserModel {
+    /// Primary key.
     pub id: String,
+    /// Login or display name.
     pub username: String,
+    /// Email address.
     pub email: String,
+    /// Owning tenant, if the user belongs to one.
     pub tenant_id: Option<String>,
+    /// When the row was created.
     pub created_at: sqlx::types::time::OffsetDateTime,
+    /// When the row was last updated.
     pub updated_at: sqlx::types::time::OffsetDateTime,
 }
 
@@ -77,22 +105,43 @@ where
     }
 }
 
+/// One versioned schema migration, as compiled into the service.
 #[derive(Debug, Clone)]
 pub struct Migration {
+    /// Ordering key and identity: migrations apply in ascending version and
+    /// roll back in descending version. Must be unique.
     pub version: i64,
+    /// Human-readable name, recorded in `krab_migrations`.
     pub name: &'static str,
+    /// The forward SQL. May hold several statements; runs in one transaction.
+    /// Its SHA-256 is recorded, and changing it after it has been applied is
+    /// reported as drift.
     pub sql: &'static str,
+    /// SQL that undoes `sql`, used by [`rollback_to_version`]. Required when
+    /// `destructive` is set; a rollback past a migration without it fails.
     pub rollback_sql: Option<&'static str>,
+    /// Whether a failure must stop the run even under
+    /// [`MigrationFailurePolicy::ContinueNonCritical`].
     pub critical: bool,
+    /// Marks a migration that can lose data. [`run_versioned_migrations`]
+    /// refuses to run one without `rollback_sql`.
     pub destructive: bool,
 }
 
+/// What [`run_versioned_migrations`] does when a migration's SQL fails.
+/// The failed migration's transaction is rolled back either way.
 #[derive(Debug, Clone, Copy)]
 pub enum MigrationFailurePolicy {
+    /// Stop at the first failure and return an error. The default.
     Halt,
+    /// Log and skip a failed migration that is not `critical`, and carry on;
+    /// a failed critical migration still stops the run.
     ContinueNonCritical,
 }
 
+/// Reads `DB_MIGRATION_FAILURE_POLICY`: `continue_non_critical`
+/// (case-insensitive) selects [`MigrationFailurePolicy::ContinueNonCritical`];
+/// anything else, or unset, is [`MigrationFailurePolicy::Halt`].
 pub fn migration_failure_policy_from_env() -> MigrationFailurePolicy {
     match std::env::var("DB_MIGRATION_FAILURE_POLICY") {
         Ok(value) if value.eq_ignore_ascii_case("continue_non_critical") => {
@@ -102,36 +151,71 @@ pub fn migration_failure_policy_from_env() -> MigrationFailurePolicy {
     }
 }
 
+/// Outcome of [`run_versioned_migrations`].
 #[derive(Debug, Default, Clone)]
 pub struct MigrationReport {
+    /// Versions applied by this run, in order.
     pub applied_versions: Vec<i64>,
+    /// Versions that were already applied (checksum verified) and skipped.
+    /// A non-critical migration that failed under
+    /// [`MigrationFailurePolicy::ContinueNonCritical`] is in neither list.
     pub skipped_versions: Vec<i64>,
 }
 
+/// Differences between the compiled migrations and `krab_migrations`, from
+/// [`detect_migration_drift`]. Judge it with [`enforce_drift_policy`].
 #[derive(Debug, Default, Clone)]
 pub struct MigrationDriftReport {
+    /// Compiled migrations the database has not applied.
     pub missing_versions: Vec<i64>,
+    /// Versions applied in the database that no compiled migration has — for
+    /// example, applied by a newer release.
     pub unexpected_versions: Vec<i64>,
+    /// Applied versions whose recorded checksum does not match the compiled
+    /// SQL: the migration was edited after it ran, or the schema bookkeeping
+    /// was changed by hand.
     pub checksum_mismatches: Vec<i64>,
 }
 
+/// Input to [`enforce_promotion_policy`].
 #[derive(Debug, Clone)]
 pub struct PromotionConfig {
+    /// The environment being migrated; must be on the ladder `local`, `dev`,
+    /// `staging`, `prod` (case-insensitive).
     pub environment: String,
+    /// `DB_MIGRATION_ALLOW_APPLY` (default true). Not consulted by
+    /// [`enforce_promotion_policy`]; [`MigrationGovernanceConfig::allow_apply`]
+    /// is the one that is enforced.
     pub allow_apply: bool,
 }
 
+/// Input to [`enforce_migration_governance`], normally from
+/// [`MigrationGovernanceConfig::from_env`].
 #[derive(Debug, Clone)]
 pub struct MigrationGovernanceConfig {
+    /// The service owning the schema (`KRAB_SERVICE_NAME`, default
+    /// `unknown`). Recorded in the ownership, audit and rehearsal tables.
     pub service_name: String,
+    /// `KRAB_ENVIRONMENT`, verbatim (default `dev`).
     pub environment: String,
+    /// `DB_MIGRATION_ALLOW_APPLY` (default true). When false, governance
+    /// records a `deny` decision and returns an error.
     pub allow_apply: bool,
+    /// Environments treated as releases (`DB_MIGRATION_RELEASE_ENVIRONMENTS`,
+    /// comma-separated, default `staging,prod`; matched case-insensitively).
     pub release_environments: Vec<String>,
+    /// Whether a release environment requires a successful rollback rehearsal
+    /// on record for this service (`DB_MIGRATION_REQUIRE_REHEARSAL_IN_RELEASE`,
+    /// default true).
     pub require_rollback_rehearsal_in_release: bool,
+    /// `DB_MIGRATION_DRIFT_THRESHOLD` (default 0): the `max_unexpected` a
+    /// caller passes to [`enforce_drift_policy`]. Not applied automatically.
     pub drift_tolerance_threshold: usize,
 }
 
 impl MigrationGovernanceConfig {
+    /// Reads the governance variables; see each field for its variable and
+    /// default. Never fails — an unparseable threshold is 0.
     pub fn from_env() -> Self {
         Self {
             service_name: std::env::var("KRAB_SERVICE_NAME")
@@ -152,6 +236,8 @@ impl MigrationGovernanceConfig {
 }
 
 impl PromotionConfig {
+    /// Reads `KRAB_ENVIRONMENT` (default `dev`) and `DB_MIGRATION_ALLOW_APPLY`
+    /// (default true).
     pub fn from_env() -> Self {
         let environment = std::env::var("KRAB_ENVIRONMENT").unwrap_or_else(|_| "dev".to_string());
         let allow_apply = std::env::var("DB_MIGRATION_ALLOW_APPLY")
@@ -185,6 +271,11 @@ async fn ensure_rehearsal_table(pool: &DbPool) -> Result<()> {
     Ok(())
 }
 
+/// Records a rollback rehearsal in `krab_migration_rollback_rehearsals`
+/// (created if absent): which service and environment, the version rolled
+/// back to, where its evidence lives, and whether it succeeded. A successful
+/// row is what [`enforce_migration_governance`] looks for in a release
+/// environment.
 pub async fn record_rollback_rehearsal(
     pool: &DbPool,
     service_name: &str,
@@ -211,6 +302,15 @@ pub async fn record_rollback_rehearsal(
     Ok(())
 }
 
+/// Applies the migration governance policy before a migration run.
+///
+/// Records `cfg.service_name` as the schema owner. In a release environment
+/// with `require_rollback_rehearsal_in_release`, errors unless a successful
+/// rollback rehearsal has been recorded for the service (in any
+/// environment). Then writes an `allow`/`deny` row to
+/// `krab_migration_policy_audit`, and errors if `allow_apply` is false — the
+/// audit row is written first, so a denial is always on record. Creates the
+/// tables it uses if absent.
 pub async fn enforce_migration_governance(
     pool: &DbPool,
     cfg: &MigrationGovernanceConfig,
@@ -313,6 +413,8 @@ pub async fn enforce_migration_governance(
     Ok(())
 }
 
+/// Judges a drift report: any missing version or checksum mismatch is an
+/// error, and so are more than `max_unexpected` unexpected versions.
 pub fn enforce_drift_policy(report: &MigrationDriftReport, max_unexpected: usize) -> Result<()> {
     if !report.missing_versions.is_empty() {
         anyhow::bail!(
@@ -336,15 +438,33 @@ pub fn enforce_drift_policy(report: &MigrationDriftReport, max_unexpected: usize
     Ok(())
 }
 
+/// Connection-pool settings, normally from [`DbConfig::from_env`]. The
+/// `Debug` output redacts the credentials in `url`.
 #[derive(Clone)]
 pub struct DbConfig {
+    /// Postgres connection URL (`DATABASE_URL`, read as a secret). Usually
+    /// contains the password.
     pub url: String,
+    /// Pool size cap (`DB_MAX_CONNECTIONS`, default 10, at least 1).
     pub max_connections: u32,
+    /// Connections kept open when idle (`DB_MIN_CONNECTIONS`, default 1,
+    /// at most `max_connections`).
     pub min_connections: u32,
+    /// How long a query waits for a free connection before failing
+    /// (`DB_ACQUIRE_TIMEOUT_SECS`, default 5 s).
     pub acquire_timeout: Duration,
+    /// Age at which a connection is retired (`DB_MAX_LIFETIME_SECS`, default
+    /// 30 min).
     pub max_lifetime: Duration,
+    /// How long a connection may sit idle before it is closed
+    /// (`DB_IDLE_TIMEOUT_SECS`, default 10 min).
     pub idle_timeout: Duration,
+    /// Total connection attempts [`connect_with_config`] makes on transient
+    /// errors (`DB_CONNECT_RETRIES`, default 5).
     pub connect_retries: u32,
+    /// Base delay of the exponential connect backoff
+    /// (`DB_CONNECT_RETRY_DELAY_MS`, default 750 ms); doubles per attempt up
+    /// to 64×, capped at 30 s, plus up to 250 ms of jitter.
     pub connect_retry_delay: Duration,
 }
 
@@ -404,6 +524,10 @@ impl Default for DbConfig {
 }
 
 impl DbConfig {
+    /// Rejects obviously unsafe URLs outside `local` and `dev`
+    /// (`KRAB_ENVIRONMENT`, default `dev`): an empty URL, or one using the
+    /// well-known `postgres:password` credentials. A no-op in `local`/`dev`.
+    /// [`connect_with_config`] calls this first.
     pub fn validate_security(&self) -> Result<()> {
         let env = std::env::var("KRAB_ENVIRONMENT").unwrap_or_else(|_| "dev".to_string());
         let is_non_local = !env.eq_ignore_ascii_case("local") && !env.eq_ignore_ascii_case("dev");
@@ -514,6 +638,8 @@ impl DbConfig {
     }
 }
 
+/// Connects to `database_url` with every other setting at its
+/// [`DbConfig::default`] value; see [`connect_with_config`].
 pub async fn connect(database_url: &str) -> Result<DbPool> {
     connect_with_config(&DbConfig {
         url: database_url.to_string(),
@@ -545,6 +671,13 @@ pub(crate) fn is_transient_connect_error(error: &sqlx::Error) -> bool {
     }
 }
 
+/// Opens a pool with `cfg`, retrying transient failures.
+///
+/// Runs [`DbConfig::validate_security`] first. Transient errors (I/O, pool
+/// timeouts, most server errors — the "database still starting" class) are
+/// retried with exponential backoff up to `connect_retries` attempts in
+/// total; TLS, configuration and authentication (SQLSTATE `28xxx`) errors
+/// fail immediately.
 pub async fn connect_with_config(cfg: &DbConfig) -> Result<DbPool> {
     cfg.validate_security()?;
 
@@ -594,37 +727,6 @@ pub async fn connect_with_config(cfg: &DbConfig) -> Result<DbPool> {
             }
         }
     }
-}
-
-/// Create a legacy `_krab_migrations` bookkeeping table and nothing else.
-///
-/// Superseded by [`run_versioned_migrations`], which owns the real
-/// `krab_migrations` ledger, checksums, rollback SQL and failure policy. The
-/// single bootstrap migration this applies is unused by the rest of the
-/// framework; calling it only writes a table nobody reads.
-///
-/// Kept through 0.5.x because it shipped in the 0.4.0 public API. Removed in
-/// 0.6.0 — see `docs/reference/api.md`.
-#[deprecated(
-    since = "0.5.0",
-    note = "use run_versioned_migrations; this only creates an unused `_krab_migrations` table and is removed in 0.6.0"
-)]
-pub async fn run_migrations(pool: &DbPool) -> Result<()> {
-    let _ = run_versioned_migrations(
-        pool,
-        &[Migration {
-            version: 1,
-            name: "bootstrap_migration_table",
-            sql: "CREATE TABLE IF NOT EXISTS _krab_migrations (id SERIAL PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now(), name TEXT NOT NULL UNIQUE)",
-            rollback_sql: None,
-            critical: true,
-            destructive: false,
-        }],
-        MigrationFailurePolicy::Halt,
-    )
-    .await?;
-
-    Ok(())
 }
 
 /// SHA-256 checksum of a migration's SQL, hex-encoded (64 characters).
@@ -720,6 +822,13 @@ pub(crate) fn promotion_stage_index(environment: &str) -> Result<usize> {
         })
 }
 
+/// Enforces forward-only promotion along `local` → `dev` → `staging` →
+/// `prod`.
+///
+/// Compares `cfg.environment` with the environment most recently recorded in
+/// `krab_migration_environment` (created if absent): moving backwards is an
+/// error, skipping a stage only warns. An environment not on the ladder —
+/// target or recorded — is an error. The target is then recorded.
 pub async fn enforce_promotion_policy(pool: &DbPool, cfg: &PromotionConfig) -> Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS krab_migration_environment (environment TEXT PRIMARY KEY, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())",
@@ -780,6 +889,11 @@ pub async fn enforce_promotion_policy(pool: &DbPool, cfg: &PromotionConfig) -> R
     Ok(())
 }
 
+/// Compares `migrations` with the rows of `krab_migrations`.
+///
+/// Not read-only: an applied row still carrying the pre-0.2.0 checksum
+/// format for unchanged SQL is rewritten to SHA-256 rather than reported.
+/// Fails if `krab_migrations` does not exist yet.
 pub async fn detect_migration_drift(
     pool: &DbPool,
     migrations: &[Migration],
@@ -828,6 +942,13 @@ pub async fn detect_migration_drift(
     Ok(report)
 }
 
+/// Rolls the schema back to `target_version`: every applied migration with a
+/// higher version is undone with its `rollback_sql`, newest first, each in
+/// its own transaction that also deletes its `krab_migrations` row.
+///
+/// Holds the same advisory lock as [`run_versioned_migrations`]. Stops with
+/// an error at the first migration lacking `rollback_sql`, leaving the ones
+/// above it already rolled back.
 pub async fn rollback_to_version(
     pool: &DbPool,
     migrations: &[Migration],
@@ -892,6 +1013,9 @@ async fn rollback_to_version_locked(
     Ok(())
 }
 
+/// Sanity checks before migrating: that an advisory lock can be taken and
+/// released, and that a query runs. Warns (without failing) when connected
+/// as the `postgres` superuser with `KRAB_ENVIRONMENT=prod`.
 pub async fn run_preflight_checks(pool: &DbPool) -> Result<()> {
     // 1. Lock acquisition test
     // Use an advisory lock to ensure we can acquire locks
@@ -942,6 +1066,19 @@ pub async fn run_preflight_checks(pool: &DbPool) -> Result<()> {
 /// releases it when its connection dies.
 const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x6b72_6162_5f6d_6967;
 
+/// Applies every migration in `migrations` not yet recorded in
+/// `krab_migrations` (created if absent), in ascending version order.
+///
+/// Each migration runs in its own transaction together with its bookkeeping
+/// row. Already-applied versions are skipped after their checksum is
+/// verified; a mismatch is an error. A `destructive` migration without
+/// `rollback_sql` is an error before anything runs for it. Failures follow
+/// `failure_policy`.
+///
+/// Safe to call from several replicas at once: a session-level Postgres
+/// advisory lock, taken on a dedicated connection outside the pool,
+/// serialises runs, and the waiting replica then skips what the first
+/// applied.
 pub async fn run_versioned_migrations(
     pool: &DbPool,
     migrations: &[Migration],

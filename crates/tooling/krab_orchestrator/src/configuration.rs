@@ -757,6 +757,40 @@ command = "cargo"
         assert_eq!(ports, vec![3000, 3001, 3002, 3207]);
     }
 
+    /// The `[services.X.healthcheck]` table wins over the flat
+    /// `healthcheck_url` / `healthcheck_timeout_ms` keys, so a manifest that
+    /// carries both says one thing (`/health`) and runs another (`/ready`).
+    /// The workspace manifest must say only what runs.
+    #[test]
+    fn the_workspace_manifest_has_no_shadowed_flat_healthcheck_keys() {
+        let Some(raw) = workspace_manifest() else {
+            return;
+        };
+
+        let value: toml::Value = toml::from_str(&raw).expect("workspace krab.toml must parse");
+        let services = value
+            .get("services")
+            .and_then(toml::Value::as_table)
+            .expect("workspace krab.toml declares services");
+        for (name, service) in services {
+            if service.get("healthcheck").is_none() {
+                continue;
+            }
+            for key in ["healthcheck_url", "healthcheck_timeout_ms"] {
+                assert!(
+                    service.get(key).is_none(),
+                    "services.{name}.{key} is shadowed by [services.{name}.healthcheck]"
+                );
+            }
+        }
+
+        let parsed = parse_krab_config(&raw).expect("workspace krab.toml must be valid");
+        for (name, service) in &parsed.services {
+            let url = service.effective_healthcheck_url().unwrap_or_default();
+            assert!(url.ends_with("/ready"), "services.{name} probes `{url}`");
+        }
+    }
+
     #[test]
     fn effective_healthcheck_retries_never_returns_zero() {
         let mut service = sample_service();

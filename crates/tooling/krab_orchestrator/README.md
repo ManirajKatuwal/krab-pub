@@ -25,9 +25,15 @@ if the service graph has a cycle or an unknown dependency, or if a service fails
 its startup readiness probe.
 
 Per-service stdout and stderr are captured to log files under
-`internal/audit/orchestrator/`, resolved relative to the working directory the
-orchestrator is started from. The directory is created automatically on startup
-(in the Krab framework repository that path is gitignored).
+`<artifact root>/orchestrator/`, resolved relative to the working directory the
+orchestrator is started from. The artifact root is `KRAB_ARTIFACT_DIR` when set;
+otherwise `internal/audit/` if that directory exists (deprecated, logged as a
+warning, removed in 0.7.0); otherwise `.krab/`, which `krab new` adds to the
+generated `.gitignore`. The directory is created automatically.
+
+On Windows every service is placed in a kill-on-close Job Object held by the
+orchestrator, so services started through `cargo run` are terminated even if the
+orchestrator crashes or is killed before it can shut them down.
 
 ## Supervision
 

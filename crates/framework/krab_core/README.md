@@ -24,8 +24,8 @@ functions.
 | `redis-store` | Redis-backed distributed store |
 | `web` | WASM/browser bindings (`web-sys`, `js-sys`, `wasm-bindgen`) |
 
-Deprecated aliases, removable no earlier than `0.3.0`: `grpc` →
-`grpc-semantics`, `db` → `db-postgres`.
+The deprecated aliases `grpc` (→ `grpc-semantics`) and `db` (→ `db-postgres`)
+were removed in `0.6.0`; use the canonical names.
 
 > **`grpc-semantics` is not gRPC.** It provides the canonical status codes and
 > `grpc-timeout` header parsing a **gateway** needs to map between HTTP and gRPC
@@ -39,7 +39,7 @@ Deprecated aliases, removable no earlier than `0.3.0`: `grpc` →
 
 ```toml
 [dependencies]
-krab_core = { version = "0.5", features = ["rest", "db-postgres"] }
+krab_core = { version = "0.6", features = ["rest", "db-postgres"] }
 ```
 
 ## Documentation

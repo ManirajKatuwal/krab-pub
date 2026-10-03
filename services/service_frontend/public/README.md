@@ -4,11 +4,15 @@ This directory contains static assets served by Axum's `tower_http::services::Se
 
 ## Building Client
 
-To generate the client-side WASM and JS files, run:
+The frontend's browser bundle is the `service_frontend_islands` crate built
+for wasm32 — it holds the islands this service renders, and links
+`krab_client`'s hydration runtime. From the repository root:
 
 ```bash
-cd ../../../crates/framework/krab_client
-wasm-pack build --target web --out-dir ../../../services/service_frontend/public --no-typescript
+wasm-pack build services/service_frontend_islands --release --target web --out-dir ../../dist/pkg -- --features web
 ```
 
-This will generate `krab_client.js`, `krab_client_bg.wasm`, and `package.json` in this directory.
+or `krab build --target client --release`, which reads the same settings from
+`krab.toml`. This produces `service_frontend_islands.js` and
+`service_frontend_islands_bg.wasm` in `dist/pkg/`, which is where
+`KRAB_FRONTEND_PKG_DIR` looks by default.

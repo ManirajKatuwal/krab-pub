@@ -541,6 +541,13 @@ git push public publish/0.5.0:main
 git push public v0.5.0
 ```
 
+> **Correction (2026-10-01):** the second command is wrong — it pushes the
+> *development* tag, which points at a development-history commit, and so
+> uploads the private history to the public repository. `krab-pub`'s `v0.5.0`
+> resolves to `85dee82` for this reason. See
+> [0.6.0 Phase 7](release_0_6_0_checklist.md#phase-7--tag-and-mirror) for the
+> corrected procedure; do not reuse this one.
+
 Then cut the GitHub release on the public repository from the tag, with the
 `[0.5.0]` changelog section as its body.
 

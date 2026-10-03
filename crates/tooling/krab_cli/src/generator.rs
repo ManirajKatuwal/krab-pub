@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::project_template::DependencySource;
 use crate::topology::protocol_label;
 use crate::{ExposureMode, GenResource, ServiceType, Topology};
 
@@ -13,32 +14,56 @@ pub(crate) fn dispatch_gen_resource(resource: &GenResource) -> Result<()> {
             exposure_mode,
             protocols,
             topology,
-        } => generate_service(name, r#type, exposure_mode, protocols, topology),
+            path_deps,
+        } => {
+            let deps = DependencySource::from_path_deps(path_deps.as_deref())?;
+            let request = ServiceRequest {
+                name,
+                service_type: r#type,
+                exposure_mode,
+                protocols,
+                topology,
+                deps: &deps,
+            };
+            generate_service_in(Path::new("."), &request)
+        }
         GenResource::Component { name } => generate_component(name),
         GenResource::Route { name } => generate_route(name),
         GenResource::ServerFunction { name } => generate_server_function(name),
     }
 }
 
-fn generate_service(
-    name: &str,
-    service_type: &ServiceType,
-    exposure_mode: &ExposureMode,
-    protocols: &Option<Vec<ServiceType>>,
-    topology: &Topology,
-) -> Result<()> {
+/// Everything `krab gen service` was asked for, bundled so the generator can
+/// take a root directory as well without an eight-argument signature.
+struct ServiceRequest<'a> {
+    name: &'a str,
+    service_type: &'a ServiceType,
+    exposure_mode: &'a ExposureMode,
+    protocols: &'a Option<Vec<ServiceType>>,
+    topology: &'a Topology,
+    deps: &'a DependencySource,
+}
+
+/// Generate a service under `root`. Root-parameterised for the same reason
+/// as [`generate_component_in`]: tests must not change the process CWD.
+fn generate_service_in(root: &Path, request: &ServiceRequest<'_>) -> Result<()> {
+    let name = request.name;
     println!(
         "🦀 Generating service '{}' of type {:?} (mode={:?}, topology={:?})...",
-        name, service_type, exposure_mode, topology
+        name, request.service_type, request.exposure_mode, request.topology
     );
 
-    let selected_protocols = resolve_protocols(service_type, exposure_mode, protocols)?;
+    let selected_protocols = resolve_protocols(
+        request.service_type,
+        request.exposure_mode,
+        request.protocols,
+    )?;
 
-    if *topology == Topology::SplitServices {
-        return generate_split_service_topology(name, &selected_protocols);
+    if *request.topology == Topology::SplitServices {
+        return generate_split_service_topology(root, name, &selected_protocols, request.deps);
     }
 
-    let path = PathBuf::from(name);
+    let path = root.join(name);
     if path.exists() {
         anyhow::bail!("Directory '{}' already exists", name);
     }
@@ -56,58 +81,22 @@ fn generate_service(
         feature_names.push(DEFAULT_FEATURE);
     }
 
-    let cargo_toml = render_service_manifest(name, &feature_names);
+    let cargo_toml = render_service_manifest(name, &feature_names, request.deps);
 
     fs::write(path.join("Cargo.toml"), cargo_toml)?;
     fs::create_dir(path.join("src"))?;
 
-    let mut main_rs = r#"use anyhow::Result;
-use async_trait::async_trait;
-use krab_core::service::ApiService;
+    fs::write(
+        path.join("src/main.rs"),
+        render_service_main(request.exposure_mode, &selected_protocols),
+    )?;
 
-struct Service;
-
-#[async_trait]
-impl ApiService for Service {
-    async fn start(&self) -> Result<()> {
-        println!("Service started!");
-        Ok(())
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
-    println!("exposure_mode=__EXPOSURE_MODE__");
-    println!("protocols=__PROTOCOLS__");
-    let service = Service;
-    service.start().await
-}
-"#
-    .to_string();
-    let exposure_mode_value = match exposure_mode {
-        ExposureMode::Single => "single",
-        ExposureMode::Multi => "multi",
-    };
-    let protocols_value = selected_protocols
-        .iter()
-        .map(protocol_label)
-        .collect::<Vec<&str>>()
-        .join(",");
-    main_rs = main_rs
-        .replace("__EXPOSURE_MODE__", exposure_mode_value)
-        .replace("__PROTOCOLS__", &protocols_value);
-    fs::write(path.join("src/main.rs"), main_rs)?;
-
-    if *exposure_mode == ExposureMode::Multi {
+    if *request.exposure_mode == ExposureMode::Multi {
         generate_multi_mode_layout(&path, &selected_protocols)?;
     }
 
     println!("✅ Service '{}' created successfully!", name);
-    println!(
-        "👉 Add '{}' to your workspace Cargo.toml members list.",
-        name
-    );
+    println!("{}", render_service_next_step(root, &[name.to_string()]));
     // `--type rpc` produces `features = ["rest"]`, which looks like the flag was
     // ignored unless the mapping is stated.
     if selected_protocols.contains(&ServiceType::Rpc) {
@@ -117,16 +106,134 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// The nearest directory at or above `start` whose `Cargo.toml` declares a
+/// `[workspace]`, which is the manifest Cargo itself would treat as the
+/// workspace root for a crate created under `start`.
+///
+/// A manifest that cannot be read or parsed is passed over rather than
+/// treated as an error: this only chooses which hint to print.
+fn enclosing_workspace_root(start: &Path) -> Option<PathBuf> {
+    let start = start.canonicalize().ok()?;
+    start.ancestors().find_map(|dir| {
+        let raw = fs::read_to_string(dir.join("Cargo.toml")).ok()?;
+        let manifest: toml::Value = toml::from_str(&raw).ok()?;
+        manifest.get("workspace")?;
+        Some(dir.to_path_buf())
+    })
+}
+
+/// What to do after `krab gen service`, which depends on where it ran.
+///
+/// It used to print `"Add '<name>' to your workspace Cargo.toml members list"`
+/// unconditionally. A `krab new` project has no `[workspace]`, so there was no
+/// list to add to — and adding one to a package manifest is not what makes the
+/// new crate build. Inside a workspace, Cargo refuses to build a crate under
+/// the workspace root that the members list does not name, so the hint is
+/// right there and names the exact entry; everywhere else the crate is
+/// standalone and simply builds from its own directory.
+fn render_service_next_step(root: &Path, crates: &[String]) -> String {
+    match enclosing_workspace_root(root) {
+        Some(workspace_root) => {
+            let base = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+            let members = crates
+                .iter()
+                .map(|name| {
+                    let member = base
+                        .join(name)
+                        .strip_prefix(&workspace_root)
+                        .map(|relative| relative.to_path_buf())
+                        .unwrap_or_else(|_| PathBuf::from(name));
+                    format!("\"{}\"", member.to_string_lossy().replace('\\', "/"))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "👉 Add {members} to `[workspace] members` in {}; Cargo will not build a crate \
+                 under the workspace root that the members list leaves out.",
+                // Canonical paths carry a `\\?\` prefix on Windows; strip it
+                // so the hint shows the path the user would type.
+                crate::project_template::path_for_toml(&workspace_root.join("Cargo.toml"))
+            )
+        }
+        None => {
+            let commands = crates
+                .iter()
+                .map(|name| format!("`cd {name} && cargo build`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "👉 No Cargo workspace encloses this directory, so the generated crate is \
+                 standalone: build it with {commands}."
+            )
+        }
+    }
+}
+
+/// Render `src/main.rs` for a generated single-crate service.
+///
+/// In multi mode the crate also carries `capabilities.rs`, `domain/` and
+/// `adapters/`. Those used to be written without a single `mod` declaration,
+/// so none of it was ever compiled — a type error in the generated domain
+/// layer, or in the user's first edit to it, went unnoticed by `cargo build`.
+/// The modules are now declared and `main` calls into them, which also keeps
+/// the scaffold free of `dead_code` warnings under `-D warnings`.
+fn render_service_main(exposure_mode: &ExposureMode, protocols: &[ServiceType]) -> String {
+    let multi = *exposure_mode == ExposureMode::Multi;
+    let exposure_mode_value = if multi { "multi" } else { "single" };
+    let protocols_value = protocols
+        .iter()
+        .map(protocol_label)
+        .collect::<Vec<&str>>()
+        .join(",");
+
+    let modules = if multi {
+        "mod adapters;\nmod capabilities;\nmod domain;\n\n"
+    } else {
+        ""
+    };
+    let capabilities = if multi {
+        "    for capability in capabilities::build_capabilities() {\n        \
+         println!(\"capability={capability}\");\n    }\n"
+    } else {
+        ""
+    };
+
+    format!(
+        r#"{modules}use anyhow::Result;
+use async_trait::async_trait;
+use krab_core::service::ApiService;
+
+struct Service;
+
+#[async_trait]
+impl ApiService for Service {{
+    async fn start(&self) -> Result<()> {{
+        println!("Service started!");
+        Ok(())
+    }}
+}}
+
+#[tokio::main]
+async fn main() -> Result<()> {{
+    tracing_subscriber::fmt::init();
+    println!("exposure_mode={exposure_mode_value}");
+    println!("protocols={protocols_value}");
+{capabilities}    let service = Service;
+    service.start().await
+}}
+"#
+    )
+}
+
 /// The `krab_core` Cargo feature a generated service needs for one protocol.
 ///
 /// Two mappings are not one-to-one and are deliberate:
 ///
 /// - `Rpc` has no feature of its own; Krab serves RPC over the REST surface.
 ///   `generate_service` prints a note so the substitution is visible.
-/// - `Grpc` maps to `grpc-semantics`, the canonical name. The `grpc` alias is
-///   deprecated in `krab_core`'s manifest and slated for removal from 0.3.0
-///   onwards, so scaffolding against it would pin every new project to a
-///   feature that is going away. See ADR 0007 for why the name changed.
+/// - `Grpc` maps to `grpc-semantics`, the canonical name. The `grpc` alias was
+///   removed from `krab_core` in 0.6.0, so a manifest naming it no longer
+///   resolves. See ADR 0007 for why the name changed.
 fn protocol_feature(protocol: &ServiceType) -> &'static str {
     match protocol {
         ServiceType::Rest => "rest",
@@ -147,7 +254,10 @@ const DEFAULT_FEATURE: &str = "rest";
 /// no generated service could ever resolve its dependencies. `async-trait` is
 /// declared because the generated `main.rs` implements
 /// `krab_core::service::ApiService` with `#[async_trait]`.
-fn render_service_manifest(name: &str, feature_names: &[&str]) -> String {
+///
+/// `deps` is `--path-deps`: [`DependencySource::Registry`] reproduces the
+/// crates.io line exactly, [`DependencySource::Path`] points at a checkout.
+fn render_service_manifest(name: &str, feature_names: &[&str], deps: &DependencySource) -> String {
     format!(
         r#"[package]
 name = "{name}"
@@ -156,28 +266,30 @@ edition = "2021"
 
 [dependencies]
 tokio = {{ version = "1.0", features = ["full"] }}
-krab_core = {{ version = "{version}", features = [{features}] }}
+{krab_core}
 async-trait = "0.1"
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 serde = {{ version = "1.0", features = ["derive"] }}
 "#,
-        version = crate::project_template::FRAMEWORK_VERSION,
-        features = feature_names
-            .iter()
-            .map(|f| format!("\"{}\"", f))
-            .collect::<Vec<String>>()
-            .join(", ")
+        krab_core = deps.render("krab_core", KRAB_CORE_DIR, feature_names),
     )
 }
 
+/// `krab_core`'s location inside a Krab checkout, for `--path-deps`.
+const KRAB_CORE_DIR: &str = "crates/framework/krab_core";
+
 /// Render the manifest for one protocol-adapter crate of a split topology.
 /// Same registry-resolution rationale as [`render_service_manifest`].
-fn render_split_adapter_manifest(crate_name: &str, domain_name: &str) -> String {
+fn render_split_adapter_manifest(
+    crate_name: &str,
+    domain_name: &str,
+    deps: &DependencySource,
+) -> String {
     format!(
-        "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{domain_name} = {{ path = \"../{domain_name}\" }}\nkrab_core = {{ version = \"{version}\", features = [\"rest\"] }}\n",
-        version = crate::project_template::FRAMEWORK_VERSION
+        "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{domain_name} = {{ path = \"../{domain_name}\" }}\n{krab_core}\n",
+        krab_core = deps.render("krab_core", KRAB_CORE_DIR, &["rest"]),
     )
 }
 
@@ -207,50 +319,137 @@ fn resolve_protocols(
     Ok(deduped)
 }
 
+const MULTI_DOMAIN_MOD_RS: &str = "pub mod models;\npub mod service;\n";
+
+const MULTI_DOMAIN_MODELS_RS: &str = "\
+/// The service's core entity. Replace the unit struct with real fields.
+#[derive(Debug, Clone, Default)]
+pub struct DomainModel;
+";
+
+const MULTI_DOMAIN_SERVICE_RS: &str = r#"use super::models::DomainModel;
+
+/// Business logic shared by every protocol adapter. Adapters translate their
+/// protocol into calls on this trait and never reach past it.
+pub trait DomainService: Send + Sync {
+    fn describe(&self, model: &DomainModel) -> String;
+}
+
+/// Placeholder implementation the generated adapters are wired against.
+pub struct DefaultDomainService;
+
+impl DomainService for DefaultDomainService {
+    fn describe(&self, model: &DomainModel) -> String {
+        format!("{model:?}")
+    }
+}
+"#;
+
+/// The module names of the adapters a multi-mode service gets, in protocol
+/// order. Falls back to `rest` when resolution produced nothing.
+fn multi_adapter_modules(selected_protocols: &[ServiceType]) -> Vec<String> {
+    let mut modules: Vec<String> = selected_protocols
+        .iter()
+        .map(|protocol| protocol_label(protocol).replace('-', "_"))
+        .collect();
+    if modules.is_empty() {
+        modules.push("rest".to_string());
+    }
+    modules
+}
+
+/// One adapter module: a thin translation onto [`MULTI_DOMAIN_SERVICE_RS`].
+fn render_multi_adapter(module: &str) -> String {
+    format!(
+        r#"use crate::domain::models::DomainModel;
+use crate::domain::service::DomainService;
+
+/// What the `{module}` adapter serves. Replace with the real mount for this
+/// protocol (a router, a schema, or an RPC table) built on `service`.
+pub fn capability(service: &dyn DomainService) -> String {{
+    format!("{module}: {{}}", service.describe(&DomainModel))
+}}
+"#
+    )
+}
+
+/// `adapters/mod.rs`: declarations sorted, because rustfmt's
+/// `reorder_modules` sorts them and the generated-project gate runs
+/// `cargo fmt --check`.
+fn render_multi_adapters_mod(modules: &[String]) -> String {
+    let mut sorted = modules.to_vec();
+    sorted.sort();
+    sorted
+        .iter()
+        .map(|module| format!("pub mod {module};\n"))
+        .collect()
+}
+
+/// `capabilities.rs`: calls every adapter, which is what makes the whole
+/// generated module tree reachable from `main`.
+///
+/// One adapter renders as `vec![x]` and several as one element per line —
+/// the two shapes rustfmt itself produces for these lengths.
+fn render_multi_capabilities(modules: &[String]) -> String {
+    let calls: Vec<String> = modules
+        .iter()
+        .map(|module| format!("adapters::{module}::capability(&service)"))
+        .collect();
+    let body = if calls.len() == 1 {
+        format!("    vec![{}]\n", calls[0])
+    } else {
+        let mut body = "    vec![\n".to_string();
+        for call in &calls {
+            body.push_str(&format!("        {call},\n"));
+        }
+        body.push_str("    ]\n");
+        body
+    };
+    format!(
+        "use crate::adapters;\nuse crate::domain::service::DefaultDomainService;\n\n\
+         /// One entry per protocol adapter this service mounts.\n\
+         pub fn build_capabilities() -> Vec<String> {{\n    \
+         let service = DefaultDomainService;\n{body}}}\n"
+    )
+}
+
 fn generate_multi_mode_layout(path: &Path, selected_protocols: &[ServiceType]) -> Result<()> {
     let domain_dir = path.join("src/domain");
     let adapters_dir = path.join("src/adapters");
     fs::create_dir_all(&domain_dir)?;
     fs::create_dir_all(&adapters_dir)?;
 
+    let modules = multi_adapter_modules(selected_protocols);
+
     fs::write(
         path.join("src/capabilities.rs"),
-        "pub fn build_capabilities() {}\n",
+        render_multi_capabilities(&modules),
     )?;
-    fs::write(
-        path.join("src/domain/mod.rs"),
-        "pub mod models;\npub mod service;\n",
-    )?;
-    fs::write(
-        path.join("src/domain/models.rs"),
-        "#[derive(Debug, Clone)]\npub struct DomainModel;\n",
-    )?;
-    fs::write(
-        path.join("src/domain/service.rs"),
-        "pub trait DomainService: Send + Sync {}\n",
-    )?;
+    fs::write(domain_dir.join("mod.rs"), MULTI_DOMAIN_MOD_RS)?;
+    fs::write(domain_dir.join("models.rs"), MULTI_DOMAIN_MODELS_RS)?;
+    fs::write(domain_dir.join("service.rs"), MULTI_DOMAIN_SERVICE_RS)?;
 
-    let mut mod_rs = String::new();
-    for protocol in selected_protocols {
-        let label = protocol_label(protocol);
-        let module_name = label.replace('-', "_");
-        mod_rs.push_str(&format!("pub mod {};\n", module_name));
+    for module in &modules {
         fs::write(
-            adapters_dir.join(format!("{}.rs", module_name)),
-            format!("pub fn mount_{}() {{}}\n", module_name),
+            adapters_dir.join(format!("{module}.rs")),
+            render_multi_adapter(module),
         )?;
     }
-    if mod_rs.is_empty() {
-        mod_rs.push_str("pub mod rest;\n");
-        fs::write(adapters_dir.join("rest.rs"), "pub fn mount_rest() {}\n")?;
-    }
-    fs::write(adapters_dir.join("mod.rs"), mod_rs)?;
+    fs::write(
+        adapters_dir.join("mod.rs"),
+        render_multi_adapters_mod(&modules),
+    )?;
     Ok(())
 }
 
-fn generate_split_service_topology(name: &str, selected_protocols: &[ServiceType]) -> Result<()> {
+fn generate_split_service_topology(
+    root: &Path,
+    name: &str,
+    selected_protocols: &[ServiceType],
+    deps: &DependencySource,
+) -> Result<()> {
     let domain_name = format!("{}-domain", name);
-    let domain_path = PathBuf::from(&domain_name);
+    let domain_path = root.join(&domain_name);
     if domain_path.exists() {
         anyhow::bail!("Directory '{}' already exists", domain_name);
     }
@@ -273,7 +472,7 @@ fn generate_split_service_topology(name: &str, selected_protocols: &[ServiceType
     for protocol in selected_protocols {
         let label = protocol_label(protocol);
         let crate_name = format!("{}-{}", name, label);
-        let crate_path = PathBuf::from(&crate_name);
+        let crate_path = root.join(&crate_name);
         if crate_path.exists() {
             anyhow::bail!("Directory '{}' already exists", crate_name);
         }
@@ -282,7 +481,7 @@ fn generate_split_service_topology(name: &str, selected_protocols: &[ServiceType
         fs::create_dir_all(crate_path.join("src/domain"))?;
         fs::write(
             crate_path.join("Cargo.toml"),
-            render_split_adapter_manifest(&crate_name, &domain_name),
+            render_split_adapter_manifest(&crate_name, &domain_name, deps),
         )?;
         fs::write(
             crate_path.join("src/main.rs"),
@@ -305,6 +504,9 @@ fn generate_split_service_topology(name: &str, selected_protocols: &[ServiceType
         domain_name
     );
     println!("👉 Generated protocol crates: {}", created.join(", "));
+    let mut crates = vec![domain_name];
+    crates.extend(created);
+    println!("{}", render_service_next_step(root, &crates));
     Ok(())
 }
 
@@ -860,13 +1062,17 @@ pub async fn {}(input: String) -> Result<String, ServerFnError> {{
 #[cfg(test)]
 mod tests {
     use super::{
+        enclosing_workspace_root, generate_service_in, render_service_next_step, ServiceRequest,
+    };
+    use super::{
         generate_component_in, generate_route_in, generate_server_function_in, protocol_feature,
         render_component, render_manual_wiring, render_route, render_server_function,
         render_server_function_endpoint_hint, render_service_manifest,
         render_split_adapter_manifest, route_registration, write_new_file, FileOutcome,
         DEFAULT_FEATURE, MERGE_PLACEMENT, MODULE_PLACEMENT,
     };
-    use crate::ServiceType;
+    use crate::project_template::DependencySource;
+    use crate::{ExposureMode, ServiceType, Topology};
     use anyhow::Result;
     use clap::ValueEnum;
     use std::fs;
@@ -889,7 +1095,11 @@ mod tests {
     /// could compile.
     #[test]
     fn service_manifest_parses_declares_async_trait_and_registry_krab_core() {
-        let manifest = render_service_manifest("demo_service", &["rest", "graphql"]);
+        let manifest = render_service_manifest(
+            "demo_service",
+            &["rest", "graphql"],
+            &DependencySource::Registry,
+        );
         let deps = dependencies_of(&manifest);
 
         assert!(
@@ -939,13 +1149,11 @@ mod tests {
             .collect()
     }
 
-    /// Deprecated `krab_core` feature aliases: `grpc` -> `grpc-semantics` and
-    /// `db` -> `db-postgres`. Both still resolve, which is precisely the hazard
-    /// — their manifest comments read "Remove no earlier than 0.3.0" and the
-    /// workspace is past that, so a project scaffolded against one is pinned to
-    /// a feature scheduled for deletion. `ServiceType::Grpc` emitted `grpc`
-    /// until this was caught, and a declared-features check alone could not see
-    /// it because the alias was declared.
+    /// Former `krab_core` feature aliases: `grpc` -> `grpc-semantics` and
+    /// `db` -> `db-postgres`, removed in 0.6.0. The declared-features check
+    /// below now catches them on its own, since they are no longer declared;
+    /// this list stays as a named guard so a reintroduced alias fails with a
+    /// message that says why. `ServiceType::Grpc` emitted `grpc` until 0.4.0.
     const DEPRECATED_FEATURE_ALIASES: &[&str] = &["grpc", "db"];
 
     /// Every `krab_core` feature `generate_service` can put in a manifest.
@@ -1402,7 +1610,11 @@ async fn main() {
 
     #[test]
     fn split_adapter_manifest_parses_and_uses_registry_krab_core() {
-        let manifest = render_split_adapter_manifest("users-rest", "users-domain");
+        let manifest = render_split_adapter_manifest(
+            "users-rest",
+            "users-domain",
+            &DependencySource::Registry,
+        );
         let deps = dependencies_of(&manifest);
 
         let core = deps.get("krab_core").expect("krab_core is a dependency");
@@ -1419,6 +1631,237 @@ async fn main() {
             domain.get("path").and_then(|p| p.as_str()),
             Some("../users-domain")
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // `krab gen service`.
+    // ---------------------------------------------------------------------
+
+    fn gen_service(
+        root: &Path,
+        name: &str,
+        exposure_mode: ExposureMode,
+        protocols: Option<Vec<ServiceType>>,
+        deps: &DependencySource,
+    ) -> Result<()> {
+        generate_service_in(
+            root,
+            &ServiceRequest {
+                name,
+                service_type: &ServiceType::Rest,
+                exposure_mode: &exposure_mode,
+                protocols: &protocols,
+                topology: &Topology::SingleService,
+                deps,
+            },
+        )
+    }
+
+    fn rustfmt_available() -> bool {
+        std::process::Command::new("rustfmt")
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Multi mode wrote `capabilities.rs`, `domain/` and `adapters/` and
+    /// declared none of them, so none of it was ever compiled. Every file must
+    /// now be reachable from `main.rs`.
+    #[test]
+    fn multi_mode_declares_and_calls_every_generated_module() -> Result<()> {
+        let temp = TempDir::new()?;
+        gen_service(
+            temp.path(),
+            "billing",
+            ExposureMode::Multi,
+            Some(vec![ServiceType::Rest, ServiceType::Graphql]),
+            &DependencySource::Registry,
+        )?;
+        let root = temp.path().join("billing");
+
+        let main_rs = read(&root, "src/main.rs");
+        for decl in ["mod adapters;", "mod capabilities;", "mod domain;"] {
+            assert!(
+                main_rs.lines().any(|line| line.trim() == decl),
+                "src/main.rs must declare `{decl}`:\n{main_rs}"
+            );
+        }
+        assert!(
+            main_rs.contains("capabilities::build_capabilities()"),
+            "{main_rs}"
+        );
+
+        let adapters_mod = read(&root, "src/adapters/mod.rs");
+        assert_eq!(adapters_mod, "pub mod graphql;\npub mod rest;\n");
+        let capabilities = read(&root, "src/capabilities.rs");
+        for module in ["rest", "graphql"] {
+            assert!(
+                capabilities.contains(&format!("adapters::{module}::capability(&service)")),
+                "{capabilities}"
+            );
+            assert!(root.join(format!("src/adapters/{module}.rs")).is_file());
+        }
+        // Every domain item is used by an adapter, so `-D warnings` has no
+        // dead code to reject.
+        let adapter = read(&root, "src/adapters/rest.rs");
+        assert!(
+            adapter.contains("service.describe(&DomainModel)"),
+            "{adapter}"
+        );
+        Ok(())
+    }
+
+    /// Single mode must not grow module declarations for files it never
+    /// writes.
+    #[test]
+    fn single_mode_declares_no_modules() -> Result<()> {
+        let temp = TempDir::new()?;
+        gen_service(
+            temp.path(),
+            "payments",
+            ExposureMode::Single,
+            None,
+            &DependencySource::Registry,
+        )?;
+        let root = temp.path().join("payments");
+
+        let main_rs = read(&root, "src/main.rs");
+        assert!(!main_rs.contains("mod "), "{main_rs}");
+        assert!(!root.join("src/capabilities.rs").exists());
+        assert!(
+            main_rs.contains("println!(\"protocols=rest\");"),
+            "{main_rs}"
+        );
+        Ok(())
+    }
+
+    /// The generated-project gate runs `cargo fmt --check` over a generated
+    /// service, so the multi-mode tree has to come out rustfmt-clean for one
+    /// adapter and for several (`vec!` formats differently for each).
+    #[test]
+    fn generated_services_are_rustfmt_clean() -> Result<()> {
+        if !rustfmt_available() {
+            eprintln!("rustfmt is not on PATH; skipping the formatting gate");
+            return Ok(());
+        }
+        let temp = TempDir::new()?;
+        for (name, mode, protocols) in [
+            ("single_svc", ExposureMode::Single, None),
+            (
+                "multi_one",
+                ExposureMode::Multi,
+                Some(vec![ServiceType::Rest]),
+            ),
+            (
+                "multi_all",
+                ExposureMode::Multi,
+                Some(vec![
+                    ServiceType::Rest,
+                    ServiceType::Graphql,
+                    ServiceType::Rpc,
+                    ServiceType::Grpc,
+                ]),
+            ),
+        ] {
+            gen_service(
+                temp.path(),
+                name,
+                mode,
+                protocols,
+                &DependencySource::Registry,
+            )?;
+            let output = std::process::Command::new("rustfmt")
+                .args(["--edition", "2021", "--check"])
+                .arg(temp.path().join(name).join("src/main.rs"))
+                .output()?;
+            assert!(
+                output.status.success() && output.stdout.is_empty(),
+                "{name} is not rustfmt-clean:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+
+    /// `--path-deps` reaches the service manifest the same way it reaches
+    /// `krab new`'s: an absolute path into the checkout, no version.
+    #[test]
+    fn path_deps_point_the_service_manifest_at_the_checkout() -> Result<()> {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .canonicalize()?;
+        let deps = DependencySource::from_path_deps(Some(&repo_root))?;
+        let temp = TempDir::new()?;
+        gen_service(temp.path(), "svc", ExposureMode::Single, None, &deps)?;
+
+        let manifest = read(temp.path(), "svc/Cargo.toml");
+        let deps_table = dependencies_of(&manifest);
+        let core = deps_table.get("krab_core").expect("krab_core dependency");
+        assert!(core.get("version").is_none(), "{manifest}");
+        let path = core
+            .get("path")
+            .and_then(|p| p.as_str())
+            .expect("krab_core is a path dependency");
+        assert!(
+            path.ends_with("crates/framework/krab_core"),
+            "{path} should point into the checkout"
+        );
+        assert!(
+            Path::new(path).join("Cargo.toml").is_file(),
+            "{path} must resolve"
+        );
+        assert!(!path.contains('\\'), "TOML-hostile separator in {path}");
+        Ok(())
+    }
+
+    #[test]
+    fn path_deps_reject_a_directory_that_is_not_a_krab_checkout() {
+        let temp = TempDir::new().expect("tempdir");
+        let err = DependencySource::from_path_deps(Some(temp.path()))
+            .expect_err("an empty directory is not a checkout");
+        assert!(err.to_string().contains("not a Krab checkout"), "{err}");
+    }
+
+    /// No `[workspace]` anywhere above: there is no members list to add to,
+    /// and the hint used to say there was.
+    #[test]
+    fn next_step_outside_a_workspace_says_the_crate_is_standalone() -> Result<()> {
+        let temp = TempDir::new()?;
+        // A `krab new` project root: a package manifest, no [workspace].
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )?;
+
+        assert_eq!(enclosing_workspace_root(temp.path()), None);
+        let hint = render_service_next_step(temp.path(), &["svc".to_string()]);
+        assert!(!hint.contains("members"), "{hint}");
+        assert!(hint.contains("cd svc && cargo build"), "{hint}");
+        Ok(())
+    }
+
+    /// Inside a workspace the hint names the exact member entry, relative to
+    /// the workspace root rather than the directory the command ran in.
+    #[test]
+    fn next_step_inside_a_workspace_names_the_member_path() -> Result<()> {
+        let temp = TempDir::new()?;
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = []\nresolver = \"2\"\n",
+        )?;
+        let services = temp.path().join("services");
+        fs::create_dir_all(&services)?;
+
+        assert_eq!(
+            enclosing_workspace_root(&services),
+            Some(temp.path().canonicalize()?)
+        );
+        let hint = render_service_next_step(&services, &["svc".to_string()]);
+        assert!(hint.contains("\"services/svc\""), "{hint}");
+        assert!(hint.contains("[workspace] members"), "{hint}");
+        Ok(())
     }
 
     /// Items that do not exist in Krab. Earlier templates were written against

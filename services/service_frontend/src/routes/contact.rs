@@ -2,45 +2,18 @@ use axum::response::Html;
 use krab_core::Render;
 use krab_macros::view;
 
+/// The contact page.
+///
+/// No inline script and no `onsubmit=` attribute: Krab's CSP
+/// (`script-src 'self' 'wasm-unsafe-eval'`) blocks both, which left the form
+/// unwired. The submit handler is `/_krab/contact.js`, which attaches itself
+/// to `#contact-form` with `addEventListener`.
 pub async fn handler() -> Html<String> {
-    let script = r#"
-        async function submitContact(event) {
-            event.preventDefault();
-            const form = event.target;
-            const result = document.getElementById('contact-result');
-            const payload = {
-                name: form.name.value,
-                email: form.email.value,
-                message: form.message.value,
-            };
-
-            try {
-                const response = await fetch('/api/contact', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload),
-                });
-                const data = await response.json();
-                if (response.ok) {
-                    result.textContent = 'Message queued successfully.';
-                    result.dataset.state = 'success';
-                } else {
-                    result.textContent = data.message || 'Submission failed.';
-                    result.dataset.state = 'error';
-                }
-            } catch (err) {
-                result.textContent = 'Submission failed due to network error.';
-                result.dataset.state = 'error';
-                console.error('contact submission failed', err);
-            }
-        }
-    "#;
-
     Html(view! {
         <div>
             <h1>"Contact Us"</h1>
             <p>"Send us a message and we will follow up."</p>
-            <form onsubmit="submitContact(event)">
+            <form id="contact-form">
                 <label r#for="name">"Name"</label>
                 <input id="name" name="name" required="true" />
 
@@ -53,7 +26,7 @@ pub async fn handler() -> Html<String> {
                 <button r#type="submit">"Send"</button>
             </form>
             <p id="contact-result"></p>
-            <script>{script}</script>
+            <script r#type="module" src="/_krab/contact.js"></script>
         </div>
     }.render())
 }

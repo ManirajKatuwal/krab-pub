@@ -10,6 +10,15 @@
 | `LatencyBurnRateSlow` | P2 | `P2: Latency Burn Rate` |
 | `AuthBudgetBurnFast` | P2 | `P2: Auth Budget Burn` |
 | `AuthBudgetBurnSlow` | P2 | `P2: Auth Budget Burn` |
+| `ServiceNotReady` | P1 | `P1: Readiness Degradation` |
+| `HighErrorRate` | P2 (rule severity `warning`) | `P1: Availability SLO Degradation` |
+| `HighP99Latency` | P2 | `P2: Latency SLO Degradation` |
+| `AuthFailureBurst` | P2 | `P2: Auth Budget Burn` |
+
+Priority follows the rule's `severity` label (`critical` = P1, `warning` = P2).
+`ServiceDown`, `HighInflightRequests`, `ProtocolErrorRateSkew` and
+`SplitServiceNoTraffic` in [`monitoring/alert_rules.yml`](../../monitoring/alert_rules.yml)
+have no section here yet.
 
 ## P1: Availability Burn Rate
 
@@ -55,7 +64,7 @@
 ### Investigation Steps
 1. **Check Dashboard:** Is the error spike correlated with a specific route?
 2. **Check Logs:** Filter for `status=500` in logs. Look for panic stacks or DB connection errors.
-3. **Check Dependencies:** Is the database or auth provider down? (Check `Dependency Health` panel).
+3. **Check Dependencies:** Is the database or auth provider down? (Check the `Service Health` panel, and the failing instance's `/ready` body, which names the dependency).
 4. **Check Deployments:** Was there a recent deploy? If so, rollback immediately.
 
 ### Resolution
@@ -98,7 +107,7 @@
 4. Validate histogram contract and scrape freshness for:
    - `krab_http_request_duration_seconds_bucket`
    - `krab_http_request_duration_seconds_count`
-   - Compatibility aliases may exist for legacy dashboards: `krab_request_duration_ms_*`
+   - `krab_request_duration_seconds_bucket` is a deprecated alias (buckets only) kept through 0.6.x for dashboards built against the pre-0.6.0 name; it is removed in 0.7.0
 
 ### Actions
 - Reduce expensive query paths (indexes, batching, cache).
@@ -111,19 +120,21 @@
 - `AuthFailureBurst` and/or `AuthBudgetBurnFast` alert firing.
 
 ### Investigation Steps
-1. **Identify Source IP:** Check logs for `auth_failure` events and group by client IP.
-2. **Block Malicious Traffic:** If attack, block IP at WAF/Load Balancer level.
-3. **Check Configuration:** Ensure `KRAB_OIDC_ISSUER` and keys are correctly configured.
+1. **Identify the reason:** `sum by (reason) (rate(krab_auth_failures_by_reason_total[5m]))`. `expired` / `invalid_signature` / `credential_mismatch` spread across many IPs is usually a client or attack pattern; `unknown_key` or `key_retired` right after a rotation is configuration; `provider_unavailable` means verification is impossible right now (no key material, a JWKS that never loaded, or an unreachable revocation store) — fix the backend, not the callers.
+2. **Identify Source IP:** Check logs for `auth_failure` events and group by client IP.
+3. **Block Malicious Traffic:** If attack, block IP at WAF/Load Balancer level.
+4. **Check Configuration:** Ensure `KRAB_OIDC_ISSUER`, the key ring (`KRAB_JWT_ACTIVE_KID`, `KRAB_JWT_KEY_NOT_AFTER_JSON`) and any `KRAB_OIDC_JWKS_URL` are correctly configured.
 
 ### Additional Actions for Burn-Rate Alerts
-4. If `AuthBudgetBurnFast` persists, enable temporary protective controls (stricter rate limits, WAF rule).
-5. If `AuthBudgetBurnSlow` persists, create follow-up for client misconfiguration or abusive traffic source remediation.
+5. If `AuthBudgetBurnFast` persists, enable temporary protective controls (stricter rate limits, WAF rule).
+6. If `AuthBudgetBurnSlow` persists, create follow-up for client misconfiguration or abusive traffic source remediation.
 
 ### Hardening Controls to Verify During Incident
 
 - **Rate-limit store failure policy** (`KRAB_RATE_LIMIT_FAIL_OPEN`)
   - `true`: requests continue on store outage (availability priority)
   - `false`: requests are rejected with `429` on store outage (abuse-resistance priority)
+  - The auth-failure limiter always fails closed, answering `503` (not `429`) while its store is unreachable — a burst of `503`s on authenticated routes during a Redis incident is this, not rate limiting
 - **Proxy header trust** (`KRAB_TRUST_PROXY_HEADERS`)
   - `false` (default): ignores `x-forwarded-for` and `x-real-ip`
   - `true`: forwarded IP headers are trusted for per-IP controls

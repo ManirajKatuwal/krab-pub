@@ -1,0 +1,7 @@
+error: `xlink:href` cannot be a prop: props are struct fields, and `:` has no field spelling.
+         Namespaced attributes and directives apply only to HTML elements. Pass the value
+         as a plain prop and put the attribute on an element inside the component.
+  --> tests/compile_fail/component_namespaced_prop.rs:16:27
+   |
+16 |     let _ = view! { <Icon xlink:href="#star"/> }.render();
+   |                           ^^^^^

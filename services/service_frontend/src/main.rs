@@ -4,7 +4,6 @@ use axum::response::Html;
 use axum::{Json, Router};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
-use krab_client::components::{Counter, CounterProps, Likes, LikesProps, Toggle, ToggleProps};
 use krab_core::config::{Environment, KrabConfig};
 use krab_core::error_boundary::ErrorBoundary;
 use krab_core::http::{apply_common_http_layers, HasRuntimeState, RuntimeState};
@@ -13,12 +12,13 @@ use krab_core::isr::{IsrCache, IsrPolicy};
 use krab_core::render_stream::{is_finalized_ssr_snapshot, ChunkedStreamWriter, SuspenseState};
 use krab_core::service::{serve_with_graceful_shutdown, ServiceConfig};
 use krab_core::service_contract::TopologyRuntime;
-use krab_core::telemetry::init_tracing;
+use krab_core::telemetry::init_tracing_with_version;
 use krab_core::Render;
 use krab_macros::view;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
+use service_frontend_islands::{Counter, CounterProps, Likes, LikesProps, Toggle, ToggleProps};
 use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -34,6 +34,7 @@ mod protocol_client;
 mod render_policy;
 mod rendering;
 mod routes;
+mod streaming;
 // Reads the ambient KRAB_RUNTIME_TOPOLOGY / KRAB_RUNTIME_ENDPOINTS_JSON that
 // `.github/workflows/topology-matrix.yaml` exports, so the two matrix legs
 // exercise different code. Its tests carry `#[serial_test::serial]` so they do
@@ -53,7 +54,9 @@ use crate::frontend_env::{
 };
 use crate::protocol_client::ProtocolAwareClient;
 use crate::render_policy::page_render_policy;
-use crate::rendering::{canonical_url, render_about_page, render_blog_page, render_greet_page};
+use crate::rendering::{
+    canonical_url, render_about_page, render_blog_page, render_greet_page, site_nav,
+};
 use crate::routes::register_frontend_routes;
 
 const SERVER_FUNCTION_VERSION: &str = "2026-02-27.1";
@@ -181,17 +184,21 @@ fn render_home_page_localized(locale: &str) -> String {
     let rendered = i18n.t("rendered");
     let hydration_mode = HydrationMode::from_env();
     let hydration_budget = hydration_budget_for_route("/", hydration_mode);
-    let hydration_preloads = hydration_preload_links_html(&hydration_budget);
+    let bundle_digest = client_bundle_digest();
+    let bundle_integrity = bundle_digest
+        .as_deref()
+        .map(|(_, integrity)| integrity.as_str());
+    let hydration_preloads = hydration_preload_links_html(&hydration_budget, bundle_integrity);
     let ttfb_budget_ms = u64_env("KRAB_HYDRATION_BUDGET_HOME_TTFB_MS", 800);
     let minimal_js_audit = bool_env("KRAB_MINIMAL_JS_AUDIT", true);
 
     let counter = Counter(CounterProps { initial: 10 });
     let toggle = Toggle(ToggleProps { initial: false });
     let likes = Likes(LikesProps { initial: 3 });
-    let critical_islands_json =
-        serde_json::to_string(&vec!["Counter"]).unwrap_or_else(|_| "[\"Counter\"]".to_string());
-    let deferred_islands_json = serde_json::to_string(&vec!["Toggle", "Likes"])
-        .unwrap_or_else(|_| "[\"Toggle\",\"Likes\"]".to_string());
+    // Only the deferred set is listed: every other island on the page is
+    // critical by construction (see `criticalIslandSelector` in the script), so
+    // `Counter` hydrates eagerly without being named here.
+    let deferred_islands = ["Toggle", "Likes"];
 
     tracing::info!(
         event = "hydration_mode_selected",
@@ -213,378 +220,23 @@ fn render_home_page_localized(locale: &str) -> String {
         );
     }
 
-    let runtime_script_base = r#"
-                    function hydrationDiag(code, level, detail, extra = {}) {
-                        const payload = {
-                            code,
-                            mode: KRAB_HYDRATION_MODE,
-                            detail,
-                            ...extra,
-                        };
-                        if (level === 'error') {
-                            console.error('[krab-hydration]', payload);
-                        } else if (level === 'warn') {
-                            console.warn('[krab-hydration]', payload);
-                        } else {
-                            console.log('[krab-hydration]', payload);
-                        }
-                    }
-
-                    async function loadHydratorModule() {
-                        const mod = await import('/pkg/krab_client.js');
-                        return {
-                            init: mod.default,
-                            hydrate: mod.hydrate,
-                        };
-                    }
-
-                    const SERVER_FUNCTION_VERSION = '2026-02-27.1';
-
-                    function asObject(value) {
-                        return !!value && typeof value === 'object' && !Array.isArray(value);
-                    }
-
-                    function setText(id, text) {
-                        const el = document.getElementById(id);
-                        if (el) {
-                            el.textContent = text;
-                        }
-                    }
-
-                    function markDegraded(reason) {
-                        const el = document.getElementById('frontend-degraded');
-                        if (el) {
-                            el.textContent = '⚠ partial functionality mode: ' + reason;
-                        }
-                    }
-
-                    function classifyIslandsForDeferredHydration() {
-                        const critical = new Set(KRAB_CRITICAL_ISLANDS);
-                        const deferred = new Set(KRAB_DEFERRED_ISLANDS);
-                        document.querySelectorAll('[data-island]').forEach((el) => {
-                            const name = el.getAttribute('data-island') || '';
-                            const priority = critical.has(name)
-                                ? 'critical'
-                                : (deferred.has(name) ? 'deferred' : 'critical');
-
-                            el.setAttribute('data-krab-priority', priority);
-
-                            if (priority === 'deferred') {
-                                el.setAttribute('data-island-deferred', name);
-                                el.removeAttribute('data-island');
-                            }
-                        });
-                    }
-
-                    function freezeCriticalIslandsAfterHydration() {
-                        document.querySelectorAll('[data-island][data-krab-priority="critical"]').forEach((el) => {
-                            const name = el.getAttribute('data-island');
-                            if (name) {
-                                el.setAttribute('data-island-hydrated', name);
-                                el.removeAttribute('data-island');
-                            }
-                        });
-                    }
-
-                    function activateDeferredIslands() {
-                        document.querySelectorAll('[data-island-deferred]').forEach((el) => {
-                            const name = el.getAttribute('data-island-deferred');
-                            if (name) {
-                                el.setAttribute('data-island', name);
-                                el.removeAttribute('data-island-deferred');
-                            }
-                        });
-                    }
-
-                    function scheduleDeferredHydration(hydrator) {
-                        const runDeferred = () => {
-                            try {
-                                activateDeferredIslands();
-                                hydrator.hydrate();
-                                document.querySelectorAll('[data-island][data-krab-priority="deferred"]').forEach((el) => {
-                                    const name = el.getAttribute('data-island');
-                                    if (name) {
-                                        el.setAttribute('data-island-hydrated', name);
-                                        el.removeAttribute('data-island');
-                                    }
-                                });
-                            } catch (err) {
-                                hydrationDiag(
-                                    'KRAB-HYDRATE-510',
-                                    'warn',
-                                    'deferred hydration failed; continuing in partial mode',
-                                    { error: String(err) }
-                                );
-                                markDegraded('deferred island hydration failed');
-                            }
-                        };
-
-                        if ('requestIdleCallback' in window) {
-                            window.requestIdleCallback(runDeferred, { timeout: 1200 });
-                        } else {
-                            setTimeout(runDeferred, 250);
-                        }
-                    }
-
-                    function wireMinimalJsCounter(root) {
-                        const button = root.querySelector('button');
-                        const valueNode = root.querySelector('span');
-                        if (!button || !valueNode) {
-                            return false;
-                        }
-                        button.addEventListener('click', () => {
-                            const parsed = Number.parseInt((valueNode.textContent || '').trim(), 10);
-                            const next = Number.isFinite(parsed) ? parsed + 1 : 1;
-                            valueNode.textContent = String(next);
-                        });
-                        return true;
-                    }
-
-                    function wireMinimalJsToggle(root) {
-                        const button = root.querySelector('button');
-                        const valueNode = root.querySelector('span');
-                        if (!button || !valueNode) {
-                            return false;
-                        }
-                        button.addEventListener('click', () => {
-                            const on = (valueNode.textContent || '').includes('ON');
-                            valueNode.textContent = on ? ' OFF' : ' ON';
-                        });
-                        return true;
-                    }
-
-                    function wireMinimalJsLikes(root) {
-                        const button = root.querySelector('button');
-                        const valueNode = root.querySelector('span');
-                        if (!button || !valueNode) {
-                            return false;
-                        }
-                        button.addEventListener('click', () => {
-                            const parsed = Number.parseInt((valueNode.textContent || '').trim(), 10);
-                            const next = Number.isFinite(parsed) ? parsed + 1 : 1;
-                            valueNode.textContent = String(next);
-                        });
-                        return true;
-                    }
-
-                    function enableMinimalJsFallback() {
-                        let wired = 0;
-                        document.querySelectorAll('[data-island]').forEach((root) => {
-                            const name = root.getAttribute('data-island') || '';
-                            let ok = false;
-                            if (name === 'Counter') {
-                                ok = wireMinimalJsCounter(root);
-                            } else if (name === 'Toggle') {
-                                ok = wireMinimalJsToggle(root);
-                            } else if (name === 'Likes') {
-                                ok = wireMinimalJsLikes(root);
-                            }
-
-                            if (ok) {
-                                wired += 1;
-                                root.setAttribute('data-krab-boundary-state', 'minimal_js');
-                            }
-                        });
-
-                        hydrationDiag('KRAB-HYDRATE-200', 'warn', 'minimal-js escape hatch activated', {
-                            wiredIslands: wired,
-                            auditEnabled: KRAB_MINIMAL_JS_AUDIT,
-                        });
-
-                        if (!KRAB_MINIMAL_JS_AUDIT) {
-                            hydrationDiag(
-                                'KRAB-HYDRATE-220',
-                                'warn',
-                                'minimal-js audit flag disabled; this mode is not policy-compliant'
-                            );
-                        }
-                    }
-
-                    function validateStatus(payload) {
-                        return asObject(payload)
-                            && payload.service === 'frontend'
-                            && (payload.status === 'ok' || payload.status === 'degraded');
-                    }
-
-                    function validateRpcNow(payload) {
-                        return asObject(payload)
-                            && Number.isFinite(payload.epoch_millis)
-                            && typeof payload.server_function_version === 'string';
-                    }
-
-                    function validateRpcVersion(payload) {
-                        return asObject(payload)
-                            && typeof payload.server_function_version === 'string'
-                            && typeof payload.policy === 'string';
-                    }
-
-                    function validateDashboard(payload) {
-                        return asObject(payload)
-                            && Number.isFinite(payload.users_online)
-                            && Number.isFinite(payload.active_sessions)
-                            && payload.feature === 'islands';
-                    }
-
-                    async function fetchJsonWithRetry(url, options = {}) {
-                        const timeoutMs = options.timeoutMs ?? 1200;
-                        const retries = options.retries ?? 2;
-                        const baseBackoffMs = options.baseBackoffMs ?? 150;
-                        const validator = options.validator;
-                        let lastError = null;
-
-                        for (let attempt = 0; attempt <= retries; attempt++) {
-                            const controller = new AbortController();
-                            const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-                            try {
-                                const response = await fetch(url, {
-                                    signal: controller.signal,
-                                    cache: 'no-store',
-                                });
-                                if (!response.ok) {
-                                    throw new Error('HTTP ' + response.status);
-                                }
-                                const json = await response.json();
-                                if (validator && !validator(json)) {
-                                    throw new Error('schema mismatch');
-                                }
-                                clearTimeout(timeoutId);
-                                return { ok: true, data: json };
-                            } catch (err) {
-                                clearTimeout(timeoutId);
-                                lastError = err;
-                                if (attempt < retries) {
-                                    const backoff = baseBackoffMs * (attempt + 1);
-                                    await new Promise(resolve => setTimeout(resolve, backoff));
-                                }
-                            }
-                        }
-
-                        return { ok: false, error: String(lastError) };
-                    }
-
-                    async function verifyManifestIntegrity() {
-                        const manifest = await fetchJsonWithRetry('/asset-manifest.json', {
-                            timeoutMs: 700,
-                            retries: 0,
-                            validator: payload => asObject(payload) && asObject(payload.assets),
-                        });
-
-                        if (!manifest.ok) {
-                            console.warn('manifest check skipped:', manifest.error);
-                            return;
-                        }
-
-                        const clientEntry = manifest.data.assets['krab_client.js'];
-                        const valid = asObject(clientEntry)
-                            && typeof clientEntry.path === 'string'
-                            && typeof clientEntry.integrity === 'string'
-                            && clientEntry.integrity.startsWith('sha256-')
-                            && clientEntry.immutable === true;
-
-                        if (!valid) {
-                            markDegraded('asset manifest integrity validation failed');
-                        }
-                    }
-
-                    function checkRouteBudgets(hydrationMs) {
-                        const nav = performance.getEntriesByType('navigation')[0];
-                        if (nav && nav.responseStart > ROUTE_BUDGETS.ttfbMs) {
-                            hydrationDiag('KRAB-HYDRATE-410', 'warn', 'TTFB budget exceeded', {
-                                ttfbMs: nav.responseStart,
-                                budgetMs: ROUTE_BUDGETS.ttfbMs,
-                            });
-                            console.warn('TTFB budget exceeded', {
-                                ttfbMs: nav.responseStart,
-                                budgetMs: ROUTE_BUDGETS.ttfbMs,
-                            });
-                        }
-
-                        if (hydrationMs > ROUTE_BUDGETS.hydrationMs) {
-                            hydrationDiag('KRAB-HYDRATE-411', 'warn', 'Hydration budget exceeded', {
-                                hydrationMs,
-                                budgetMs: ROUTE_BUDGETS.hydrationMs,
-                            });
-                            console.warn('Hydration budget exceeded', {
-                                hydrationMs,
-                                budgetMs: ROUTE_BUDGETS.hydrationMs,
-                            });
-                        }
-                    }
-
-                    async function loadData() {
-                        const [status, rpc, rpcVersion, dashboard] = await Promise.all([
-                            fetchJsonWithRetry('/api/status', { validator: validateStatus }),
-                            fetchJsonWithRetry('/rpc/now', { validator: validateRpcNow }),
-                            fetchJsonWithRetry('/rpc/version', { validator: validateRpcVersion }),
-                            fetchJsonWithRetry('/data/dashboard', { validator: validateDashboard }),
-                        ]);
-
-                        setText('status', status.ok ? JSON.stringify(status.data) : 'status unavailable');
-                        setText('rpc', rpc.ok ? JSON.stringify(rpc.data) : 'rpc unavailable');
-                        setText('version', rpcVersion.ok ? JSON.stringify(rpcVersion.data) : 'version unavailable');
-                        setText('dashboard', dashboard.ok ? JSON.stringify(dashboard.data) : 'dashboard unavailable');
-
-                        if (!status.ok || !rpc.ok || !rpcVersion.ok || !dashboard.ok) {
-                            markDegraded('one or more upstream APIs are unavailable');
-                        }
-                    }
-
-                    async function run() {
-                        const hydrationStart = performance.now();
-                        if (KRAB_HYDRATION_MODE === 'ssr_only') {
-                            markDegraded('SSR-only mode active');
-                            hydrationDiag('KRAB-HYDRATE-300', 'warn', 'SSR-only mode skips client hydration');
-                        } else if (KRAB_HYDRATION_MODE === 'minimal_js') {
-                            enableMinimalJsFallback();
-                        } else {
-                            try {
-                                classifyIslandsForDeferredHydration();
-                                const hydrator = await loadHydratorModule();
-                                await hydrator.init();
-                                hydrator.hydrate();
-                                freezeCriticalIslandsAfterHydration();
-                                scheduleDeferredHydration(hydrator);
-                            } catch (err) {
-                                markDegraded('hydration mismatch recovered via SSR fallback');
-                                hydrationDiag('KRAB-HYDRATE-500', 'error', 'WASM hydration bootstrap failed', {
-                                    error: String(err),
-                                });
-                                console.error('hydration failed:', err);
-                            }
-                        }
-                        const hydrationMs = performance.now() - hydrationStart;
-
-                        checkRouteBudgets(hydrationMs);
-                        await loadData();
-                        await verifyManifestIntegrity();
-
-                        if (SERVER_FUNCTION_VERSION !== '2026-02-27.1') {
-                            markDegraded('server function version mismatch');
-                        }
-
-                        // HMR
-                        if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
-                            const evtSource = new EventSource('/api/hmr');
-                            evtSource.onmessage = (e) => {
-                                console.log('HMR signal received:', e.data);
-                                // Full page reload is the current HMR strategy. Module-level hot
-                                // swapping would require DOM diffing that the runtime does not yet do.
-                                window.location.reload();
-                            };
-                        }
-                    }
-
-                    run();"#;
-    let runtime_script = format!(
-        "const KRAB_HYDRATION_MODE = \"{}\";\nconst KRAB_MINIMAL_JS_AUDIT = {};\nconst KRAB_CRITICAL_ISLANDS = {};\nconst KRAB_DEFERRED_ISLANDS = {};\nconst ROUTE_BUDGETS = {{ ttfbMs: {}, hydrationMs: {} }};\n{}",
-        hydration_mode.as_str(),
-        if minimal_js_audit { "true" } else { "false" },
-        critical_islands_json,
-        deferred_islands_json,
-        ttfb_budget_ms,
-        hydration_budget.max_startup_ms,
-        runtime_script_base
-    );
+    // Per-render settings travel as a JSON *data* block, and the code that
+    // reads them is the external `/_krab/home.js`. Krab's CSP is
+    // `script-src 'self'`, which blocks every inline executable script: the
+    // page used to carry its whole hydration runtime inline and so could not
+    // run under the framework's own security headers. A data block is not
+    // executed, so CSP does not apply to it.
+    let home_config = json!({
+        "hydrationMode": hydration_mode.as_str(),
+        "bundleIntegrity": bundle_integrity,
+        "minimalJsAudit": minimal_js_audit,
+        "deferredIslands": deferred_islands,
+        "routeBudgets": {
+            "ttfbMs": ttfb_budget_ms,
+            "hydrationMs": hydration_budget.max_startup_ms,
+        },
+    })
+    .to_string();
 
     let base_url = normalize_public_base_url();
     let canonical = canonical_url(&base_url, "/");
@@ -678,6 +330,16 @@ fn render_home_page_localized(locale: &str) -> String {
                         color: var(--text-color);
                         border: 1px solid var(--border);
                     }
+                    .site-nav {
+                        display: flex;
+                        gap: 1.5rem;
+                        justify-content: center;
+                        padding-top: 1.5rem;
+                    }
+                    .site-nav a {
+                        color: var(--secondary);
+                        text-decoration: none;
+                    }
                     .btn:hover {
                         transform: translateY(-2px);
                     }
@@ -738,12 +400,19 @@ fn render_home_page_localized(locale: &str) -> String {
                     "#
                 </style>
                 <script r#type="application/ld+json">{structured_data}</script>
-                <script r#type="module">
-                    {runtime_script}
-                </script>
+                <script r#type="application/json" id="krab-home-config">{home_config}</script>
+                <script r#type="module" src="/_krab/home.js"></script>
             </head>
             <body>
                 <div class="container">
+                    {site_nav()}
+                    // The router outlet: `start_router()` swaps only this
+                    // element's contents on an in-app navigation. The nav above
+                    // and the live-data panel below stay mounted, so the status
+                    // polling keeps its DOM across page changes. `tabindex` is
+                    // declared here rather than added by the router on the first
+                    // navigation, so it is in the server-rendered markup.
+                    <main class="page" data-krab-router-outlet="" tabindex="-1">
                     <header>
                         <h1>{hello}</h1>
                         <p class="tagline">
@@ -788,6 +457,7 @@ fn render_home_page_localized(locale: &str) -> String {
                             <div>{likes}</div>
                         </div>
                     </div>
+                    </main>
 
                     <div class="interactive-demo" style="margin-top: 2rem;">
                         <h2>"Real-Time Data"</h2>
@@ -833,6 +503,9 @@ fn render_home_page_localized(locale: &str) -> String {
     let _ = writer.write("<!DOCTYPE html>");
     let _ = writer.write_suspense_marker("home", SuspenseState::Pending);
     let _ = writer.write("<div data-krab-hydration=\"home\">");
+    // The module script is a plain text child of `<script>` above: `view!`
+    // emits raw-text elements verbatim (with `</script` neutralised), so it
+    // no longer needs splicing in after rendering.
     let mut rendered_html = guarded.render();
     if !hydration_preloads.is_empty() {
         rendered_html = rendered_html.replacen(
@@ -1034,9 +707,421 @@ fn spawn_hmr_signal_poller(hmr_tx: tokio::sync::watch::Sender<u64>) {
 }
 
 /// Directory holding the built client bundle, for manifest digests.
+/// The home page's hydration runtime, served as `/_krab/home.js`.
+///
+/// It reads its per-render settings from the `krab-home-config` JSON data
+/// block the page embeds. It used to be inline, which Krab's own CSP
+/// (`script-src 'self'`) blocks.
+pub(crate) fn home_runtime_js() -> &'static str {
+    static SCRIPT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SCRIPT.get_or_init(|| format!("{HOME_RUNTIME_PRELUDE}{HOME_RUNTIME_BODY}"))
+}
+
+const HOME_RUNTIME_PRELUDE: &str = r#"const __krabHomeConfig = JSON.parse(
+    document.getElementById('krab-home-config').textContent);
+const KRAB_HYDRATION_MODE = __krabHomeConfig.hydrationMode;
+const KRAB_BUNDLE_INTEGRITY = __krabHomeConfig.bundleIntegrity ?? null;
+const KRAB_MINIMAL_JS_AUDIT = __krabHomeConfig.minimalJsAudit === true;
+const KRAB_DEFERRED_ISLANDS = __krabHomeConfig.deferredIslands || [];
+const ROUTE_BUDGETS = __krabHomeConfig.routeBudgets;
+"#;
+
+const HOME_RUNTIME_BODY: &str = r#"
+                    function hydrationDiag(code, level, detail, extra = {}) {
+                        const payload = {
+                            code,
+                            mode: KRAB_HYDRATION_MODE,
+                            detail,
+                            ...extra,
+                        };
+                        if (level === 'error') {
+                            console.error('[krab-hydration]', payload);
+                        } else if (level === 'warn') {
+                            console.warn('[krab-hydration]', payload);
+                        } else {
+                            console.log('[krab-hydration]', payload);
+                        }
+                    }
+
+                    async function loadHydratorModule() {
+                        const mod = await import('/pkg/service_frontend_islands.js');
+                        return {
+                            init: mod.default,
+                            hydrateWithinSelector: mod.hydrate_within_selector,
+                            startRouter: mod.start_router,
+                        };
+                    }
+
+                    const SERVER_FUNCTION_VERSION = '2026-02-27.1';
+
+                    function asObject(value) {
+                        return !!value && typeof value === 'object' && !Array.isArray(value);
+                    }
+
+                    function setText(id, text) {
+                        const el = document.getElementById(id);
+                        if (el) {
+                            el.textContent = text;
+                        }
+                    }
+
+                    function markDegraded(reason) {
+                        const el = document.getElementById('frontend-degraded');
+                        if (el) {
+                            el.textContent = '⚠ partial functionality mode: ' + reason;
+                        }
+                    }
+
+                    // Hydration is staged by selector rather than by hiding
+                    // islands from the runtime. `hydrate_within_selector` skips
+                    // any boundary a previous pass already claimed, so the
+                    // deferred pass cannot double-bind the critical islands,
+                    // and it contains a panicking island to its own boundary.
+                    function islandSelector(names) {
+                        return names.map((name) => '[data-island="' + name + '"]').join(',');
+                    }
+
+                    // Every island not explicitly deferred is critical, so one
+                    // added to the page without being classified hydrates
+                    // eagerly rather than never.
+                    function criticalIslandSelector() {
+                        return '[data-island]' + KRAB_DEFERRED_ISLANDS
+                            .map((name) => ':not([data-island="' + name + '"])')
+                            .join('');
+                    }
+
+                    function reportFailedIslands(failed, phase) {
+                        if (failed > 0) {
+                            hydrationDiag(
+                                'KRAB-HYDRATE-510',
+                                'warn',
+                                phase + ' island hydration failed; continuing in partial mode',
+                                { failedIslands: failed }
+                            );
+                            markDegraded(phase + ' island hydration failed');
+                        }
+                    }
+
+                    function scheduleDeferredHydration(hydrator) {
+                        if (KRAB_DEFERRED_ISLANDS.length === 0) {
+                            return;
+                        }
+                        const runDeferred = () => {
+                            try {
+                                reportFailedIslands(
+                                    hydrator.hydrateWithinSelector(islandSelector(KRAB_DEFERRED_ISLANDS)),
+                                    'deferred'
+                                );
+                            } catch (err) {
+                                hydrationDiag(
+                                    'KRAB-HYDRATE-510',
+                                    'warn',
+                                    'deferred hydration failed; continuing in partial mode',
+                                    { error: String(err) }
+                                );
+                                markDegraded('deferred island hydration failed');
+                            }
+                        };
+
+                        if ('requestIdleCallback' in window) {
+                            window.requestIdleCallback(runDeferred, { timeout: 1200 });
+                        } else {
+                            setTimeout(runDeferred, 250);
+                        }
+                    }
+
+                    function wireMinimalJsCounter(root) {
+                        const button = root.querySelector('button');
+                        const valueNode = root.querySelector('span');
+                        if (!button || !valueNode) {
+                            return false;
+                        }
+                        button.addEventListener('click', () => {
+                            const parsed = Number.parseInt((valueNode.textContent || '').trim(), 10);
+                            const next = Number.isFinite(parsed) ? parsed + 1 : 1;
+                            valueNode.textContent = String(next);
+                        });
+                        return true;
+                    }
+
+                    function wireMinimalJsToggle(root) {
+                        const button = root.querySelector('button');
+                        const valueNode = root.querySelector('span');
+                        if (!button || !valueNode) {
+                            return false;
+                        }
+                        button.addEventListener('click', () => {
+                            const on = (valueNode.textContent || '').includes('ON');
+                            valueNode.textContent = on ? ' OFF' : ' ON';
+                        });
+                        return true;
+                    }
+
+                    function wireMinimalJsLikes(root) {
+                        const button = root.querySelector('button');
+                        const valueNode = root.querySelector('span');
+                        if (!button || !valueNode) {
+                            return false;
+                        }
+                        button.addEventListener('click', () => {
+                            const parsed = Number.parseInt((valueNode.textContent || '').trim(), 10);
+                            const next = Number.isFinite(parsed) ? parsed + 1 : 1;
+                            valueNode.textContent = String(next);
+                        });
+                        return true;
+                    }
+
+                    function enableMinimalJsFallback() {
+                        let wired = 0;
+                        document.querySelectorAll('[data-island]').forEach((root) => {
+                            const name = root.getAttribute('data-island') || '';
+                            let ok = false;
+                            if (name === 'Counter') {
+                                ok = wireMinimalJsCounter(root);
+                            } else if (name === 'Toggle') {
+                                ok = wireMinimalJsToggle(root);
+                            } else if (name === 'Likes') {
+                                ok = wireMinimalJsLikes(root);
+                            }
+
+                            if (ok) {
+                                wired += 1;
+                                root.setAttribute('data-krab-boundary-state', 'minimal_js');
+                            }
+                        });
+
+                        hydrationDiag('KRAB-HYDRATE-200', 'warn', 'minimal-js escape hatch activated', {
+                            wiredIslands: wired,
+                            auditEnabled: KRAB_MINIMAL_JS_AUDIT,
+                        });
+
+                        if (!KRAB_MINIMAL_JS_AUDIT) {
+                            hydrationDiag(
+                                'KRAB-HYDRATE-220',
+                                'warn',
+                                'minimal-js audit flag disabled; this mode is not policy-compliant'
+                            );
+                        }
+                    }
+
+                    function validateStatus(payload) {
+                        return asObject(payload)
+                            && payload.service === 'frontend'
+                            && (payload.status === 'ok' || payload.status === 'degraded');
+                    }
+
+                    function validateRpcNow(payload) {
+                        return asObject(payload)
+                            && Number.isFinite(payload.epoch_millis)
+                            && typeof payload.server_function_version === 'string';
+                    }
+
+                    function validateRpcVersion(payload) {
+                        return asObject(payload)
+                            && typeof payload.server_function_version === 'string'
+                            && typeof payload.policy === 'string';
+                    }
+
+                    function validateDashboard(payload) {
+                        return asObject(payload)
+                            && Number.isFinite(payload.users_online)
+                            && Number.isFinite(payload.active_sessions)
+                            && payload.feature === 'islands';
+                    }
+
+                    async function fetchJsonWithRetry(url, options = {}) {
+                        const timeoutMs = options.timeoutMs ?? 1200;
+                        const retries = options.retries ?? 2;
+                        const baseBackoffMs = options.baseBackoffMs ?? 150;
+                        const validator = options.validator;
+                        let lastError = null;
+
+                        for (let attempt = 0; attempt <= retries; attempt++) {
+                            const controller = new AbortController();
+                            const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+                            try {
+                                const response = await fetch(url, {
+                                    signal: controller.signal,
+                                    cache: 'no-store',
+                                });
+                                if (!response.ok) {
+                                    throw new Error('HTTP ' + response.status);
+                                }
+                                const json = await response.json();
+                                if (validator && !validator(json)) {
+                                    throw new Error('schema mismatch');
+                                }
+                                clearTimeout(timeoutId);
+                                return { ok: true, data: json };
+                            } catch (err) {
+                                clearTimeout(timeoutId);
+                                lastError = err;
+                                if (attempt < retries) {
+                                    const backoff = baseBackoffMs * (attempt + 1);
+                                    await new Promise(resolve => setTimeout(resolve, backoff));
+                                }
+                            }
+                        }
+
+                        return { ok: false, error: String(lastError) };
+                    }
+
+                    async function verifyManifestIntegrity() {
+                        const manifest = await fetchJsonWithRetry('/asset-manifest.json', {
+                            timeoutMs: 700,
+                            retries: 0,
+                            validator: payload => asObject(payload) && asObject(payload.assets),
+                        });
+
+                        if (!manifest.ok) {
+                            console.warn('manifest check skipped:', manifest.error);
+                            return;
+                        }
+
+                        const clientEntry = manifest.data.assets['service_frontend_islands.js'];
+                        const valid = asObject(clientEntry)
+                            && typeof clientEntry.path === 'string'
+                            && typeof clientEntry.integrity === 'string'
+                            && clientEntry.integrity.startsWith('sha256-')
+                            && clientEntry.immutable === true;
+
+                        if (!valid) {
+                            markDegraded('asset manifest integrity validation failed');
+                        } else if (KRAB_BUNDLE_INTEGRITY !== null
+                            && clientEntry.integrity !== KRAB_BUNDLE_INTEGRITY) {
+                            // The page and the manifest describe different
+                            // bundles: a deploy is mid-flight, or one of them
+                            // was tampered with. The import map already makes
+                            // the browser refuse a mismatched module.
+                            markDegraded('asset manifest integrity does not match this page');
+                        }
+                    }
+
+                    function checkRouteBudgets(hydrationMs) {
+                        const nav = performance.getEntriesByType('navigation')[0];
+                        if (nav && nav.responseStart > ROUTE_BUDGETS.ttfbMs) {
+                            hydrationDiag('KRAB-HYDRATE-410', 'warn', 'TTFB budget exceeded', {
+                                ttfbMs: nav.responseStart,
+                                budgetMs: ROUTE_BUDGETS.ttfbMs,
+                            });
+                            console.warn('TTFB budget exceeded', {
+                                ttfbMs: nav.responseStart,
+                                budgetMs: ROUTE_BUDGETS.ttfbMs,
+                            });
+                        }
+
+                        if (hydrationMs > ROUTE_BUDGETS.hydrationMs) {
+                            hydrationDiag('KRAB-HYDRATE-411', 'warn', 'Hydration budget exceeded', {
+                                hydrationMs,
+                                budgetMs: ROUTE_BUDGETS.hydrationMs,
+                            });
+                            console.warn('Hydration budget exceeded', {
+                                hydrationMs,
+                                budgetMs: ROUTE_BUDGETS.hydrationMs,
+                            });
+                        }
+                    }
+
+                    async function loadData() {
+                        const [status, rpc, rpcVersion, dashboard] = await Promise.all([
+                            fetchJsonWithRetry('/api/status', { validator: validateStatus }),
+                            fetchJsonWithRetry('/rpc/now', { validator: validateRpcNow }),
+                            fetchJsonWithRetry('/rpc/version', { validator: validateRpcVersion }),
+                            fetchJsonWithRetry('/data/dashboard', { validator: validateDashboard }),
+                        ]);
+
+                        setText('status', status.ok ? JSON.stringify(status.data) : 'status unavailable');
+                        setText('rpc', rpc.ok ? JSON.stringify(rpc.data) : 'rpc unavailable');
+                        setText('version', rpcVersion.ok ? JSON.stringify(rpcVersion.data) : 'version unavailable');
+                        setText('dashboard', dashboard.ok ? JSON.stringify(dashboard.data) : 'dashboard unavailable');
+
+                        if (!status.ok || !rpc.ok || !rpcVersion.ok || !dashboard.ok) {
+                            markDegraded('one or more upstream APIs are unavailable');
+                        }
+                    }
+
+                    async function run() {
+                        const hydrationStart = performance.now();
+                        if (KRAB_HYDRATION_MODE === 'ssr_only') {
+                            markDegraded('SSR-only mode active');
+                            hydrationDiag('KRAB-HYDRATE-300', 'warn', 'SSR-only mode skips client hydration');
+                        } else if (KRAB_HYDRATION_MODE === 'minimal_js') {
+                            enableMinimalJsFallback();
+                        } else {
+                            try {
+                                const hydrator = await loadHydratorModule();
+                                await hydrator.init();
+                                reportFailedIslands(
+                                    hydrator.hydrateWithinSelector(criticalIslandSelector()),
+                                    'critical'
+                                );
+                                scheduleDeferredHydration(hydrator);
+                                // After the critical islands, so the router can
+                                // never swap out markup that has not been
+                                // claimed yet. It re-hydrates every page it
+                                // swaps in, which also covers a navigation
+                                // that lands before the deferred pass runs.
+                                hydrator.startRouter();
+                            } catch (err) {
+                                markDegraded('hydration mismatch recovered via SSR fallback');
+                                hydrationDiag('KRAB-HYDRATE-500', 'error', 'WASM hydration bootstrap failed', {
+                                    error: String(err),
+                                });
+                                console.error('hydration failed:', err);
+                            }
+                        }
+                        const hydrationMs = performance.now() - hydrationStart;
+
+                        checkRouteBudgets(hydrationMs);
+                        await loadData();
+                        await verifyManifestIntegrity();
+
+                        if (SERVER_FUNCTION_VERSION !== '2026-02-27.1') {
+                            markDegraded('server function version mismatch');
+                        }
+
+                        // HMR
+                        if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
+                            const evtSource = new EventSource('/api/hmr');
+                            evtSource.onmessage = (e) => {
+                                console.log('HMR signal received:', e.data);
+                                // Full page reload is the current HMR strategy. Module-level hot
+                                // swapping would require DOM diffing that the runtime does not yet do.
+                                window.location.reload();
+                            };
+                        }
+                    }
+
+                    run();"#;
+
+/// The pages, assets and read-only endpoints anonymous visitors use. Declared
+/// by the service rather than inherited from the framework's default
+/// open-path list, whose application entries are deprecated (removed in
+/// 0.7.0).
+const FRONTEND_PUBLIC_PATHS: &[&str] = &[
+    "/",
+    "/contact",
+    "/api/contact",
+    "/api/status",
+    "/data/dashboard",
+    "/rpc/version",
+    "/rpc/now",
+    "/asset-manifest.json",
+    // Crawler contracts: a crawler carries no token.
+    "/robots.txt",
+    "/sitemap.xml",
+    "/blog/*",
+    "/pkg/*",
+    // Progressive streaming demo and the swap runtime it loads (ADR 0017).
+    "/streaming",
+    "/_krab/stream.js",
+    "/_krab/home.js",
+    "/_krab/contact.js",
+];
+
 const DEFAULT_PKG_DIR: &str = "dist/pkg";
 /// The bundle file whose bytes back the published `integrity` value.
-const CLIENT_BUNDLE_FILE: &str = "krab_client.js";
+const CLIENT_BUNDLE_FILE: &str = "service_frontend_islands.js";
 
 /// Content digest of the client bundle as `(cache_buster, integrity)`.
 ///
@@ -1046,14 +1131,14 @@ const CLIENT_BUNDLE_FILE: &str = "krab_client.js";
 /// that the string began with `sha256-`. Either the value is derived from the
 /// bundle or it is not published at all.
 ///
-/// This service links `/pkg/krab_client.js` but does not serve it, so the
+/// This service links `/pkg/service_frontend_islands.js` but does not serve it, so the
 /// location is configurable via `KRAB_FRONTEND_PKG_DIR`. When that is unset the
 /// candidates below are tried in order, which covers running from the workspace
 /// root and running as an installed binary with the bundle beside it.
 ///
 /// **Deployment note.** `Dockerfile.service` copies only the binary, and nothing
 /// in `docker-compose.yml` mounts a bundle, so a containerised frontend has no
-/// `krab_client.js` to hash — and none to serve either. The degraded banner the
+/// `service_frontend_islands.js` to hash — and none to serve either. The degraded banner the
 /// browser then shows is accurate rather than spurious: there genuinely is no
 /// client bundle in that image. Ship one and point `KRAB_FRONTEND_PKG_DIR` at
 /// it if you want hydration in a container.
@@ -1151,14 +1236,14 @@ fn asset_manifest_json() -> String {
 fn asset_manifest_json_with(digest: Option<&(String, String)>) -> String {
     match digest {
         Some((cache_buster, integrity)) => format!(
-            "{{\"assets\":{{\"krab_client.js\":{{\"path\":\"/pkg/krab_client.js?h={}\",\"integrity\":\"{}\",\"immutable\":true}}}},\"server_function_version\":\"{}\"}}",
+            "{{\"assets\":{{\"service_frontend_islands.js\":{{\"path\":\"/pkg/service_frontend_islands.js?h={}\",\"integrity\":\"{}\",\"immutable\":true}}}},\"server_function_version\":\"{}\"}}",
             cache_buster, integrity, SERVER_FUNCTION_VERSION
         ),
         // No readable bundle means no digest to publish. The browser treats a
         // missing integrity as degraded, which is the correct reading: a bundle
         // this process cannot read is one it cannot vouch for.
         None => format!(
-            "{{\"assets\":{{\"krab_client.js\":{{\"path\":\"/pkg/krab_client.js\",\"immutable\":true}}}},\"server_function_version\":\"{}\"}}",
+            "{{\"assets\":{{\"service_frontend_islands.js\":{{\"path\":\"/pkg/service_frontend_islands.js\",\"immutable\":true}}}},\"server_function_version\":\"{}\"}}",
             SERVER_FUNCTION_VERSION
         ),
     }
@@ -1288,7 +1373,7 @@ fn build_router(state: AppState) -> Router {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_tracing("service_frontend");
+    init_tracing_with_version("service_frontend", env!("CARGO_PKG_VERSION"));
     let cfg = KrabConfig::from_env_checked("frontend", 3000)?;
     let secrets_report = cfg.validate_all()?;
     if !secrets_report.is_clean() {
@@ -1356,7 +1441,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // `KRAB_REDIS_URL` set every replica reads and invalidates the same
     // entries. Without it this is a `MemoryStore` and behaves as before —
     // correct for one process, not for several.
-    let runtime = RuntimeState::try_new()?;
+    let runtime = RuntimeState::try_new()?.with_public_paths(FRONTEND_PUBLIC_PATHS.iter().copied());
     let isr_cache = IsrCache::with_store(runtime.store.clone());
 
     let state = AppState {
@@ -1364,6 +1449,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         http_client: Client::builder().timeout(Duration::from_secs(2)).build()?,
         auth_base_url: auth_base_url.clone(),
         users_base_url: users_base_url.clone(),
+        users: users_contract_bundle.adapter,
         protocol_client: {
             let service_urls = HashMap::from([
                 ("auth".to_string(), auth_base_url),
@@ -1441,6 +1527,7 @@ mod tests {
             http_client: Client::builder().timeout(timeout).build().unwrap(),
             auth_base_url: "http://127.0.0.1:1".to_string(),
             users_base_url: "http://127.0.0.1:1".to_string(),
+            users: crate::users_contract::local_users_adapter(),
             protocol_client: test_protocol_client(),
             isr_cache: IsrCache::new(),
             isr_revalidating: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
@@ -1448,11 +1535,279 @@ mod tests {
         }
     }
 
+    /// Progressive streaming through the full router (ADR 0017): the first
+    /// body frame is the shell with the `<Suspense>` fallback and no data;
+    /// the resolved boundary arrives in a later frame as a `<template>`. The
+    /// route has no render policy, so the cache middleware must pass the body
+    /// through rather than buffer it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_route_flushes_the_fallback_first_and_the_resolved_template_later() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let mut state = test_state_with_protocol_client(Duration::from_millis(50));
+        state.runtime = state
+            .runtime
+            .with_public_paths(super::FRONTEND_PUBLIC_PATHS.iter().copied());
+        let app = super::build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/streaming")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+
+        let mut body = response.into_body();
+        let first = body
+            .frame()
+            .await
+            .expect("a first frame")
+            .expect("frame ok")
+            .into_data()
+            .expect("data frame");
+        let first = String::from_utf8_lossy(&first).into_owned();
+        assert!(first.contains("Loading the slow report"), "{first}");
+        assert!(first.contains(":pending-->"), "{first}");
+        assert!(
+            first.contains("<script src=\"/_krab/stream.js\"></script>"),
+            "{first}"
+        );
+        assert!(
+            !first.contains("Report ready"),
+            "data must not be in the shell: {first}"
+        );
+
+        let mut rest = String::new();
+        while let Some(frame) = body.frame().await {
+            if let Ok(data) = frame.expect("frame ok").into_data() {
+                rest.push_str(&String::from_utf8_lossy(&data));
+            }
+        }
+        assert!(rest.contains("<template data-krab-suspense=\"s"), "{rest}");
+        assert!(rest.contains("Report ready"), "{rest}");
+        assert!(rest.ends_with("</body></html>"), "{rest}");
+        assert!(is_finalized_ssr_snapshot(&format!("{first}{rest}")));
+    }
+
+    #[tokio::test]
+    async fn the_stream_swap_runtime_is_served_as_javascript() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let mut state = test_state_with_protocol_client(Duration::from_millis(50));
+        state.runtime = state
+            .runtime
+            .with_public_paths(super::FRONTEND_PUBLIC_PATHS.iter().copied());
+        let app = super::build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/_krab/stream.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("application/javascript")));
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            &body[..],
+            krab_core::render_stream::STREAM_SWAP_SCRIPT.as_bytes()
+        );
+    }
+
+    /// The users routes go through the topology-selected adapter; with the
+    /// in-process one, a lookup and a create round-trip and a validation
+    /// failure maps to 400.
+    #[tokio::test]
+    async fn users_routes_use_the_selected_adapter() {
+        use axum::extract::{Path, State};
+        use krab_core::service_contract::NewUserRequest;
+
+        let state = test_state_with_protocol_client(Duration::from_millis(50));
+
+        let found = crate::users_contract::get_user_handler(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Path("ada".to_string()),
+        )
+        .await;
+        assert_eq!(found.status(), axum::http::StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(found.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let user: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(user["id"], "ada");
+
+        let created = crate::users_contract::create_user_handler(
+            State(state.clone()),
+            axum::Json(NewUserRequest {
+                email: "ada@example.com".to_string(),
+                display_name: "Ada".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(created.status(), axum::http::StatusCode::CREATED);
+
+        let invalid = crate::users_contract::create_user_handler(
+            State(state),
+            axum::Json(NewUserRequest {
+                email: " ".to_string(),
+                display_name: "".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(invalid.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    fn distributed_users_topology(base_url: &str) -> krab_core::service_contract::TopologyRuntime {
+        use krab_core::service_contract::{ServiceEndpoint, ServiceTopology, TopologyRuntime};
+        TopologyRuntime {
+            mode: ServiceTopology::Distributed,
+            endpoints: HashMap::from([(
+                "users".to_string(),
+                ServiceEndpoint {
+                    base_url: base_url.to_string(),
+                    timeout_ms: 500,
+                    max_retries: 0,
+                },
+            )]),
+        }
+    }
+
+    /// In a distributed topology `GET /api/users/me` is fetched with the
+    /// caller's credential. It was fetched with the frontend's own service
+    /// token, so every caller got the service account's record (a confused
+    /// deputy).
+    #[tokio::test]
+    async fn remote_users_lookup_forwards_the_callers_authorization() {
+        use axum::extract::{Path, State};
+
+        let seen: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::default();
+        let recorder = seen.clone();
+        let stub = axum::Router::new().route(
+            "/api/v1/users/me",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let recorder = recorder.clone();
+                async move {
+                    let auth = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    recorder.lock().unwrap().push(auth);
+                    axum::Json(serde_json::json!({"id": "u-caller", "username": "caller"}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, stub).await;
+        });
+
+        let mut state = test_state_with_protocol_client(Duration::from_millis(500));
+        state.users = crate::users_contract::build_users_adapter(
+            &distributed_users_topology(&base_url),
+            base_url.clone(),
+            Some("frontend-service-token".to_string()),
+        )
+        .adapter;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer caller-token"),
+        );
+        let with_caller = crate::users_contract::get_user_handler(
+            State(state.clone()),
+            headers,
+            Path("me".to_string()),
+        )
+        .await;
+        let anonymous = crate::users_contract::get_user_handler(
+            State(state),
+            axum::http::HeaderMap::new(),
+            Path("me".to_string()),
+        )
+        .await;
+        server.abort();
+
+        assert_eq!(with_caller.status(), axum::http::StatusCode::OK);
+        assert_eq!(anonymous.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Some("Bearer caller-token".to_string()), None],
+            "the users service must see the caller's credential, never the service token"
+        );
+    }
+
+    /// A failed upstream call answers with a generic message: reqwest's error
+    /// text names the internal users URL, which must not reach the client.
+    #[tokio::test]
+    async fn remote_users_errors_do_not_leak_the_upstream_url() {
+        use axum::extract::{Path, State};
+
+        let base_url = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let mut state = test_state_with_protocol_client(Duration::from_millis(500));
+        state.users = crate::users_contract::build_users_adapter(
+            &distributed_users_topology(&base_url),
+            base_url.clone(),
+            None,
+        )
+        .adapter;
+
+        let response = crate::users_contract::get_user_handler(
+            State(state),
+            axum::http::HeaderMap::new(),
+            Path("me".to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        let host = base_url.trim_start_matches("http://");
+        assert!(
+            !text.contains(host),
+            "error body leaks the upstream: {text}"
+        );
+        assert!(
+            !text.contains("127.0.0.1"),
+            "error body leaks the upstream: {text}"
+        );
+    }
+
     #[test]
     fn ssr_home_includes_hydration_and_data_loading_contracts() {
-        let html = render_home_page();
+        let html = home_page_with_runtime();
         assert!(html.contains("loadHydratorModule"));
-        assert!(html.contains("import('/pkg/krab_client.js')"));
+        assert!(html.contains("import('/pkg/service_frontend_islands.js')"));
         assert!(html.contains("/api/status"));
         assert!(html.contains("/rpc/now"));
         assert!(html.contains("/rpc/version"));
@@ -1466,13 +1821,100 @@ mod tests {
         assert!(html.contains("fetchJsonWithRetry"));
         assert!(html.contains("ROUTE_BUDGETS"));
         assert!(html.contains("schema mismatch"));
-        // In non-web SSR mode, island wrappers expose `data-island` + `data-props`.
-        // In `--all-features` builds, `krab_client` may compile with `feature = "web"`
-        // and render direct component markup without wrapper attributes.
-        // Assert stable interactive component payload in either mode.
+        // The islands come from `service_frontend_islands`, which this service
+        // links without its `web` feature, so each renders the SSR wrapper
+        // (`data-island` + `data-props`) the browser bundle hydrates.
+        assert!(html.contains("data-island=\"Counter\""));
+        assert!(html.contains("data-island=\"Toggle\""));
+        assert!(html.contains("data-island=\"Likes\""));
         assert!(html.contains("Count:"));
         assert!(html.contains("Toggle"));
         assert!(html.contains("Like"));
+    }
+
+    /// The deferred-hydration block used to hide deferred islands from the
+    /// runtime by renaming `data-island` and strip it again after hydrating,
+    /// purely to stop a second pass binding every handler twice. `hydrate()`
+    /// is idempotent now, so none of that attribute juggling may come back.
+    #[test]
+    fn ssr_home_no_longer_strips_island_attributes_to_defer_hydration() {
+        let html = render_home_page();
+        for gone in [
+            "classifyIslandsForDeferredHydration",
+            "freezeCriticalIslandsAfterHydration",
+            "activateDeferredIslands",
+            "data-island-deferred",
+            "data-island-hydrated",
+            "removeAttribute('data-island')",
+            "hydrator.hydrate()",
+        ] {
+            assert!(!html.contains(gone), "{gone} is back in the page");
+        }
+    }
+
+    /// The runtime is loaded from `/_krab/home.js` and configured by a JSON
+    /// data block; the page carries no inline executable script, which Krab's
+    /// CSP (`script-src 'self'`) would block. The config reaches the page as
+    /// raw JSON, not HTML-escaped text.
+    #[test]
+    fn ssr_home_runtime_script_is_not_html_escaped() {
+        let html = render_home_page();
+        assert!(
+            html.contains(r#"<script type="module" src="/_krab/home.js"></script>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<script type="application/json" id="krab-home-config">{""#),
+            "config must be raw JSON: {html}"
+        );
+        assert!(!html.contains("&quot;hydrationMode"), "{html}");
+        let script = crate::home_runtime_js();
+        assert!(script.contains("=>"), "the served runtime is JavaScript");
+        assert!(
+            script.contains("(name) => '[data-island=\"' + name + '\"]'"),
+            "{script}"
+        );
+        assert!(!html.contains("=&gt;"), "arrow functions were escaped");
+        assert!(!html.contains("&amp;&amp;"), "logical ands were escaped");
+    }
+
+    /// Every page carries the shared nav and a router outlet, and on the home
+    /// page the live-data panel sits outside the outlet so it survives a
+    /// client-side navigation.
+    #[test]
+    fn pages_render_a_router_outlet_and_shared_nav() {
+        let home = render_home_page();
+        let outlet = "<main class=\"page\" data-krab-router-outlet=\"\" tabindex=\"-1\">";
+        assert_eq!(home.matches("data-krab-router-outlet").count(), 1, "{home}");
+        assert!(home.contains(outlet), "{home}");
+        assert!(home.contains("<nav class=\"site-nav\" aria-label=\"primary\">"));
+        assert!(home.contains("<a href=\"/about\">About</a>"));
+        let outlet_at = home.find(outlet).expect("outlet");
+        let close_at = home[outlet_at..].find("</main>").expect("outlet close") + outlet_at;
+        let islands_at = home.find("data-island=\"Counter\"").expect("counter");
+        let status_at = home.find("id=\"status\"").expect("status");
+        assert!(
+            outlet_at < islands_at && islands_at < close_at,
+            "the islands demo belongs inside the outlet"
+        );
+        assert!(
+            status_at > close_at,
+            "the live-data panel belongs outside the outlet"
+        );
+        assert!(
+            home.find("class=\"site-nav\"") < Some(outlet_at),
+            "nav precedes the outlet"
+        );
+
+        for page in [
+            render_about_page(),
+            crate::rendering::render_greet_page(),
+            render_blog_page("x"),
+        ] {
+            assert!(page.contains(outlet), "{page}");
+            assert!(page.contains("class=\"site-nav\""), "{page}");
+        }
+        assert!(render_about_page().contains(&format!("{outlet}<h1>About Page</h1></main>")));
     }
 
     #[test]
@@ -1518,6 +1960,16 @@ mod tests {
         assert!(sitemap_body.contains("<loc>https://krab.example.com/</loc>"));
         assert!(sitemap_body.contains("<loc>https://krab.example.com/about</loc>"));
         assert!(sitemap_body.contains("<loc>https://krab.example.com/greet</loc>"));
+    }
+
+    /// Crawlers do not carry bearer tokens: `/robots.txt` and `/sitemap.xml`
+    /// behind auth answer every crawler `401`, which defeats both.
+    #[tokio::test]
+    async fn robots_and_sitemap_are_served_to_anonymous_crawlers() {
+        let robots = get_page_body("/robots.txt").await;
+        assert!(robots.contains("User-agent: *"), "{robots}");
+        let sitemap = get_page_body("/sitemap.xml").await;
+        assert!(sitemap.contains("<urlset"), "{sitemap}");
     }
 
     #[test]
@@ -1595,6 +2047,7 @@ mod tests {
                 .unwrap(),
             auth_base_url: format!("http://{}", addr),
             users_base_url: format!("http://{}", addr),
+            users: crate::users_contract::local_users_adapter(),
             protocol_client: Arc::new(ProtocolAwareClient::new(
                 Client::new(),
                 HashMap::from([
@@ -1740,7 +2193,7 @@ mod tests {
 
     #[test]
     fn browser_journey_contract_scripts_reference_api_matrix() {
-        let html = render_home_page();
+        let html = home_page_with_runtime();
         assert!(html.contains("fetchJsonWithRetry('/api/status'"));
         assert!(html.contains("fetchJsonWithRetry('/rpc/now'"));
         assert!(html.contains("fetchJsonWithRetry('/rpc/version'"));
@@ -1784,10 +2237,10 @@ mod tests {
         let raw = asset_manifest_json_with(Some(&digest));
 
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let entry = &json["assets"]["krab_client.js"];
+        let entry = &json["assets"]["service_frontend_islands.js"];
         assert_eq!(
             entry["path"].as_str(),
-            Some("/pkg/krab_client.js?h=0a1b2c3d")
+            Some("/pkg/service_frontend_islands.js?h=0a1b2c3d")
         );
         assert!(entry["integrity"]
             .as_str()
@@ -1801,11 +2254,14 @@ mod tests {
         let raw = asset_manifest_json_with(None);
 
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let entry = &json["assets"]["krab_client.js"];
+        let entry = &json["assets"]["service_frontend_islands.js"];
         // Absent, not invented. The browser reads a missing integrity as
         // degraded, which is the honest signal when there is no bundle to hash.
         assert!(entry["integrity"].is_null());
-        assert_eq!(entry["path"].as_str(), Some("/pkg/krab_client.js"));
+        assert_eq!(
+            entry["path"].as_str(),
+            Some("/pkg/service_frontend_islands.js")
+        );
         assert_eq!(
             json["server_function_version"].as_str(),
             Some(SERVER_FUNCTION_VERSION)
@@ -1931,10 +2387,24 @@ mod tests {
 
     #[test]
     fn e2e_ssr_to_hydration_journey_contract() {
-        let html = render_home_page();
-        assert!(html.contains("import('/pkg/krab_client.js')"));
+        let html = home_page_with_runtime();
+        assert!(html.contains("import('/pkg/service_frontend_islands.js')"));
         assert!(html.contains("await hydrator.init();"));
-        assert!(html.contains("hydrator.hydrate();"));
+        // Critical islands first, deferred ones on idle, both through the
+        // scoped, panic-isolated export; then the client router.
+        assert!(html.contains("mod.hydrate_within_selector"), "{html}");
+        assert!(html.contains("hydrator.hydrateWithinSelector(criticalIslandSelector())"));
+        assert!(
+            html.contains("hydrator.hydrateWithinSelector(islandSelector(KRAB_DEFERRED_ISLANDS))")
+        );
+        assert!(html.contains("requestIdleCallback(runDeferred"));
+        assert!(html.contains("mod.start_router"));
+        assert!(html.contains("hydrator.startRouter();"));
+        // The router must start after the critical pass has claimed its islands.
+        assert!(
+            html.find("hydrateWithinSelector(criticalIslandSelector())")
+                < html.find("hydrator.startRouter();")
+        );
         assert!(html.contains("hydration mismatch recovered via SSR fallback"));
         assert!(html.contains("checkRouteBudgets"));
         assert!(html.contains("KRAB-HYDRATE-500"));
@@ -1946,7 +2416,7 @@ mod tests {
 
         let home = render_home_page();
         assert!(home.contains("modulepreload"));
-        assert!(home.contains("krab_client_bg.wasm"));
+        assert!(home.contains("service_frontend_islands_bg.wasm"));
 
         let about = render_about_page();
         assert!(!about.contains("modulepreload"));
@@ -1955,11 +2425,206 @@ mod tests {
     }
 
     #[test]
+    fn a_known_bundle_digest_pins_module_integrity_on_the_preload() {
+        let budget = crate::frontend_env::hydration_budget_for_route(
+            "/",
+            crate::frontend_env::HydrationMode::Wasm,
+        );
+        let html = crate::hydration_preload_links_html(&budget, Some("sha256-abc="));
+        assert!(
+            html.contains(r#"<link rel="modulepreload" href="/pkg/service_frontend_islands.js" integrity="sha256-abc=""#),
+            "{html}"
+        );
+        // No inline import map: the CSP would block it.
+        assert!(!html.contains("<script"), "{html}");
+
+        let without = crate::hydration_preload_links_html(&budget, None);
+        assert!(!without.contains("integrity"));
+        assert!(without.contains("modulepreload"));
+    }
+
+    /// Every page the service renders must run under Krab's CSP,
+    /// `script-src 'self' 'wasm-unsafe-eval'`: no inline executable script.
+    /// A `<script>` must have a `src`, or be a non-executed data block
+    /// (`application/json`, `application/ld+json`). Inline event-handler
+    /// attributes (`onsubmit=`, `onclick=`, ...) are inline script too and
+    /// are rejected the same way.
+    #[tokio::test]
+    async fn no_page_carries_an_inline_executable_script() {
+        std::env::set_var("KRAB_HYDRATION_MODE", "wasm");
+        let mut pages = vec![
+            ("home", render_home_page()),
+            ("about", crate::rendering::render_about_page()),
+            ("greet", crate::rendering::render_greet_page()),
+            ("blog", crate::rendering::render_blog_page("hello")),
+        ];
+        std::env::remove_var("KRAB_HYDRATION_MODE");
+        // `/contact` is a build.rs file-system route, reachable only through
+        // the router.
+        pages.push(("contact", get_page_body("/contact").await));
+
+        for (name, html) in pages {
+            let mut rest = html.as_str();
+            while let Some(at) = rest.find("<script") {
+                let tag_end = rest[at..].find('>').map(|e| at + e).unwrap_or(rest.len());
+                let tag = &rest[at..tag_end];
+                let allowed = tag.contains(" src=")
+                    || tag.contains(r#"type="application/json""#)
+                    || tag.contains(r#"type="application/ld+json""#);
+                assert!(
+                    allowed,
+                    "{name}: inline executable script `{tag}>` would be blocked by the CSP"
+                );
+                rest = &rest[tag_end..];
+            }
+            if let Some(attr) = inline_event_handler_attribute(&html) {
+                panic!("{name}: inline event handler `{attr}` would be blocked by the CSP");
+            }
+        }
+    }
+
+    /// The first `on<event>=` attribute inside any tag of `html`, if one.
+    fn inline_event_handler_attribute(html: &str) -> Option<String> {
+        let mut rest = html;
+        while let Some(open) = rest.find('<') {
+            let after = &rest[open + 1..];
+            let close = after.find('>').unwrap_or(after.len());
+            let tag = &after[..close];
+            let bytes = tag.as_bytes();
+            for i in 1..bytes.len() {
+                if !bytes[i - 1].is_ascii_whitespace() || !tag[i..].starts_with("on") {
+                    continue;
+                }
+                let name_len = tag[i + 2..]
+                    .bytes()
+                    .take_while(|b| b.is_ascii_lowercase())
+                    .count();
+                let name_end = i + 2 + name_len;
+                if name_len > 0 && tag[name_end..].trim_start().starts_with('=') {
+                    return Some(tag[i..name_end].to_string());
+                }
+            }
+            rest = &after[close..];
+        }
+        None
+    }
+
+    #[test]
+    fn the_inline_event_handler_scan_finds_handlers_and_ignores_text() {
+        assert_eq!(
+            inline_event_handler_attribute(r#"<form id="f" onsubmit="go(event)">"#).as_deref(),
+            Some("onsubmit")
+        );
+        assert_eq!(
+            inline_event_handler_attribute("<button\n  onclick = 'x()'>").as_deref(),
+            Some("onclick")
+        );
+        assert_eq!(
+            inline_event_handler_attribute(r#"<p class="note">only one=two</p>"#),
+            None
+        );
+        assert_eq!(
+            inline_event_handler_attribute(r#"<input name="online" data-on="1">"#),
+            None
+        );
+    }
+
+    /// Anonymous `GET path` through the full router with the frontend's
+    /// public paths: the status and the body.
+    async fn get_anonymously(path: &str) -> (axum::http::StatusCode, String) {
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let mut state = test_state_with_protocol_client(Duration::from_millis(50));
+        state.runtime = state
+            .runtime
+            .with_public_paths(super::FRONTEND_PUBLIC_PATHS.iter().copied());
+        let response = super::build_router(state)
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// `GET path` through the full router; it must answer `200`.
+    async fn get_page_body(path: &str) -> String {
+        let (status, body) = get_anonymously(path).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{path}: {body}");
+        body
+    }
+
+    /// The frontend serves the same telemetry routes as every other service
+    /// (Prometheus scrapes it), closed to anonymous callers unless
+    /// `KRAB_METRICS_PUBLIC=true`. Before they existed `/metrics` fell through
+    /// to `/{locale}`, so the scrape job collected an HTML page or a 401.
+    #[tokio::test]
+    async fn metrics_routes_answer_and_are_closed_unless_metrics_public() {
+        std::env::remove_var("KRAB_METRICS_PUBLIC");
+        for path in ["/metrics", "/metrics/prometheus"] {
+            let (status, _) = get_anonymously(path).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::UNAUTHORIZED,
+                "{path} must not be anonymous by default"
+            );
+        }
+
+        std::env::set_var("KRAB_METRICS_PUBLIC", "true");
+        let prometheus = get_anonymously("/metrics/prometheus").await;
+        let json = get_anonymously("/metrics").await;
+        std::env::remove_var("KRAB_METRICS_PUBLIC");
+
+        assert_eq!(prometheus.0, axum::http::StatusCode::OK);
+        assert!(
+            prometheus.1.contains("krab_requests_total"),
+            "{}",
+            prometheus.1
+        );
+        assert!(
+            prometheus.1.contains("krab_readiness_status"),
+            "{}",
+            prometheus.1
+        );
+        assert_eq!(json.0, axum::http::StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_str(&json.1).expect("JSON metrics");
+        assert!(payload.get("requests_total").is_some(), "{payload}");
+    }
+
+    /// The contact page loads its handler from `/_krab/contact.js`, which is
+    /// public, served as JavaScript, and attaches with `addEventListener`.
+    #[tokio::test]
+    async fn the_contact_page_loads_its_submit_handler_from_an_external_script() {
+        let html = get_page_body("/contact").await;
+        assert!(
+            html.contains(r#"<script type="module" src="/_krab/contact.js"></script>"#),
+            "{html}"
+        );
+        assert!(html.contains(r#"<form id="contact-form">"#), "{html}");
+
+        let script = get_page_body("/_krab/contact.js").await;
+        assert_eq!(script, crate::routes::CONTACT_SCRIPT);
+        assert!(script.contains("addEventListener('submit', submitContact)"));
+        assert!(script.contains("getElementById('contact-form')"));
+    }
+
+    /// Test helper: the home page followed by the runtime it loads, for
+    /// assertions about what the page does in the browser.
+    fn home_page_with_runtime() -> String {
+        format!("{}\n{}", render_home_page(), crate::home_runtime_js())
+    }
+
+    #[test]
     fn minimal_js_escape_hatch_is_explicit_and_auditable() {
         std::env::set_var("KRAB_HYDRATION_MODE", "minimal_js");
         std::env::set_var("KRAB_MINIMAL_JS_AUDIT", "true");
 
-        let html = render_home_page();
+        let html = home_page_with_runtime();
+        assert!(html.contains(r#""hydrationMode":"minimal_js""#), "{html}");
+        assert!(html.contains(r#""minimalJsAudit":true"#), "{html}");
         assert!(html.contains("enableMinimalJsFallback"));
         assert!(html.contains("KRAB_MINIMAL_JS_AUDIT"));
         assert!(html.contains("KRAB-HYDRATE-200"));
@@ -1973,7 +2638,8 @@ mod tests {
     fn ssr_only_mode_surfaces_stable_hydration_diagnostic_code() {
         std::env::set_var("KRAB_HYDRATION_MODE", "ssr_only");
 
-        let html = render_home_page();
+        let html = home_page_with_runtime();
+        assert!(html.contains(r#""hydrationMode":"ssr_only""#), "{html}");
         assert!(html.contains("KRAB-HYDRATE-300"));
         assert!(html.contains("SSR-only mode skips client hydration"));
 
@@ -2180,6 +2846,7 @@ mod tests {
                 .unwrap(),
             auth_base_url: "http://127.0.0.1:1".to_string(),
             users_base_url: "http://127.0.0.1:1".to_string(),
+            users: crate::users_contract::local_users_adapter(),
             protocol_client: test_protocol_client(),
             isr_cache: IsrCache::new(),
             isr_revalidating: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
@@ -2237,6 +2904,7 @@ mod tests {
                 .unwrap(),
             auth_base_url: "http://127.0.0.1:1".to_string(),
             users_base_url: "http://127.0.0.1:1".to_string(),
+            users: crate::users_contract::local_users_adapter(),
             protocol_client: test_protocol_client(),
             isr_cache: IsrCache::new(),
             isr_revalidating: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
@@ -2295,6 +2963,7 @@ mod tests {
                 .unwrap(),
             auth_base_url: "http://127.0.0.1:1".to_string(),
             users_base_url: "http://127.0.0.1:1".to_string(),
+            users: crate::users_contract::local_users_adapter(),
             protocol_client: test_protocol_client(),
             isr_cache: IsrCache::new(),
             isr_revalidating: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
@@ -2356,6 +3025,7 @@ mod tests {
                 .unwrap(),
             auth_base_url: "http://127.0.0.1:1".to_string(),
             users_base_url: "http://127.0.0.1:1".to_string(),
+            users: crate::users_contract::local_users_adapter(),
             protocol_client: test_protocol_client(),
             isr_cache: IsrCache::new(),
             isr_revalidating: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
@@ -2458,6 +3128,7 @@ mod tests {
                 .unwrap(),
             auth_base_url: "http://127.0.0.1:1".to_string(),
             users_base_url: "http://127.0.0.1:1".to_string(),
+            users: crate::users_contract::local_users_adapter(),
             protocol_client: test_protocol_client(),
             isr_cache: IsrCache::new(),
             isr_revalidating: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
@@ -2610,6 +3281,7 @@ mod tests {
                 .unwrap(),
             auth_base_url: "http://127.0.0.1:1".to_string(),
             users_base_url: "http://127.0.0.1:1".to_string(),
+            users: crate::users_contract::local_users_adapter(),
             protocol_client: test_protocol_client(),
             isr_cache: IsrCache::new(),
             isr_revalidating: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
@@ -2667,6 +3339,7 @@ mod tests {
                 .unwrap(),
             auth_base_url: "http://127.0.0.1:1".to_string(),
             users_base_url: "http://127.0.0.1:1".to_string(),
+            users: crate::users_contract::local_users_adapter(),
             protocol_client: test_protocol_client(),
             isr_cache: IsrCache::new(),
             isr_revalidating: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
@@ -2698,6 +3371,7 @@ mod tests {
                 .unwrap(),
             auth_base_url: "http://127.0.0.1:1".to_string(),
             users_base_url: "http://127.0.0.1:1".to_string(),
+            users: crate::users_contract::local_users_adapter(),
             protocol_client: test_protocol_client(),
             isr_cache: IsrCache::new(),
             isr_revalidating: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
@@ -2736,6 +3410,7 @@ mod tests {
                 .unwrap(),
             auth_base_url: "http://127.0.0.1:1".to_string(),
             users_base_url: "http://127.0.0.1:1".to_string(),
+            users: crate::users_contract::local_users_adapter(),
             protocol_client: test_protocol_client(),
             isr_cache: IsrCache::new(),
             isr_revalidating: Arc::new(tokio::sync::Mutex::new(HashSet::new())),

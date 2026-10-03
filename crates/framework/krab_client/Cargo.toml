@@ -67,6 +67,9 @@ features = [
 # document. These tests run under `wasm-pack test --headless`, which is the only
 # way this crate's actual behaviour gets exercised.
 wasm-bindgen-test = "0.3"
+# Observes attribute writes in the reactive-attribute browser suite. Test-only,
+# so these features stay out of the runtime's own web-sys feature list.
+web-sys = { version = "0.3", features = ["MutationObserver", "MutationObserverInit", "MutationRecord"] }
 
 [features]
 # `web` is ON by default. It gates the entire hydration runtime — `hydrate()`,
@@ -80,7 +83,7 @@ wasm-bindgen-test = "0.3"
 # nothing. Defaulting it on means the obvious command produces the working
 # artifact; a consumer that genuinely wants the inert native half of `#[island]`
 # — a server-side renderer — opts out with `default-features = false`.
-default = ["web", "demo-islands"]
+default = ["web"]
 
 web = []
 
@@ -88,11 +91,10 @@ web = []
 # are per-node and only useful when debugging a mismatch.
 debug = []
 
-# The bundled demo islands (`Counter`, `Toggle`, `Likes`). Deprecated — see the
-# note in `src/components.rs` — and scheduled for removal in 0.6.0. Still on by
-# default so existing consumers keep compiling; turn it off with
-# `default-features = false` (plus `features = ["web"]` if you want the runtime).
-demo-islands = []
+# `demo-islands` (the bundled `Counter` / `Toggle` / `Likes`) was deprecated in
+# 0.4.0 and removed in 0.6.0: every `#[island]` registers under its plain name,
+# so shipping islands from the framework claimed those names in every
+# consumer's registry. Define islands in your own crate.
 
 # rustc 1.97 emits bulk-memory and nontrapping-fptoint by default; the binaryen
 # wasm-pack bundles (version 117) rejects them unless told they exist. Without

@@ -29,17 +29,16 @@ whichever features you need, then pick between them with `KRAB_DB_DRIVER`:
 
 ```toml
 # Postgres only — the usual production choice
-krab_core = { version = "0.5.0", features = ["db-postgres"] }
+krab_core = { version = "0.6.0", features = ["db-postgres"] }
 
 # Both, selected per environment
-krab_core = { version = "0.5.0", features = ["db-postgres", "db-sqlite"] }
+krab_core = { version = "0.6.0", features = ["db-postgres", "db-sqlite"] }
 ```
 
-> **`db` is a deprecated alias for `db-postgres`.** It is kept for one minor
-> version per the breaking-change policy in
-> [`RELEASE_POLICY.md`](../../RELEASE_POLICY.md). It was deprecated *in* `0.2.0`,
-> so it is removable no earlier than `0.3.0` — matching the manifest comment in
-> `krab_core/Cargo.toml`. Use the explicit driver feature.
+> **The `db` feature alias is gone.** It was deprecated in `0.2.0` and removed
+> in `0.6.0`, per the breaking-change policy in
+> [`RELEASE_POLICY.md`](../../RELEASE_POLICY.md). Use the explicit driver
+> feature, `db-postgres`.
 >
 > Before this split, `krab_core`'s `sqlx` dependency enabled `postgres`
 > unconditionally and nothing else. SQLite existed only inside
@@ -132,7 +131,7 @@ Enforces deployment ordering: `local → dev → staging → prod`.
 
 - Backward promotion (e.g., `prod → dev`) is rejected.
 - Skipping stages (e.g., `dev → prod`) triggers a warning.
-- Policy decisions are audited in the `krab_migration_environment` table.
+- The current stage is recorded in the `krab_migration_environment` table; apply decisions are audited in `krab_migration_policy_audit`.
 
 Configuration:
 
@@ -142,6 +141,7 @@ Configuration:
 | `DB_MIGRATION_FAILURE_POLICY` | Failure handling (`halt`, `continue_non_critical`) | `halt` |
 | `DB_MIGRATION_RELEASE_ENVIRONMENTS` | Comma-separated release environments | `staging,prod` |
 | `DB_MIGRATION_REQUIRE_REHEARSAL_IN_RELEASE` | Require rollback rehearsal in release environments | `true` |
+| `DB_MIGRATION_DRIFT_THRESHOLD` | Tolerated unexpected versions (the `max_unexpected` passed to `enforce_drift_policy`; not applied automatically) | `0` |
 
 ### Rollback rehearsal governance
 

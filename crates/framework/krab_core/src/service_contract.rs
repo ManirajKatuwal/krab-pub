@@ -1,3 +1,12 @@
+//! Transport-agnostic service contracts, so one service can call another
+//! either in-process or over the network without the caller changing.
+//!
+//! A contract trait ([`UsersServiceContract`], [`AuthServiceContract`]) is
+//! implemented by a local adapter and a remote one; [`TopologyRuntime`]
+//! (`KRAB_RUNTIME_TOPOLOGY`, `KRAB_RUNTIME_ENDPOINTS_JSON`) tells the wiring
+//! which to use and where remote services live. Failures cross the boundary
+//! as [`DomainError`], whatever the transport.
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -6,7 +15,12 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceTopology {
+    /// Every domain is served in-process; wire local adapters. Parsed from
+    /// `monolith`, `single` or `single_service`.
     Monolith,
+    /// Domains are separate services; wire remote adapters using
+    /// [`TopologyRuntime::endpoints`]. Parsed from `distributed`, `split` or
+    /// `split_services`.
     Distributed,
 }
 
@@ -24,8 +38,12 @@ impl ServiceTopology {
 /// Endpoint configuration used by remote adapters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceEndpoint {
+    /// Base URL of the remote service (default `http://127.0.0.1:3000`).
     pub base_url: String,
+    /// Per-call timeout, in milliseconds, for the adapter to apply (default
+    /// 1500).
     pub timeout_ms: u64,
+    /// Retries after the first attempt, for the adapter to apply (default 2).
     pub max_retries: u8,
 }
 
@@ -42,6 +60,8 @@ impl Default for ServiceEndpoint {
 /// Topology runtime config used by service adapters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopologyRuntime {
+    /// Whether to wire local or remote adapters (default
+    /// [`ServiceTopology::Monolith`]).
     pub mode: ServiceTopology,
     /// Domain name => endpoint config
     pub endpoints: HashMap<String, ServiceEndpoint>,
@@ -130,6 +150,7 @@ impl TopologyRuntime {
         Ok(out)
     }
 
+    /// The endpoint configured for `domain` (for example `users`), if any.
     pub fn endpoint_for(&self, domain: &str) -> Option<&ServiceEndpoint> {
         self.endpoints.get(domain)
     }
@@ -139,25 +160,37 @@ impl TopologyRuntime {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DomainErrorKind {
+    /// The input was rejected.
     Validation,
+    /// The caller is not authenticated.
     Unauthorized,
+    /// The caller is authenticated but not allowed.
     Forbidden,
+    /// The requested entity does not exist.
     NotFound,
+    /// The request conflicts with existing state.
     Conflict,
+    /// A downstream call did not finish in time.
     Timeout,
+    /// A downstream service could not be reached or failed.
     UpstreamUnavailable,
+    /// Any other failure.
     Internal,
 }
 
 /// Transport-agnostic domain error payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainError {
+    /// The category, which transports map to a status.
     pub kind: DomainErrorKind,
+    /// Machine-readable error code.
     pub code: String,
+    /// Human-readable description.
     pub message: String,
 }
 
 impl DomainError {
+    /// A domain error with the given kind, code and message.
     pub fn new(kind: DomainErrorKind, code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             kind,
@@ -167,37 +200,74 @@ impl DomainError {
     }
 }
 
+/// A user as exchanged across the users contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserRecord {
+    /// Stable user id.
     pub id: String,
+    /// Email address.
     pub email: String,
+    /// Name shown in the UI.
     pub display_name: String,
 }
 
+/// Input to [`UsersServiceContract::create_user`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewUserRequest {
+    /// Email address of the new user.
     pub email: String,
+    /// Name shown in the UI.
     pub display_name: String,
 }
 
 /// Transport-agnostic users domain contract.
 #[async_trait]
 pub trait UsersServiceContract: Send + Sync {
+    /// Fetches the user with `id`, under the adapter's own identity — for
+    /// service-to-service calls that are not made on behalf of a user.
     async fn get_user(&self, id: &str) -> Result<UserRecord, DomainError>;
+    /// Fetches the user with `id` on behalf of the end user whose
+    /// `Authorization` header value is `authorization` (`None` when the
+    /// request carried none).
+    ///
+    /// Use this, not [`UsersServiceContract::get_user`], whenever a request
+    /// handler serves a caller: a remote adapter must present the caller's
+    /// credential to the users service, never its own service identity, or
+    /// every caller is answered with data the service account may see (a
+    /// confused deputy — `me` resolving to the service account).
+    ///
+    /// The default ignores `authorization` and calls `get_user`, which is
+    /// right for in-process adapters (this process already authenticated the
+    /// caller). Remote adapters must override it. Added in 0.6.0.
+    async fn get_user_on_behalf_of(
+        &self,
+        id: &str,
+        authorization: Option<&str>,
+    ) -> Result<UserRecord, DomainError> {
+        let _ = authorization;
+        self.get_user(id).await
+    }
+    /// Creates a user and returns it as stored.
     async fn create_user(&self, request: NewUserRequest) -> Result<UserRecord, DomainError>;
 }
 
+/// An issued access token, shaped like an OAuth 2.0 token response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionToken {
+    /// The token itself.
     pub access_token: String,
+    /// How to present it, typically `Bearer`.
     pub token_type: String,
+    /// Lifetime from issue, in seconds.
     pub expires_in_seconds: u64,
 }
 
 /// Transport-agnostic auth domain contract.
 #[async_trait]
 pub trait AuthServiceContract: Send + Sync {
+    /// Issues an access token for `user_id`.
     async fn issue_token(&self, user_id: &str) -> Result<SessionToken, DomainError>;
+    /// Verifies `token` and returns the user id it was issued for.
     async fn verify_token(&self, token: &str) -> Result<String, DomainError>;
 }
 

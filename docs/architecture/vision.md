@@ -1,5 +1,11 @@
 # Krab Framework: Vision & Philosophy
 
+> This page records the original design intent. It is not a feature list: some
+> pillars below (sub-second HMR, the "Krab Shell" toolbar, scoped CSS — whose
+> `style_scope` module is deprecated in 0.6.0 — and running on edge runtimes
+> without code changes) are not implemented. See [design.md](design.md) and
+> [core_runtime.md](core_runtime.md) for what exists.
+
 ## Core Mission
 To provide the ultimate full-stack Rust development experience, combining the raw performance of Rust with the ease of use found in frameworks like Next.js or SvelteKit, while eliminating common friction points in current Rust web development.
 

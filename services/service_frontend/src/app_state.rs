@@ -21,6 +21,8 @@ pub(crate) struct AppState {
     pub(crate) http_client: Client,
     pub(crate) auth_base_url: String,
     pub(crate) users_base_url: String,
+    /// The users domain contract, local or remote per the topology.
+    pub(crate) users: Arc<dyn krab_core::service_contract::UsersServiceContract>,
     pub(crate) protocol_client: Arc<ProtocolAwareClient>,
     pub(crate) isr_cache: IsrCache,
     pub(crate) isr_revalidating: Arc<tokio::sync::Mutex<HashSet<String>>>,

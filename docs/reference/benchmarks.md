@@ -37,10 +37,10 @@ Supporting automation:
   it drives invalid tokens instead and, when
   `KRAB_SHARED_STATE_MAX_BLOCK_INDEX` is set, requires the first block to land
   at or below that request index — which is what separates a block by the
-  per-IP auth-failure limiter from one by the global token bucket.
+  per-IP auth-failure limiter from one by the global per-IP limiter.
   `KRAB_SHARED_STATE_CLIENT_IP` sends that address as `X-Forwarded-For` so the
   scenario runs against counters no earlier scenario in the job has spent; both
-  limiters key on the client IP, and a token bucket left partly drained by a
+  limiters key on the client IP, and a global window left partly spent by a
   previous step blocks *earlier* than its capacity, which would satisfy the
   bound without the limiter under test doing anything. It is honoured only
   where the target trusts forwarded headers.

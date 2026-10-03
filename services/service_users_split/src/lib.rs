@@ -12,7 +12,7 @@ use axum::Router;
 use krab_core::config::KrabConfig;
 use krab_core::protocol::{DeploymentTopology, ExposureMode, ProtocolConfig, ProtocolKind};
 use krab_core::service::{serve_with_graceful_shutdown, ApiService, ServiceConfig};
-use krab_core::telemetry::init_tracing;
+use krab_core::telemetry::init_tracing_with_version;
 use std::sync::Arc;
 use tracing::warn;
 
@@ -189,7 +189,7 @@ pub fn build_default_app(domain: Arc<dyn DomainService>) -> Result<Router> {
 }
 
 pub async fn run_default() -> Result<()> {
-    init_tracing(DEFAULT_SERVICE_NAME);
+    init_tracing_with_version(DEFAULT_SERVICE_NAME, env!("CARGO_PKG_VERSION"));
     let service = bootstrap_users_split_service()?;
     service.start().await
 }

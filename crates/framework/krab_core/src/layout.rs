@@ -59,12 +59,13 @@ impl Outlet {
 
 // ── Layout ──────────────────────────────────────────────────────────────────
 
+/// Signature of a layout's render function: (outlet, head) -> HTML.
+type LayoutRenderFn = dyn Fn(&Outlet, &HeadContext) -> String + Send + Sync;
+
 /// A layout wrapper that composes around child route content.
 ///
 /// Layouts receive an `Outlet` (child content) and a `HeadContext` (metadata),
 /// and return the fully rendered HTML string for their region.
-type LayoutRenderFn = dyn Fn(&Outlet, &HeadContext) -> String + Send + Sync;
-
 pub struct Layout {
     /// Unique name for this layout (used in diagnostics and debugging).
     pub name: String,

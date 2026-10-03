@@ -42,12 +42,20 @@ use std::pin::Pin;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServerFnErrorCode {
+    /// The request could not be decoded or is malformed (HTTP 400).
     BadRequest,
+    /// The arguments decoded but failed validation (HTTP 400).
     Validation,
+    /// The caller is not authenticated (HTTP 401).
     Unauthorized,
+    /// The caller is authenticated but not allowed (HTTP 403).
     Forbidden,
+    /// The requested entity does not exist (HTTP 404).
     NotFound,
+    /// The request conflicts with current state (HTTP 409).
     Conflict,
+    /// Any other failure (HTTP 500); also the default when a payload omits
+    /// the code.
     Internal,
 }
 
@@ -516,6 +524,96 @@ fn router_with_dispatch(registrations: &'static [ServerFnRegistration]) -> axum:
     )
 }
 
+// ── Server-Sent Events (client side of `#[server(stream)]`) ─────────────────
+
+/// One server-sent event, as delivered to a `#[server(stream)]` caller.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServerEvent {
+    /// The `event:` field, if the server named one.
+    pub event: Option<String>,
+    /// The `data:` lines, joined with `\n`.
+    pub data: String,
+    /// The `id:` field, if any.
+    pub id: Option<String>,
+}
+
+/// Incremental `text/event-stream` parser.
+///
+/// Follows the WHATWG event-stream interpretation: lines end in `\n`, `\r\n`
+/// or `\r`; a blank line dispatches the pending event if it has data; lines
+/// starting with `:` are comments; one space after the field's colon is
+/// stripped. Feed it text in whatever pieces the network delivers.
+#[derive(Debug, Default)]
+pub struct SseParser {
+    line: String,
+    /// A `\r` ended the previous chunk; a leading `\n` in the next one
+    /// belongs to the same line break.
+    pending_cr: bool,
+    event: Option<String>,
+    data: Vec<String>,
+    id: Option<String>,
+}
+
+impl SseParser {
+    /// Feed a piece of the stream; returns the events it completed.
+    pub fn push(&mut self, text: &str) -> Vec<ServerEvent> {
+        let mut out = Vec::new();
+        for ch in text.chars() {
+            if self.pending_cr {
+                self.pending_cr = false;
+                if ch == '\n' {
+                    continue;
+                }
+            }
+            match ch {
+                '\r' => {
+                    self.pending_cr = true;
+                    self.end_line(&mut out);
+                }
+                '\n' => self.end_line(&mut out),
+                c => self.line.push(c),
+            }
+        }
+        out
+    }
+
+    /// Signal end of stream. Per the spec an event not terminated by a blank
+    /// line is discarded, so this only resets state.
+    pub fn finish(&mut self) -> Vec<ServerEvent> {
+        *self = Self::default();
+        Vec::new()
+    }
+
+    fn end_line(&mut self, out: &mut Vec<ServerEvent>) {
+        let line = std::mem::take(&mut self.line);
+        if line.is_empty() {
+            if !self.data.is_empty() {
+                out.push(ServerEvent {
+                    event: self.event.take(),
+                    data: std::mem::take(&mut self.data).join("\n"),
+                    id: self.id.clone(),
+                });
+            } else {
+                self.event = None;
+            }
+            return;
+        }
+        if line.starts_with(':') {
+            return;
+        }
+        let (field, value) = match line.split_once(':') {
+            Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
+            None => (line.as_str(), ""),
+        };
+        match field {
+            "event" => self.event = Some(value.to_string()),
+            "data" => self.data.push(value.to_string()),
+            "id" if !value.contains('\0') => self.id = Some(value.to_string()),
+            _ => {}
+        }
+    }
+}
+
 // ── Client-Side Call (WASM) ─────────────────────────────────────────────────
 
 /// Call a server function from the client (WASM) via fetch.
@@ -526,6 +624,165 @@ pub async fn call_server_fn<A: Serialize, T: serde::de::DeserializeOwned>(
     url: &str,
     args: &A,
 ) -> Result<T, ServerFnError> {
+    use wasm_bindgen_futures::JsFuture;
+
+    let resp = post_server_fn(url, args).await?;
+
+    let text = JsFuture::from(
+        resp.text()
+            .map_err(|_| ServerFnError::new("failed to read response body"))?,
+    )
+    .await
+    .map_err(|_| ServerFnError::new("failed to await response text"))?;
+
+    let text_str = text
+        .as_string()
+        .ok_or_else(|| ServerFnError::new("response is not a string"))?;
+
+    if resp.ok() {
+        serde_json::from_str(&text_str).map_err(|e| ServerFnError::new(e.to_string()))
+    } else {
+        // Try to parse server error
+        Err(decode_server_fn_error_body(&text_str, resp.status()))
+    }
+}
+
+/// Call a `#[server(stream)]` function from the client (WASM).
+///
+/// POSTs the arguments exactly as [`call_server_fn`] does and returns the
+/// response as a [`ServerEventStream`] of parsed server-sent events, read
+/// incrementally from the response body. `EventSource` cannot be used: it only
+/// issues `GET` and cannot carry a JSON body or the CSRF header.
+///
+/// A non-2xx response is decoded as a [`ServerFnError`] up front, so the error
+/// path matches [`call_server_fn`]'s.
+#[cfg(target_arch = "wasm32")]
+pub async fn call_server_fn_stream<A: Serialize>(
+    url: &str,
+    args: &A,
+) -> Result<ServerEventStream, ServerFnError> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+
+    let resp = post_server_fn(url, args).await?;
+    if !resp.ok() {
+        let text = JsFuture::from(
+            resp.text()
+                .map_err(|_| ServerFnError::new("failed to read response body"))?,
+        )
+        .await
+        .ok()
+        .and_then(|v| v.as_string())
+        .unwrap_or_default();
+        return Err(decode_server_fn_error_body(&text, resp.status()));
+    }
+
+    let body = resp
+        .body()
+        .ok_or_else(|| ServerFnError::new("stream response has no body"))?;
+    let reader: web_sys::ReadableStreamDefaultReader = body
+        .get_reader()
+        .dyn_into()
+        .map_err(|_| ServerFnError::new("stream reader cast failed"))?;
+
+    Ok(ServerEventStream {
+        reader,
+        parser: SseParser::default(),
+        ready: std::collections::VecDeque::new(),
+        utf8_carry: Vec::new(),
+        done: false,
+    })
+}
+
+/// Server-sent events from a `#[server(stream)]` call, read as they arrive.
+///
+/// Poll with [`next`](Self::next) until it returns `None`.
+#[cfg(target_arch = "wasm32")]
+pub struct ServerEventStream {
+    reader: web_sys::ReadableStreamDefaultReader,
+    parser: SseParser,
+    ready: std::collections::VecDeque<ServerEvent>,
+    /// Bytes of a UTF-8 sequence split across two body chunks.
+    utf8_carry: Vec<u8>,
+    done: bool,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl ServerEventStream {
+    /// The next event, `None` once the server closes the stream, or an error
+    /// if reading the body fails.
+    pub async fn next(&mut self) -> Option<Result<ServerEvent, ServerFnError>> {
+        use wasm_bindgen_futures::JsFuture;
+
+        loop {
+            if let Some(event) = self.ready.pop_front() {
+                return Some(Ok(event));
+            }
+            if self.done {
+                return None;
+            }
+
+            let chunk = match JsFuture::from(self.reader.read()).await {
+                Ok(chunk) => chunk,
+                Err(_) => {
+                    self.done = true;
+                    return Some(Err(ServerFnError::new("failed to read event stream")));
+                }
+            };
+            let done = js_sys::Reflect::get(&chunk, &"done".into())
+                .ok()
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            if done {
+                self.done = true;
+                self.ready.extend(self.parser.finish());
+                continue;
+            }
+            let Ok(value) = js_sys::Reflect::get(&chunk, &"value".into()) else {
+                continue;
+            };
+            self.utf8_carry
+                .extend(js_sys::Uint8Array::new(&value).to_vec());
+            let text = take_complete_utf8(&mut self.utf8_carry);
+            self.ready.extend(self.parser.push(&text));
+        }
+    }
+}
+
+/// Drain the longest valid UTF-8 prefix of `buf`, leaving an incomplete
+/// trailing sequence (split across network chunks) for the next call.
+/// Invalid bytes are replaced rather than stalling the stream.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn take_complete_utf8(buf: &mut Vec<u8>) -> String {
+    match std::str::from_utf8(buf) {
+        Ok(text) => {
+            let text = text.to_string();
+            buf.clear();
+            text
+        }
+        Err(err) if err.error_len().is_none() => {
+            // Incomplete sequence at the end: keep it for the next chunk.
+            let valid = err.valid_up_to();
+            let text = String::from_utf8_lossy(&buf[..valid]).into_owned();
+            buf.drain(..valid);
+            text
+        }
+        Err(_) => {
+            let text = String::from_utf8_lossy(buf).into_owned();
+            buf.clear();
+            text
+        }
+    }
+}
+
+/// POST `args` as JSON to a server function, with the CSRF header when the
+/// server issues tokens. Shared by [`call_server_fn`] and
+/// [`call_server_fn_stream`].
+#[cfg(target_arch = "wasm32")]
+async fn post_server_fn<A: Serialize>(
+    url: &str,
+    args: &A,
+) -> Result<web_sys::Response, ServerFnError> {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
 
@@ -557,27 +814,9 @@ pub async fn call_server_fn<A: Serialize, T: serde::de::DeserializeOwned>(
         .await
         .map_err(|_| ServerFnError::new("fetch failed"))?;
 
-    let resp: web_sys::Response = resp_value
+    resp_value
         .dyn_into()
-        .map_err(|_| ServerFnError::new("response cast failed"))?;
-
-    let text = JsFuture::from(
-        resp.text()
-            .map_err(|_| ServerFnError::new("failed to read response body"))?,
-    )
-    .await
-    .map_err(|_| ServerFnError::new("failed to await response text"))?;
-
-    let text_str = text
-        .as_string()
-        .ok_or_else(|| ServerFnError::new("response is not a string"))?;
-
-    if resp.ok() {
-        serde_json::from_str(&text_str).map_err(|e| ServerFnError::new(e.to_string()))
-    } else {
-        // Try to parse server error
-        Err(decode_server_fn_error_body(&text_str, resp.status()))
-    }
+        .map_err(|_| ServerFnError::new("response cast failed"))
 }
 
 /// Fetch a CSRF token from [`crate::csrf::CSRF_TOKEN_ENDPOINT_PATH`].
@@ -715,6 +954,66 @@ macro_rules! collect_server_fns {
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod sse_tests {
+    use super::{take_complete_utf8, ServerEvent, SseParser};
+
+    fn ev(event: Option<&str>, data: &str, id: Option<&str>) -> ServerEvent {
+        ServerEvent {
+            event: event.map(str::to_string),
+            data: data.to_string(),
+            id: id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn parses_what_axum_sse_emits() {
+        let mut p = SseParser::default();
+        let events = p.push("event: project\ndata: p-1\n\ndata: two\ndata: lines\nid: 7\n\n");
+        assert_eq!(
+            events,
+            vec![
+                ev(Some("project"), "p-1", None),
+                ev(None, "two\nlines", Some("7"))
+            ]
+        );
+    }
+
+    #[test]
+    fn events_split_across_chunks_and_line_endings() {
+        let mut p = SseParser::default();
+        assert!(p.push("data: hel").is_empty());
+        assert!(p.push("lo\r").is_empty());
+        // The `\n` completing a `\r\n` arrives in the next chunk.
+        assert_eq!(p.push("\n\r\n"), vec![ev(None, "hello", None)]);
+        assert_eq!(
+            p.push("data:no-space\r\r"),
+            vec![ev(None, "no-space", None)]
+        );
+    }
+
+    #[test]
+    fn comments_and_unknown_fields_are_ignored_and_empty_events_dropped() {
+        let mut p = SseParser::default();
+        assert!(p.push(": keep-alive\nretry: 10\nevent: x\n\n").is_empty());
+        // `event:` does not leak into the next event after an empty dispatch.
+        assert_eq!(p.push("data: y\n\n"), vec![ev(None, "y", None)]);
+        // An unterminated event is discarded at end of stream.
+        assert!(p.push("data: partial").is_empty());
+        assert!(p.finish().is_empty());
+    }
+
+    #[test]
+    fn utf8_split_across_chunks_is_held_back() {
+        let bytes = "é".as_bytes();
+        let mut buf = vec![b'a', bytes[0]];
+        assert_eq!(take_complete_utf8(&mut buf), "a");
+        buf.push(bytes[1]);
+        assert_eq!(take_complete_utf8(&mut buf), "é");
+        assert!(buf.is_empty());
+    }
+}
 
 #[cfg(test)]
 mod tests {

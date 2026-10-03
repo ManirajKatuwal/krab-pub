@@ -183,6 +183,31 @@ fn strip_fragment(url: &str) -> &str {
     }
 }
 
+/// Where a URL's fragment asks the page to scroll to.
+///
+/// Follows the HTML "indicated part of the document" rules the router needs:
+/// no `#` means no fragment navigation at all; an empty fragment or `top`
+/// (ASCII case-insensitive) means the top of the page; anything else names an
+/// element, still percent-encoded as it appears in the URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FragmentTarget<'a> {
+    /// `#` or `#top`: scroll to the top — unless the document has an
+    /// element named `top`, which wins, as in a browser.
+    Top,
+    /// `#name`: scroll to the element whose `id` (or anchor `name`) matches.
+    Element(&'a str),
+}
+
+/// The scroll target named by `url`'s fragment, if it has one.
+pub fn fragment_target(url: &str) -> Option<FragmentTarget<'_>> {
+    let (_, fragment) = url.split_once('#')?;
+    if fragment.is_empty() || fragment.eq_ignore_ascii_case("top") {
+        Some(FragmentTarget::Top)
+    } else {
+        Some(FragmentTarget::Element(fragment))
+    }
+}
+
 // ── Markup scanning ─────────────────────────────────────────────────────────
 //
 // A deliberately small tag scanner rather than a DOM parse: this runs on the
@@ -785,6 +810,13 @@ mod browser {
                 if push {
                     remember_scroll(&window);
                     push_history(&window, href, href);
+                    // The click was `prevent_default`ed, so the browser's own
+                    // fragment scroll never happens; do it here.
+                    scroll_to_fragment(&window, &document, href);
+                } else if let Some((x, y)) = saved_scroll(&window) {
+                    window.scroll_to_with_x_and_y(x, y);
+                } else {
+                    scroll_to_fragment(&window, &document, href);
                 }
                 return;
             }
@@ -855,10 +887,61 @@ mod browser {
         announce(&document, title.as_deref().unwrap_or(href));
 
         if push {
-            window.scroll_to_with_x_and_y(0.0, 0.0);
+            // `/page#section` lands on the section, as a document load would.
+            if !scroll_to_fragment(&window, &document, href) {
+                window.scroll_to_with_x_and_y(0.0, 0.0);
+            }
         } else if let Some((x, y)) = saved_scroll(&window) {
             window.scroll_to_with_x_and_y(x, y);
         }
+    }
+
+    /// Scroll to what `href`'s fragment names. Returns whether it named
+    /// something that exists — `false` for no fragment, or an element that
+    /// is not in the document, so the caller can fall back.
+    fn scroll_to_fragment(window: &Window, document: &Document, href: &str) -> bool {
+        match fragment_target(href) {
+            None => false,
+            Some(FragmentTarget::Top) => {
+                // The spec looks for an element first and only then treats
+                // `top` as the top of the page, so `id="top"` wins.
+                let raw = href.split_once('#').map_or("", |(_, fragment)| fragment);
+                match (!raw.is_empty())
+                    .then(|| fragment_element(document, raw))
+                    .flatten()
+                {
+                    Some(element) => element.scroll_into_view(),
+                    None => window.scroll_to_with_x_and_y(0.0, 0.0),
+                }
+                true
+            }
+            Some(FragmentTarget::Element(raw)) => match fragment_element(document, raw) {
+                Some(element) => {
+                    element.scroll_into_view();
+                    true
+                }
+                None => false,
+            },
+        }
+    }
+
+    /// The element a fragment names: by `id`, then by anchor `name`, trying
+    /// the fragment as written first and then percent-decoded — the HTML
+    /// spec's order, so `#caf%C3%A9` finds `id="café"`.
+    fn fragment_element(document: &Document, raw: &str) -> Option<Element> {
+        let decoded = js_sys::decode_uri_component(raw)
+            .ok()
+            .and_then(|v| v.as_string());
+        std::iter::once(raw.to_string())
+            .chain(decoded)
+            .find_map(|name| {
+                document.get_element_by_id(&name).or_else(|| {
+                    document
+                        .get_elements_by_name(&name)
+                        .item(0)
+                        .and_then(|n| n.dyn_into::<Element>().ok())
+                })
+            })
     }
 
     async fn fetch_document(href: &str) -> Option<FetchedDocument> {
@@ -1131,6 +1214,21 @@ mod tests {
         assert!(!is_same_document_fragment("/docs", "/guide#usage"));
         // No fragment at all is a real navigation.
         assert!(!is_same_document_fragment("/docs", "/docs"));
+    }
+
+    #[test]
+    fn fragment_targets_follow_the_html_rules() {
+        assert_eq!(fragment_target("/docs"), None);
+        assert_eq!(fragment_target("/docs#"), Some(FragmentTarget::Top));
+        assert_eq!(fragment_target("/docs#TOP"), Some(FragmentTarget::Top));
+        assert_eq!(
+            fragment_target("/docs#usage"),
+            Some(FragmentTarget::Element("usage"))
+        );
+        assert_eq!(
+            fragment_target("https://x.test/a?b=c#caf%C3%A9"),
+            Some(FragmentTarget::Element("caf%C3%A9"))
+        );
     }
 
     #[test]

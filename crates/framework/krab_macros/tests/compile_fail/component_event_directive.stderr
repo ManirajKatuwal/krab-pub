@@ -1,0 +1,8 @@
+error: `on:click` attaches a DOM event listener, and <Button> is a component, not an element:
+         it has no DOM node of its own for the listener to attach to.
+         Pass the handler as a prop and attach it to an element inside the component:
+           <Button on_click={move |_| ...}/>
+  --> tests/compile_fail/component_event_directive.rs:17:40
+   |
+17 |     let _ = view! { <Button label="Go" on:click={|_| {}}/> }.render();
+   |                                        ^^

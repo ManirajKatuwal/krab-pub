@@ -13,6 +13,11 @@ dist/.hmr_signal
 /services/service_frontend/public/pkg/
 /services/service_frontend/public/__ssg/
 
+# Default artifact root for `krab db rehearsal`, `krab release certify` and the
+# orchestrator's service logs when KRAB_ARTIFACT_DIR is unset (see
+# crates/tooling/krab_cli/src/artifacts.rs).
+.krab/
+
 # Local environment (never commit secrets)
 .env*
 !.env.example

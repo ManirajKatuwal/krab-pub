@@ -31,7 +31,7 @@ All conditions below must be satisfied before a beta release can be promoted to 
 ### Security Requirements
 
 - No unresolved high/critical dependency advisories.
-- `cargo deny --all-features check advisories licenses bans` passes with policy-approved settings and no ignored advisories/licenses/sources exceptions.
+- `cargo deny --all-features check advisories bans licenses sources` passes with policy-approved settings and no ignored advisories/licenses/sources exceptions.
 - Production secret sourcing enforced (no inline secrets in non-dev environments).
 
 ### Operational Readiness
@@ -49,7 +49,7 @@ All conditions below must be satisfied before a beta release can be promoted to 
 ## Crate Publication
 
 Krab is consumed from crates.io, not by cloning this repository. Five crates are
-published; the other five workspace members — the four under `services/` and the
+published; the other six workspace members — the five under `services/` and the
 reference app `examples/reference_apps/islands_rpc` — carry `publish = false`
 and are reference applications, not distributables.
 

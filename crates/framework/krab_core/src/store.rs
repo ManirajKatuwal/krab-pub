@@ -1,3 +1,12 @@
+//! A small key-value store abstraction for state that must be shared
+//! between a service's replicas: rate-limit and auth-failure counters, token
+//! revocations, ISR cache entries and render leases.
+//!
+//! [`MemoryStore`] is in-process — correct for one replica, per-replica
+//! otherwise. `RedisStore` (feature `redis-store`) is the shared
+//! implementation; the HTTP runtime state picks it when `KRAB_REDIS_URL` is
+//! set.
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,9 +22,16 @@ use tokio::sync::RwLock;
 /// `Duration::ZERO` as a `ttl` means **no expiry**, in every implementation.
 #[async_trait]
 pub trait DistributedStore: Send + Sync {
+    /// The value at `key`, or `None` if it is absent or expired.
     async fn get(&self, key: &str) -> Result<Option<String>>;
+    /// Stores `value` at `key`, replacing any existing value and expiry.
     async fn set(&self, key: &str, value: &str, ttl: Duration) -> Result<()>;
+    /// Adds `delta` to the integer at `key` (an absent key counts as 0) and
+    /// returns the new value. An existing expiry is kept; a new key gets
+    /// none. Errors if the stored value is not an integer.
     async fn incr(&self, key: &str, delta: u64) -> Result<u64>;
+    /// Sets the expiry of an existing key to `ttl` from now, or removes its
+    /// expiry for `Duration::ZERO`. A missing key is not an error.
     async fn expire(&self, key: &str, ttl: Duration) -> Result<()>;
 
     /// Remove a key. `Ok(true)` if it existed.
@@ -45,8 +61,33 @@ pub trait DistributedStore: Send + Sync {
     /// required method — implementations of this trait outside the workspace
     /// must add it.
     async fn set_if_absent(&self, key: &str, value: &str, ttl: Duration) -> Result<bool>;
+
+    /// Increment `key` by `delta`, giving it `ttl` when this call creates it.
+    /// Returns the new value.
+    ///
+    /// For fixed-window counters (rate limiting). Implementations should make
+    /// the increment and the expiry one atomic step: done as two calls, a
+    /// crash — or a store error on the second — between them leaves a counter
+    /// with no expiry, which then limits that client forever. The default
+    /// implementation is that two-call sequence, kept so external
+    /// implementations of this trait keep compiling; both built-in stores
+    /// override it. Added in 0.6.0.
+    async fn incr_with_ttl(&self, key: &str, delta: u64, ttl: Duration) -> Result<u64> {
+        let value = self.incr(key, delta).await?;
+        if value == delta {
+            self.expire(key, ttl).await?;
+        }
+        Ok(value)
+    }
 }
 
+/// The in-process [`DistributedStore`]: a map behind an async lock.
+///
+/// Not shared between processes, so with more than one replica each holds
+/// its own counters and cache. Clones share the same map. Capped at
+/// `KRAB_MEMORY_STORE_MAX_ENTRIES` entries (default 100 000, `0` for no cap)
+/// when built with [`MemoryStore::new`]; expired entries are swept
+/// periodically.
 #[derive(Clone)]
 pub struct MemoryStore {
     inner: Arc<RwLock<MemoryInner>>,
@@ -109,6 +150,8 @@ impl Default for MemoryStore {
 }
 
 impl MemoryStore {
+    /// An empty store capped at `KRAB_MEMORY_STORE_MAX_ENTRIES` (read once
+    /// per process; default 100 000, `0` for no cap). Same as `default()`.
     pub fn new() -> Self {
         Self::default()
     }
@@ -256,11 +299,15 @@ impl DistributedStore for MemoryStore {
             Some(entry) => match entry.value.parse::<u64>() {
                 Ok(value) => value,
                 Err(_) => {
-                    // A non-numeric value here is a key collision with a
-                    // non-counter entry; resetting silently would corrupt
-                    // whichever caller loses.
-                    tracing::warn!(key, "memory_store_incr_reset_non_numeric_value");
-                    0
+                    // A non-numeric value is a key collision with a
+                    // non-counter entry. Redis answers `INCR` on such a key
+                    // with an error and leaves it alone; this store used to
+                    // overwrite it with `delta`, corrupting whichever caller
+                    // owned the key. Matching Redis keeps the two stores
+                    // interchangeable, and callers already treat a store
+                    // error per their fail-open/closed policy.
+                    tracing::warn!(key, "memory_store_incr_non_numeric_value");
+                    anyhow::bail!("value at `{key}` is not an integer");
                 }
             },
             None => 0,
@@ -274,6 +321,41 @@ impl DistributedStore for MemoryStore {
             MemoryEntry {
                 value: next.to_string(),
                 expires_at: ttl,
+            },
+        );
+        self.sweep_if_due(&mut guard);
+        Ok(next)
+    }
+
+    async fn incr_with_ttl(&self, key: &str, delta: u64, ttl: Duration) -> Result<u64> {
+        // One write-lock section: the increment and the expiry cannot be
+        // separated by another task, and a new counter never exists without
+        // its expiry.
+        let mut guard = self.inner.write().await;
+        let now = Instant::now();
+
+        let existing = match guard.entries.get(key) {
+            Some(entry) if !entry.is_expired(now) => Some(entry),
+            _ => None,
+        };
+        let (current, expires_at) = match existing {
+            Some(entry) => match entry.value.parse::<u64>() {
+                Ok(value) => (value, entry.expires_at),
+                Err(_) => {
+                    tracing::warn!(key, "memory_store_incr_non_numeric_value");
+                    anyhow::bail!("value at `{key}` is not an integer");
+                }
+            },
+            None => (0, (!ttl.is_zero()).then(|| now + ttl)),
+        };
+
+        let next = current.saturating_add(delta);
+        self.insert_entry(
+            &mut guard,
+            key,
+            MemoryEntry {
+                value: next.to_string(),
+                expires_at,
             },
         );
         self.sweep_if_due(&mut guard);
@@ -337,6 +419,12 @@ impl DistributedStore for MemoryStore {
     }
 }
 
+/// The shared [`DistributedStore`], backed by Redis (feature `redis-store`).
+///
+/// Expiries are applied in whole seconds, rounded down with a minimum of one
+/// second. Each operation takes a fresh multiplexed connection from the
+/// client; a connection failure is an `Err`, which callers handle per their
+/// fail-open or fail-closed policy.
 #[cfg(feature = "redis-store")]
 #[derive(Clone)]
 pub struct RedisStore {
@@ -345,10 +433,15 @@ pub struct RedisStore {
 
 #[cfg(feature = "redis-store")]
 impl RedisStore {
+    /// A store using an existing Redis client.
     pub fn new(client: redis::Client) -> Self {
         Self { client }
     }
 
+    /// A store for the Redis server at `url` (for example
+    /// `redis://127.0.0.1:6379`). Only parses the URL — errors for a malformed
+    /// one — and does not connect; an unreachable server surfaces on the
+    /// first operation.
     pub fn from_url(url: &str) -> Result<Self> {
         let client = redis::Client::open(url).context("invalid redis url")?;
         Ok(Self::new(client))
@@ -395,6 +488,30 @@ impl DistributedStore for RedisStore {
 
         let mut conn = self.conn().await?;
         let value: u64 = conn.incr(key, delta).await.context("redis INCR failed")?;
+        Ok(value)
+    }
+
+    async fn incr_with_ttl(&self, key: &str, delta: u64, ttl: Duration) -> Result<u64> {
+        // A script runs atomically on the server, so no other client — and no
+        // crash of this one — can observe the counter without its expiry.
+        const SCRIPT: &str = "local v = redis.call('INCRBY', KEYS[1], ARGV[1]) \
+             if v == tonumber(ARGV[1]) and tonumber(ARGV[2]) > 0 then \
+               redis.call('EXPIRE', KEYS[1], ARGV[2]) \
+             end \
+             return v";
+
+        let mut conn = self.conn().await?;
+        let value: u64 = redis::Script::new(SCRIPT)
+            .key(key)
+            .arg(delta)
+            .arg(if ttl.is_zero() {
+                0
+            } else {
+                ttl.as_secs().max(1)
+            })
+            .invoke_async(&mut conn)
+            .await
+            .context("redis INCRBY+EXPIRE script failed")?;
         Ok(value)
     }
 
@@ -503,6 +620,91 @@ fn escape_scan_glob(input: &str) -> String {
 #[cfg(test)]
 mod memory_store_tests {
     use super::*;
+
+    /// The counter and its expiry are created together, a later increment does
+    /// not extend the window, and the counter restarts once it expires.
+    #[tokio::test]
+    async fn incr_with_ttl_sets_expiry_only_on_creation() {
+        let store = MemoryStore::new();
+        let ttl = Duration::from_millis(80);
+
+        assert_eq!(store.incr_with_ttl("w", 1, ttl).await.unwrap(), 1);
+        let first_expiry = store.inner.read().await.entries["w"].expires_at;
+        assert!(first_expiry.is_some(), "a new counter always has an expiry");
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(store.incr_with_ttl("w", 1, ttl).await.unwrap(), 2);
+        assert_eq!(
+            store.inner.read().await.entries["w"].expires_at,
+            first_expiry,
+            "a fixed window does not slide"
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(store.incr_with_ttl("w", 1, ttl).await.unwrap(), 1);
+    }
+
+    /// Like Redis, incrementing a non-numeric value is an error that leaves
+    /// the value alone — it used to overwrite it.
+    #[tokio::test]
+    async fn incr_on_a_non_numeric_value_errors_and_preserves_it() {
+        let store = MemoryStore::new();
+        store
+            .set("k", "not-a-number", Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(store.incr("k", 1).await.is_err());
+        assert!(store
+            .incr_with_ttl("k", 1, Duration::from_secs(5))
+            .await
+            .is_err());
+        assert_eq!(
+            store.get("k").await.unwrap().as_deref(),
+            Some("not-a-number")
+        );
+    }
+
+    /// The trait's provided method still works for a store that only
+    /// implements the required ones.
+    #[tokio::test]
+    async fn default_incr_with_ttl_sets_expiry_on_first_increment() {
+        struct Minimal(MemoryStore);
+        #[async_trait]
+        impl DistributedStore for Minimal {
+            async fn get(&self, key: &str) -> Result<Option<String>> {
+                self.0.get(key).await
+            }
+            async fn set(&self, key: &str, value: &str, ttl: Duration) -> Result<()> {
+                self.0.set(key, value, ttl).await
+            }
+            async fn incr(&self, key: &str, delta: u64) -> Result<u64> {
+                self.0.incr(key, delta).await
+            }
+            async fn expire(&self, key: &str, ttl: Duration) -> Result<()> {
+                self.0.expire(key, ttl).await
+            }
+            async fn delete(&self, key: &str) -> Result<bool> {
+                self.0.delete(key).await
+            }
+            async fn keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+                self.0.keys_with_prefix(prefix).await
+            }
+            async fn set_if_absent(&self, key: &str, value: &str, ttl: Duration) -> Result<bool> {
+                self.0.set_if_absent(key, value, ttl).await
+            }
+        }
+
+        let store = Minimal(MemoryStore::new());
+        assert_eq!(
+            store
+                .incr_with_ttl("d", 1, Duration::from_secs(60))
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(store.0.inner.read().await.entries["d"].expires_at.is_some());
+    }
 
     /// Epoch-suffixed keys (rate limiting) are written once and never touched
     /// again; the periodic write sweep is the only thing that reclaims them.
@@ -653,5 +855,184 @@ mod memory_store_tests {
 
         assert_eq!(store.get("a").await.unwrap().as_deref(), Some("2"));
         assert_eq!(store.get("b").await.unwrap().as_deref(), Some("1"));
+    }
+}
+
+/// `RedisStore` against a real server.
+///
+/// Needs `KRAB_TEST_REDIS_URL` (e.g. `redis://127.0.0.1:6379/15`). Without a
+/// reachable server each test prints that it executed NOTHING and passes —
+/// unless `KRAB_REQUIRE_REDIS_TESTS=1`, in which case it fails, so a CI job
+/// that is meant to exercise Redis cannot go green by skipping. Every key is
+/// prefixed with the process id and test name, so concurrent runs against a
+/// shared server do not collide, and each test deletes what it wrote.
+#[cfg(all(test, feature = "redis-store"))]
+mod redis_store_tests {
+    use super::*;
+
+    async fn store_or_skip(test: &str) -> Option<(RedisStore, String)> {
+        let skip = |reason: String| {
+            if std::env::var("KRAB_REQUIRE_REDIS_TESTS").as_deref() == Ok("1") {
+                panic!("{test}: KRAB_REQUIRE_REDIS_TESTS=1 but {reason}");
+            }
+            eprintln!("SKIPPED {test}: {reason}; this test executed NOTHING");
+            None
+        };
+        let url = match std::env::var("KRAB_TEST_REDIS_URL") {
+            Ok(url) if !url.trim().is_empty() => url,
+            _ => return skip("KRAB_TEST_REDIS_URL is unset".to_string()),
+        };
+        let store = match RedisStore::from_url(&url) {
+            Ok(store) => store,
+            Err(err) => return skip(format!("invalid KRAB_TEST_REDIS_URL: {err:#}")),
+        };
+        if let Err(err) = store.get("krab-test:probe").await {
+            return skip(format!("redis unreachable: {err:#}"));
+        }
+        Some((store, format!("krab-test:{}:{test}:", std::process::id())))
+    }
+
+    async fn ttl_secs(store: &RedisStore, key: &str) -> i64 {
+        let mut conn = store.conn().await.expect("connection");
+        redis::cmd("TTL")
+            .arg(key)
+            .query_async::<i64>(&mut conn)
+            .await
+            .expect("TTL")
+    }
+
+    async fn cleanup(store: &RedisStore, prefix: &str) {
+        for key in store.keys_with_prefix(prefix).await.unwrap_or_default() {
+            let _ = store.delete(&key).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn set_get_delete_and_zero_ttl_is_permanent() {
+        let Some((store, p)) = store_or_skip("set_get_delete").await else {
+            return;
+        };
+        let (a, b) = (format!("{p}a"), format!("{p}b"));
+
+        store.set(&a, "one", Duration::from_secs(60)).await.unwrap();
+        store.set(&b, "two", Duration::ZERO).await.unwrap();
+        assert_eq!(store.get(&a).await.unwrap().as_deref(), Some("one"));
+        assert!((1..=60).contains(&ttl_secs(&store, &a).await));
+        assert_eq!(ttl_secs(&store, &b).await, -1, "ZERO means no expiry");
+
+        assert!(store.delete(&a).await.unwrap());
+        assert!(!store.delete(&a).await.unwrap());
+        assert_eq!(store.get(&a).await.unwrap(), None);
+        cleanup(&store, &p).await;
+    }
+
+    #[tokio::test]
+    async fn incr_with_ttl_sets_expiry_once_and_atomically() {
+        let Some((store, p)) = store_or_skip("incr_with_ttl").await else {
+            return;
+        };
+        let key = format!("{p}counter");
+
+        assert_eq!(
+            store
+                .incr_with_ttl(&key, 1, Duration::from_secs(120))
+                .await
+                .unwrap(),
+            1
+        );
+        let first = ttl_secs(&store, &key).await;
+        assert!(
+            (1..=120).contains(&first),
+            "new counter has an expiry: {first}"
+        );
+
+        assert_eq!(
+            store
+                .incr_with_ttl(&key, 2, Duration::from_secs(9999))
+                .await
+                .unwrap(),
+            3
+        );
+        assert!(
+            ttl_secs(&store, &key).await <= first,
+            "a later increment must not extend the window"
+        );
+
+        // `incr` on a non-numeric value is an error, as with MemoryStore.
+        let text = format!("{p}text");
+        store
+            .set(&text, "abc", Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(store.incr(&text, 1).await.is_err());
+        assert!(store
+            .incr_with_ttl(&text, 1, Duration::from_secs(60))
+            .await
+            .is_err());
+        assert_eq!(store.get(&text).await.unwrap().as_deref(), Some("abc"));
+        cleanup(&store, &p).await;
+    }
+
+    #[tokio::test]
+    async fn expire_zero_persists_rather_than_deleting() {
+        let Some((store, p)) = store_or_skip("expire_zero").await else {
+            return;
+        };
+        let key = format!("{p}k");
+        store.set(&key, "v", Duration::from_secs(60)).await.unwrap();
+        store.expire(&key, Duration::ZERO).await.unwrap();
+        assert_eq!(ttl_secs(&store, &key).await, -1);
+        assert_eq!(store.get(&key).await.unwrap().as_deref(), Some("v"));
+        cleanup(&store, &p).await;
+    }
+
+    #[tokio::test]
+    async fn set_if_absent_is_a_lease() {
+        let Some((store, p)) = store_or_skip("set_if_absent").await else {
+            return;
+        };
+        let key = format!("{p}lease");
+        assert!(store
+            .set_if_absent(&key, "a", Duration::from_secs(60))
+            .await
+            .unwrap());
+        assert!(!store
+            .set_if_absent(&key, "b", Duration::from_secs(60))
+            .await
+            .unwrap());
+        assert_eq!(store.get(&key).await.unwrap().as_deref(), Some("a"));
+        cleanup(&store, &p).await;
+    }
+
+    /// Glob metacharacters in a prefix are literal: `a*` must not match `ab`.
+    #[tokio::test]
+    async fn keys_with_prefix_treats_glob_characters_literally() {
+        let Some((store, p)) = store_or_skip("keys_with_prefix").await else {
+            return;
+        };
+        for suffix in ["x*[1]:one", "x*[1]:two", "xy:three"] {
+            store
+                .set(&format!("{p}{suffix}"), "v", Duration::from_secs(60))
+                .await
+                .unwrap();
+        }
+        let mut found = store.keys_with_prefix(&format!("{p}x*[1]:")).await.unwrap();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![format!("{p}x*[1]:one"), format!("{p}x*[1]:two")]
+        );
+        cleanup(&store, &p).await;
+    }
+}
+
+#[cfg(all(test, feature = "redis-store"))]
+mod scan_glob_tests {
+    use super::escape_scan_glob;
+
+    #[test]
+    fn every_glob_metacharacter_is_escaped() {
+        assert_eq!(escape_scan_glob("plain:key"), "plain:key");
+        assert_eq!(escape_scan_glob(r"a*b?c[d]e\f"), r"a\*b\?c\[d\]e\\f");
     }
 }

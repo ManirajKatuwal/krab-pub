@@ -450,9 +450,9 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chacha20"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
@@ -1667,7 +1667,7 @@ dependencies = [
 
 [[package]]
 name = "krab_cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1683,7 +1683,7 @@ dependencies = [
 
 [[package]]
 name = "krab_client"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "inventory",
  "js-sys",
@@ -1699,7 +1699,7 @@ dependencies = [
 
 [[package]]
 name = "krab_core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1707,6 +1707,7 @@ dependencies = [
  "async-trait",
  "axum",
  "config",
+ "futures-core",
  "js-sys",
  "jsonwebtoken",
  "krab_macros",
@@ -1732,7 +1733,7 @@ dependencies = [
 
 [[package]]
 name = "krab_macros"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "axum",
  "krab_core",
@@ -1747,7 +1748,7 @@ dependencies = [
 
 [[package]]
 name = "krab_orchestrator"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "krab_core",
@@ -1755,10 +1756,12 @@ dependencies = [
  "notify",
  "reqwest",
  "serde",
+ "tempfile",
  "tokio",
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2543,10 +2546,11 @@ dependencies = [
 
 [[package]]
 name = "reference_app_islands_rpc"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",
+ "futures-util",
  "http-body-util",
  "inventory",
  "krab_client",
@@ -2706,9 +2710,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.37"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "758025cb5fccfd3bc2fd74708fd4682be41d99e5dff73c377c0646c6012c73a4"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "once_cell",
  "ring",
@@ -2730,9 +2734,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -2883,7 +2887,7 @@ dependencies = [
 
 [[package]]
 name = "service_auth"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2902,7 +2906,7 @@ dependencies = [
 
 [[package]]
 name = "service_frontend"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2913,13 +2917,13 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "krab_client",
  "krab_core",
  "krab_macros",
  "reqwest",
  "serde",
  "serde_json",
  "serial_test",
+ "service_frontend_islands",
  "sha2",
  "tokio",
  "tokio-stream",
@@ -2930,8 +2934,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "service_frontend_islands"
+version = "0.6.0"
+dependencies = [
+ "inventory",
+ "krab_client",
+ "krab_core",
+ "krab_macros",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "service_users"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-graphql",
@@ -2951,7 +2968,7 @@ dependencies = [
 
 [[package]]
 name = "service_users_split"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-graphql",

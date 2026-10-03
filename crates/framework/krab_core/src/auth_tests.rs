@@ -55,6 +55,7 @@ mod tests {
             "KRAB_AUTH_REQUIRE_TENANT_MATCH",
             "KRAB_JWT_REQUIRE_KID",
             "KRAB_AUTH_OPEN_PATHS",
+            "KRAB_AUTH_PUBLIC_PATHS",
             "KRAB_METRICS_PUBLIC",
             "KRAB_TRUST_PROXY_HEADERS",
             "KRAB_TRUSTED_PROXY_HOPS",
@@ -67,6 +68,10 @@ mod tests {
             "KRAB_HTTP_MAX_CONCURRENCY",
             "KRAB_HTTP_OVERLOAD_MODE",
             "KRAB_PROTOCOL_TENANT_HINT_UNTRUSTED",
+            "KRAB_OIDC_JWKS_URL",
+            "KRAB_OIDC_JWKS_MIN_REFETCH_SECS",
+            "KRAB_JWT_KEY_NOT_AFTER_JSON",
+            "KRAB_BEARER_TOKEN_FILE",
         ] {
             std::env::remove_var(key);
         }
@@ -734,6 +739,63 @@ mod tests {
         );
     }
 
+    async fn anonymous_status(app: &Router, path: &str) -> StatusCode {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("x-forwarded-for", "10.10.0.51")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// An operator's explicit `KRAB_AUTH_OPEN_PATHS` is the complete open
+    /// list: public paths a service declares in code must not reopen a route
+    /// it omits. `KRAB_AUTH_PUBLIC_PATHS` stays additive.
+    #[tokio::test]
+    #[serial]
+    async fn explicit_open_paths_are_not_reopened_by_code_declared_public_paths() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+        std::env::set_var("KRAB_AUTH_OPEN_PATHS", "/health,/ready");
+        std::env::set_var("KRAB_AUTH_PUBLIC_PATHS", "/api/tenants/*");
+
+        let runtime = RuntimeState::new().with_public_paths(["/protected"]);
+        let app = test_app_with_state(TestState { runtime });
+        let closed = anonymous_status(&app, "/protected").await;
+        let operator_public = anonymous_status(&app, "/api/tenants/acme/users").await;
+        std::env::remove_var("KRAB_AUTH_PUBLIC_PATHS");
+
+        assert_eq!(
+            closed,
+            StatusCode::UNAUTHORIZED,
+            "a code-declared public path must not reopen a route the operator's \
+             explicit KRAB_AUTH_OPEN_PATHS omits"
+        );
+        assert_eq!(operator_public, StatusCode::OK);
+    }
+
+    /// Without an explicit open-path list, code-declared public paths are
+    /// open, as before.
+    #[tokio::test]
+    #[serial]
+    async fn code_declared_public_paths_apply_without_explicit_open_paths() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+
+        let runtime = RuntimeState::new().with_public_paths(["/protected"]);
+        let app = test_app_with_state(TestState { runtime });
+        assert_eq!(anonymous_status(&app, "/protected").await, StatusCode::OK);
+    }
+
     fn multi_protocol_config() -> crate::protocol::ProtocolConfig {
         crate::protocol::ProtocolConfig {
             exposure_mode: crate::protocol::ExposureMode::Multi,
@@ -1357,6 +1419,684 @@ mod tests {
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 
         std::env::remove_var("KRAB_AUTH_FAILURE_WINDOW_SECS");
+        std::env::remove_var("KRAB_AUTH_FAILURE_THRESHOLD");
+    }
+
+    /// A token with no `kid` is tried against every configured key, so one
+    /// signed with the non-default key during a rotation still verifies.
+    #[tokio::test]
+    #[serial]
+    async fn kidless_token_signed_with_a_non_default_key_is_accepted() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var(
+            "KRAB_JWT_KEYS_JSON",
+            r#"{"default": "old-secret", "next": "new-secret"}"#,
+        );
+
+        let app = test_app();
+        let claims = json!({"sub": "user", "exp": 9999999999i64});
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(b"new-secret"),
+        )
+        .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("x-forwarded-for", "10.10.0.40")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A kid-less token is tried against at most `MAX_KIDLESS_KEY_TRIALS`
+    /// keys: each trial is a signature verification, so an unbounded trial
+    /// is a CPU amplifier.
+    #[tokio::test]
+    #[serial]
+    async fn kidless_token_key_trials_are_capped() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        let keys: serde_json::Map<String, Value> = (0..10)
+            .map(|i| (format!("k{i:02}"), json!(format!("secret-{i:02}"))))
+            .collect();
+        std::env::set_var("KRAB_JWT_KEYS_JSON", Value::Object(keys).to_string());
+        assert_eq!(crate::http_auth::MAX_KIDLESS_KEY_TRIALS, 8);
+
+        let app = test_app();
+        let kidless = |secret: &str| {
+            encode(
+                &Header::default(),
+                &json!({"sub": "user", "exp": 9999999999i64}),
+                &EncodingKey::from_secret(secret.as_bytes()),
+            )
+            .unwrap()
+        };
+        // Keys are tried in id order; k07 is the 8th, k08 the 9th.
+        let within = call(&app, &kidless("secret-07"), "10.10.0.44").await;
+        let beyond = call(&app, &kidless("secret-08"), "10.10.0.45").await;
+        assert_eq!(within, StatusCode::OK);
+        assert_eq!(beyond, StatusCode::UNAUTHORIZED);
+    }
+
+    /// An address already over its auth-failure budget is answered 429
+    /// before its token is verified — even a valid one — instead of costing
+    /// a verification per request.
+    #[tokio::test]
+    #[serial]
+    async fn over_budget_address_is_rejected_before_verification() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+        std::env::set_var("KRAB_AUTH_FAILURE_WINDOW_SECS", "3600");
+        std::env::set_var("KRAB_AUTH_FAILURE_THRESHOLD", "2");
+
+        let (app, state) = test_app_and_state();
+        let claims = json!({"sub": "user", "exp": 9999999999i64});
+        // Kid-less and signed with the wrong key: the amplifying shape.
+        let kidless_bad = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(b"not-the-secret"),
+        )
+        .unwrap();
+        // A valid token naming its key (KRAB_JWT_SECRET is kid `default`).
+        let valid_with_kid = generate_token_with_kid("default", claims, b"secret");
+
+        let mut statuses = Vec::new();
+        for _ in 0..3 {
+            statuses.push(call(&app, &kidless_bad, "10.10.0.46").await);
+        }
+        let reasons_before: u64 = state
+            .runtime
+            .auth_failure_reasons
+            .iter()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .sum();
+        let kidless_from_blocked = call(&app, &kidless_bad, "10.10.0.46").await;
+        let reasons_after: u64 = state
+            .runtime
+            .auth_failure_reasons
+            .iter()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .sum();
+        let valid_with_kid_from_blocked = call(&app, &valid_with_kid, "10.10.0.46").await;
+        std::env::remove_var("KRAB_AUTH_FAILURE_WINDOW_SECS");
+        std::env::remove_var("KRAB_AUTH_FAILURE_THRESHOLD");
+
+        assert_eq!(
+            statuses,
+            vec![
+                StatusCode::UNAUTHORIZED,
+                StatusCode::UNAUTHORIZED,
+                StatusCode::TOO_MANY_REQUESTS
+            ]
+        );
+        assert_eq!(kidless_from_blocked, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            reasons_after, reasons_before,
+            "a kid-less token from an over-budget address must not reach verification"
+        );
+        // A valid token that names its key is never locked out by other
+        // callers' failures on the same address (shared NAT).
+        assert_eq!(valid_with_kid_from_blocked, StatusCode::OK);
+    }
+
+    /// `KRAB_JWT_REQUIRE_KID` still refuses a kid-less token outright.
+    #[tokio::test]
+    #[serial]
+    async fn kidless_token_is_rejected_when_kid_is_required() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_REQUIRE_KID", "true");
+        std::env::set_var("KRAB_JWT_KEYS_JSON", r#"{"default": "s1", "next": "s2"}"#);
+
+        let app = test_app();
+        let token = encode(
+            &Header::default(),
+            &json!({"sub": "user", "exp": 9999999999i64}),
+            &EncodingKey::from_secret(b"s2"),
+        )
+        .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("x-forwarded-for", "10.10.0.41")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A store whose counters always fail, as during a Redis outage.
+    struct CounterOutageStore(crate::store::MemoryStore);
+
+    #[async_trait::async_trait]
+    impl crate::store::DistributedStore for CounterOutageStore {
+        async fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
+            self.0.get(key).await
+        }
+        async fn set(&self, key: &str, value: &str, ttl: Duration) -> anyhow::Result<()> {
+            self.0.set(key, value, ttl).await
+        }
+        async fn incr(&self, _key: &str, _delta: u64) -> anyhow::Result<u64> {
+            anyhow::bail!("store unavailable")
+        }
+        async fn incr_with_ttl(
+            &self,
+            _key: &str,
+            _delta: u64,
+            _ttl: Duration,
+        ) -> anyhow::Result<u64> {
+            anyhow::bail!("store unavailable")
+        }
+        async fn expire(&self, key: &str, ttl: Duration) -> anyhow::Result<()> {
+            self.0.expire(key, ttl).await
+        }
+        async fn delete(&self, key: &str) -> anyhow::Result<bool> {
+            self.0.delete(key).await
+        }
+        async fn keys_with_prefix(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+            self.0.keys_with_prefix(prefix).await
+        }
+        async fn set_if_absent(
+            &self,
+            key: &str,
+            value: &str,
+            ttl: Duration,
+        ) -> anyhow::Result<bool> {
+            self.0.set_if_absent(key, value, ttl).await
+        }
+    }
+
+    /// When the failure counter cannot be written the request still fails
+    /// closed, but as 503 — an outage — not 429, which told clients and
+    /// dashboards they were being rate limited.
+    #[tokio::test]
+    #[serial]
+    async fn auth_failure_limiter_store_outage_is_503_not_429() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+
+        let mut runtime = RuntimeState::new();
+        runtime.store = std::sync::Arc::new(CounterOutageStore(crate::store::MemoryStore::new()));
+        let app = test_app_with_state(TestState { runtime });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header("Authorization", "Bearer not-a-jwt")
+                    .header("x-forwarded-for", "10.10.0.42")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// `KRAB_BEARER_TOKEN_FILE` is honoured like every other secret's `_FILE`
+    /// form; it used to be ignored and static mode answered 503.
+    #[tokio::test]
+    #[serial]
+    async fn static_bearer_token_can_come_from_a_file() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::remove_var("KRAB_BEARER_TOKEN");
+        std::env::set_var("KRAB_AUTH_MODE", "static");
+        let path =
+            std::env::temp_dir().join(format!("krab-bearer-{}-{}", std::process::id(), line!()));
+        std::fs::write(&path, "file-token\n").unwrap();
+        std::env::set_var("KRAB_BEARER_TOKEN_FILE", &path);
+
+        let app = test_app();
+        let request = |token: &str| {
+            Request::builder()
+                .uri("/protected")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("x-forwarded-for", "10.10.0.43")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let ok = app.clone().oneshot(request("file-token")).await.unwrap();
+        let wrong = app.oneshot(request("other")).await.unwrap();
+
+        std::env::remove_var("KRAB_BEARER_TOKEN_FILE");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // --- Remote JWKS, key retirement, failure reasons (0.6.0) -------------
+
+    /// Throwaway Ed25519 test keys (generated for this suite, never used
+    /// anywhere else) and the base64url `x` of each public key.
+    const ED_KEY_1: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID742l9H0wbtOWWM4nhgdHtQWwQJmJb39AreNwHcK+ee\n-----END PRIVATE KEY-----\n";
+    const ED_X_1: &str = "tQCGXC6DpH3eQ7mQpTmUwz_UrjPnQ-X2ztczWt5Uyis";
+    const ED_KEY_2: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIEB2k94KXBt5aiXPDWN5+lsLuPzYlsNw+PAD0dKDhH4x\n-----END PRIVATE KEY-----\n";
+    const ED_X_2: &str = "x5VYN6QqYC4bfupaGI_894t7v2AfY3cu_GsHl8uV0dM";
+
+    fn ed_token(kid: &str, pem: &str) -> String {
+        let header = Header {
+            kid: Some(kid.to_string()),
+            alg: jsonwebtoken::Algorithm::EdDSA,
+            ..Default::default()
+        };
+        encode(
+            &header,
+            &json!({"sub": "user", "exp": 9999999999i64}),
+            &EncodingKey::from_ed_pem(pem.as_bytes()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn jwk(kid: &str, x: &str) -> Value {
+        json!({"kty": "OKP", "crv": "Ed25519", "kid": kid, "x": x, "use": "sig", "alg": "EdDSA"})
+    }
+
+    /// A JWKS endpoint whose document can be swapped mid-test, counting hits.
+    struct JwksServer {
+        url: String,
+        body: std::sync::Arc<std::sync::Mutex<Value>>,
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    async fn jwks_server(initial: Value) -> JwksServer {
+        let body = std::sync::Arc::new(std::sync::Mutex::new(initial));
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (b, h) = (body.clone(), hits.clone());
+        let app = Router::new().route(
+            "/jwks",
+            axum::routing::get(move || {
+                let (b, h) = (b.clone(), h.clone());
+                async move {
+                    h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let value = b.lock().unwrap().clone();
+                    axum::Json(value)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        JwksServer {
+            url: format!("http://{addr}/jwks"),
+            body,
+            hits,
+        }
+    }
+
+    fn jwks_env(url: &str, min_refetch_secs: &str) {
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_ALLOWED_ALGS", "EdDSA");
+        std::env::set_var("KRAB_OIDC_JWKS_URL", url);
+        std::env::set_var("KRAB_OIDC_JWKS_MIN_REFETCH_SECS", min_refetch_secs);
+    }
+
+    fn clear_jwks_env() {
+        for key in [
+            "KRAB_OIDC_JWKS_URL",
+            "KRAB_OIDC_JWKS_MIN_REFETCH_SECS",
+            "KRAB_JWT_KEY_NOT_AFTER_JSON",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    async fn call(app: &Router, token: &str, ip: &str) -> StatusCode {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("x-forwarded-for", ip)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// A token signed by a key the provider publishes verifies, with no key
+    /// material in the environment at all.
+    #[tokio::test]
+    #[serial]
+    async fn jwks_keys_verify_tokens_without_static_key_material() {
+        let _guard = env_lock();
+        reset_auth_env();
+        let server = jwks_server(json!({"keys": [jwk("k1", ED_X_1)]})).await;
+        jwks_env(&server.url, "30");
+
+        let app = test_app();
+        assert_eq!(
+            call(&app, &ed_token("k1", ED_KEY_1), "10.20.0.1").await,
+            StatusCode::OK
+        );
+        // Signed by a key the provider does not publish under that kid.
+        assert_eq!(
+            call(&app, &ed_token("k1", ED_KEY_2), "10.20.0.2").await,
+            StatusCode::UNAUTHORIZED
+        );
+        clear_jwks_env();
+    }
+
+    /// A provider-side rotation is picked up on the first token naming the
+    /// new `kid`, without waiting for the scheduled refresh.
+    #[tokio::test]
+    #[serial]
+    async fn jwks_refetches_on_an_unknown_kid() {
+        let _guard = env_lock();
+        reset_auth_env();
+        let server = jwks_server(json!({"keys": [jwk("k1", ED_X_1)]})).await;
+        // `0` is floored to one second: the refetch below must wait it out.
+        jwks_env(&server.url, "0");
+
+        let app = test_app();
+        assert_eq!(
+            call(&app, &ed_token("k1", ED_KEY_1), "10.20.0.3").await,
+            StatusCode::OK
+        );
+
+        *server.body.lock().unwrap() = json!({"keys": [jwk("k1", ED_X_1), jwk("k2", ED_X_2)]});
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(
+            call(&app, &ed_token("k2", ED_KEY_2), "10.20.0.4").await,
+            StatusCode::OK
+        );
+        clear_jwks_env();
+    }
+
+    /// Unknown `kid`s cannot make the service hammer the identity provider:
+    /// within the refetch window they are rejected from cache.
+    #[tokio::test]
+    #[serial]
+    async fn jwks_unknown_kid_refetch_is_rate_limited() {
+        let _guard = env_lock();
+        reset_auth_env();
+        let server = jwks_server(json!({"keys": [jwk("k1", ED_X_1)]})).await;
+        jwks_env(&server.url, "3600");
+
+        let (app, state) = test_app_and_state();
+        state.runtime.jwt_verifier_cache.refresh_jwks().await;
+        let before = server.hits.load(std::sync::atomic::Ordering::SeqCst);
+
+        for i in 0..5 {
+            let token = ed_token(&format!("made-up-{i}"), ED_KEY_2);
+            assert_eq!(
+                call(&app, &token, &format!("10.20.1.{i}")).await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        let after = server.hits.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(after, before, "no refetch inside the rate-limit window");
+        clear_jwks_env();
+    }
+
+    /// Requests that miss the cache for an unknown `kid` while a refetch is
+    /// in flight share it: the need is re-checked after the fetch lock, so
+    /// requests queued behind a (slow) fetch do not each fetch again in turn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn jwks_refetch_is_single_flight() {
+        let _guard = env_lock();
+        reset_auth_env();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let slow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (counter, delay) = (hits.clone(), slow.clone());
+        let server = Router::new().route(
+            "/jwks",
+            axum::routing::get(move || {
+                let (counter, delay) = (counter.clone(), delay.clone());
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if delay.load(std::sync::atomic::Ordering::SeqCst) {
+                        // Slower than the 1 s refetch gap.
+                        tokio::time::sleep(Duration::from_millis(1300)).await;
+                    }
+                    axum::Json(json!({"keys": [jwk("k1", ED_X_1)]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/jwks", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, server).await;
+        });
+        jwks_env(&url, "1");
+
+        let (app, state) = test_app_and_state();
+        state.runtime.jwt_verifier_cache.refresh_jwks().await;
+        // Let the 1 s refetch gap pass, then make the IdP slow.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        slow.store(true, std::sync::atomic::Ordering::SeqCst);
+        let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+
+        let token = ed_token("rotated", ED_KEY_2);
+        let spawn_call = |i: usize| {
+            let (app, token) = (app.clone(), token.clone());
+            tokio::spawn(async move { call(&app, &token, &format!("10.20.2.{i}")).await })
+        };
+        // The first miss starts a slow fetch; the others arrive once the gap
+        // since its start has passed, and queue behind it.
+        let first = spawn_call(0);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let queued: Vec<_> = (1..4).map(spawn_call).collect();
+        assert_eq!(first.await.unwrap(), StatusCode::UNAUTHORIZED);
+        for request in queued {
+            assert_eq!(request.await.unwrap(), StatusCode::UNAUTHORIZED);
+        }
+        let fetches = hits.load(std::sync::atomic::Ordering::SeqCst) - before;
+        clear_jwks_env();
+        assert_eq!(
+            fetches, 1,
+            "requests queued behind a fetch must not refetch"
+        );
+    }
+
+    /// No key set has ever loaded: the outage is ours, so 503 — and the
+    /// reason is recorded as provider_unavailable.
+    #[tokio::test]
+    #[serial]
+    async fn jwks_unreachable_before_first_load_is_503() {
+        let _guard = env_lock();
+        reset_auth_env();
+        // Bind and drop a listener so the port is closed.
+        let url = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            format!("http://{}/jwks", listener.local_addr().unwrap())
+        };
+        jwks_env(&url, "0");
+
+        let (app, state) = test_app_and_state();
+        assert_eq!(
+            call(&app, &ed_token("k1", ED_KEY_1), "10.20.0.5").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let slot = crate::http_auth::AuthFailureReason::ProviderUnavailable.slot();
+        assert_eq!(
+            state.runtime.auth_failure_reasons[slot].load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        clear_jwks_env();
+    }
+
+    /// Our outages are not the client's failures: a 503 while the key set is
+    /// unreachable does not spend the client IP's auth-failure budget, so an
+    /// IdP outage does not turn into 429s.
+    #[tokio::test]
+    #[serial]
+    async fn provider_outage_does_not_count_against_the_client_ip() {
+        let _guard = env_lock();
+        reset_auth_env();
+        let url = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            format!("http://{}/jwks", listener.local_addr().unwrap())
+        };
+        jwks_env(&url, "30");
+        std::env::set_var("KRAB_AUTH_FAILURE_WINDOW_SECS", "3600");
+        std::env::set_var("KRAB_AUTH_FAILURE_THRESHOLD", "1");
+
+        let app = test_app();
+        let mut statuses = Vec::new();
+        for _ in 0..3 {
+            statuses.push(call(&app, &ed_token("k1", ED_KEY_1), "10.20.3.1").await);
+        }
+        let bad_token = call(&app, "garbage", "10.20.3.1").await;
+        std::env::remove_var("KRAB_AUTH_FAILURE_WINDOW_SECS");
+        std::env::remove_var("KRAB_AUTH_FAILURE_THRESHOLD");
+        clear_jwks_env();
+
+        assert_eq!(statuses, vec![StatusCode::SERVICE_UNAVAILABLE; 3]);
+        assert_eq!(
+            bad_token,
+            StatusCode::UNAUTHORIZED,
+            "the outage must not have used up the client's failure budget"
+        );
+    }
+
+    /// A plain-http JWKS URL outside dev is refused at construction: nothing
+    /// verifies (503) rather than trusting keys anyone on the path could swap.
+    #[tokio::test]
+    #[serial]
+    async fn jwks_plain_http_url_is_refused_outside_dev() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_ENVIRONMENT", "staging");
+        jwks_env("http://idp.example.com/jwks", "30");
+
+        let (app, state) = test_app_and_state();
+        assert!(state.runtime.jwt_verifier_cache.load_failed());
+        assert_eq!(
+            call(&app, &ed_token("k1", ED_KEY_1), "10.20.0.6").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        clear_jwks_env();
+    }
+
+    /// A key past its `key_not_after` stops verifying; its successor keeps
+    /// working. The failure is counted as key_retired.
+    #[tokio::test]
+    #[serial]
+    async fn a_retired_key_stops_verifying_on_schedule() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_KEYS_JSON", r#"{"old": "s-old", "new": "s-new"}"#);
+        std::env::set_var(
+            "KRAB_JWT_KEY_NOT_AFTER_JSON",
+            r#"{"old": "2000-01-01T00:00:00Z", "new": "2999-01-01T00:00:00Z"}"#,
+        );
+
+        let (app, state) = test_app_and_state();
+        let claims = json!({"sub": "user", "exp": 9999999999i64});
+        let old = generate_token_with_kid("old", claims.clone(), b"s-old");
+        let new = generate_token_with_kid("new", claims, b"s-new");
+
+        assert_eq!(
+            call(&app, &old, "10.20.0.7").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(call(&app, &new, "10.20.0.8").await, StatusCode::OK);
+        let slot = crate::http_auth::AuthFailureReason::KeyRetired.slot();
+        assert_eq!(
+            state.runtime.auth_failure_reasons[slot].load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        clear_jwks_env();
+    }
+
+    /// An unparseable retirement time fails closed instead of meaning "never".
+    #[tokio::test]
+    #[serial]
+    async fn an_unparseable_key_not_after_fails_closed() {
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_KEYS_JSON", r#"{"old": "s-old"}"#);
+        std::env::set_var("KRAB_JWT_KEY_NOT_AFTER_JSON", r#"{"old": "next tuesday"}"#);
+
+        let (_app, state) = test_app_and_state();
+        assert!(state.runtime.jwt_verifier_cache.load_failed());
+        clear_jwks_env();
+    }
+
+    /// Each failure is counted under its reason, and the exposition carries
+    /// the labelled series.
+    #[tokio::test]
+    #[serial]
+    async fn auth_failures_are_counted_by_reason() {
+        use crate::http_auth::AuthFailureReason as R;
+        let _guard = env_lock();
+        reset_auth_env();
+        std::env::set_var("KRAB_AUTH_MODE", "jwt");
+        std::env::set_var("KRAB_JWT_SECRET", "secret");
+        std::env::set_var("KRAB_AUTH_FAILURE_THRESHOLD", "1000");
+
+        let (app, state) = test_app_and_state();
+        let expired = generate_token(json!({"sub": "u", "exp": 1000000000}));
+        let wrong_key = encode(
+            &Header::default(),
+            &json!({"sub": "u", "exp": 9999999999i64}),
+            &EncodingKey::from_secret(b"not-the-secret"),
+        )
+        .unwrap();
+
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header("x-forwarded-for", "10.20.0.9")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        call(&app, "garbage", "10.20.0.9").await;
+        call(&app, &expired, "10.20.0.9").await;
+        call(&app, &wrong_key, "10.20.0.9").await;
+
+        let count = |r: R| {
+            state.runtime.auth_failure_reasons[r.slot()].load(std::sync::atomic::Ordering::Relaxed)
+        };
+        assert_eq!(count(R::MissingCredentials), 1);
+        assert_eq!(count(R::MalformedToken), 1);
+        assert_eq!(count(R::Expired), 1);
+        assert_eq!(count(R::InvalidSignature), 1);
+
+        let body = crate::http_runtime::metrics_prometheus_impl(&state.runtime);
+        let bytes = axum::body::to_bytes(body.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            text.contains("krab_auth_failures_by_reason_total{reason=\"expired\"} 1"),
+            "{text}"
+        );
         std::env::remove_var("KRAB_AUTH_FAILURE_THRESHOLD");
     }
 }

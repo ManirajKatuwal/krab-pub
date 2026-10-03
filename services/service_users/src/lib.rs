@@ -5,7 +5,7 @@ use krab_core::db::DbConfig;
 use krab_core::http::RuntimeState;
 use krab_core::protocol::{DeploymentTopology, ExposureMode, ProtocolConfig, ProtocolKind};
 use krab_core::service::{serve_with_graceful_shutdown, ApiService, ServiceConfig};
-use krab_core::telemetry::init_tracing;
+use krab_core::telemetry::init_tracing_with_version;
 use sqlx::sqlite::SqlitePoolOptions;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -290,7 +290,7 @@ pub fn configure_split_target_env(target: SplitUsersTarget) {
 }
 
 pub async fn run_default() -> Result<()> {
-    init_tracing("service_users");
+    init_tracing_with_version("service_users", env!("CARGO_PKG_VERSION"));
     let service = bootstrap_users_service().await?;
     service.start().await
 }
@@ -303,7 +303,7 @@ pub async fn run_default() -> Result<()> {
 /// `std::env::set_var` is no longer sound. See the three `src/bin/users_*.rs`
 /// entry points for the shape.
 pub async fn run_split_target(target: SplitUsersTarget) -> Result<()> {
-    init_tracing(target.service_name());
+    init_tracing_with_version(target.service_name(), env!("CARGO_PKG_VERSION"));
     let service = bootstrap_users_service().await?;
     service.start().await
 }

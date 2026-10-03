@@ -94,7 +94,7 @@ green.
 
 ## Boundary Semantics
 
-Services should communicate through contracts and adapters, not direct imports from another service crate. `krab topology doctor` checks for direct cross-service imports and validates shared contract payload serialization derives.
+Services should communicate through contracts and adapters, not direct imports from another service crate. `krab topology doctor` checks for direct cross-service imports and validates shared contract payload serialization derives. A crate under `services/` counts as a service boundary only if it builds a binary (`src/main.rs` or `src/bin/`); a library there — `service_frontend_islands`, for example — is shared code and may be imported.
 
 ## Local-To-Remote Swap
 

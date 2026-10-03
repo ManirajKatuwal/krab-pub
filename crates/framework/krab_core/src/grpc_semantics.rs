@@ -21,26 +21,46 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum GrpcStatusCode {
+    /// Success.
     Ok = 0,
+    /// The operation was cancelled, typically by the caller.
     Cancelled = 1,
+    /// An unknown error; also what [`GrpcStatusCode::from_u16`] returns for an
+    /// out-of-range value.
     Unknown = 2,
+    /// The client supplied an invalid argument, whatever the system state.
     InvalidArgument = 3,
+    /// The deadline expired before the operation completed.
     DeadlineExceeded = 4,
+    /// A requested entity was not found.
     NotFound = 5,
+    /// The entity the client tried to create already exists.
     AlreadyExists = 6,
+    /// The caller is identified but not permitted to do this.
     PermissionDenied = 7,
+    /// A resource, such as a quota or rate limit, is exhausted.
     ResourceExhausted = 8,
+    /// The system is not in the state the operation requires.
     FailedPrecondition = 9,
+    /// The operation was aborted, typically by a concurrency conflict.
     Aborted = 10,
+    /// The operation was attempted past a valid range.
     OutOfRange = 11,
+    /// The operation is not implemented or not supported.
     Unimplemented = 12,
+    /// An internal invariant was broken.
     Internal = 13,
+    /// The service is currently unavailable; usually transient and retryable.
     Unavailable = 14,
+    /// Unrecoverable data loss or corruption.
     DataLoss = 15,
+    /// The request lacks valid authentication credentials.
     Unauthenticated = 16,
 }
 
 impl GrpcStatusCode {
+    /// The code with numeric value `value`; any value above 16 maps to
+    /// [`GrpcStatusCode::Unknown`].
     pub fn from_u16(value: u16) -> Self {
         match value {
             0 => Self::Ok,
@@ -65,13 +85,18 @@ impl GrpcStatusCode {
     }
 }
 
+/// A gRPC call outcome: the status code and its message (the `grpc-status`
+/// and `grpc-message` trailers).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrpcStatus {
+    /// The status code.
     pub code: GrpcStatusCode,
+    /// Developer-facing description; empty on success.
     pub message: String,
 }
 
 impl GrpcStatus {
+    /// [`GrpcStatusCode::Ok`] with an empty message.
     pub fn ok() -> Self {
         Self {
             code: GrpcStatusCode::Ok,
@@ -79,6 +104,8 @@ impl GrpcStatus {
         }
     }
 
+    /// A status with `code` and `message`. Does not check that `code` is an
+    /// error code.
     pub fn error(code: GrpcStatusCode, message: impl Into<String>) -> Self {
         Self {
             code,

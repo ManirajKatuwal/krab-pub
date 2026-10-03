@@ -17,6 +17,7 @@ COPY crates/framework/krab_client/Cargo.toml crates/framework/krab_client/Cargo.
 COPY services/service_auth/Cargo.toml services/service_auth/Cargo.toml
 COPY services/service_users/Cargo.toml services/service_users/Cargo.toml
 COPY services/service_frontend/Cargo.toml services/service_frontend/Cargo.toml
+COPY services/service_frontend_islands/Cargo.toml services/service_frontend_islands/Cargo.toml
 COPY services/service_users_split/Cargo.toml services/service_users_split/Cargo.toml
 COPY crates/tooling/krab_orchestrator/Cargo.toml crates/tooling/krab_orchestrator/Cargo.toml
 COPY crates/tooling/krab_cli/Cargo.toml crates/tooling/krab_cli/Cargo.toml

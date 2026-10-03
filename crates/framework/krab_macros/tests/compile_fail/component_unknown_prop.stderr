@@ -1,0 +1,7 @@
+error[E0560]: struct `CardProps` has no field named `titel`
+  --> tests/compile_fail/component_unknown_prop.rs:17:27
+   |
+17 |     let _ = view! { <Card titel="Inbox"/> }.render();
+   |                           ^^^^^ `CardProps` does not have this field
+   |
+   = note: all struct fields are already assigned
